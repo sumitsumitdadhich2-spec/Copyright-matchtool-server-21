@@ -1239,6 +1239,35 @@ export default function App() {
   };
 
   // ---------------------------------------------------------------------------
+  // Jump to a specific candidate from the "View all candidates" panel.
+  // Sets candidateIndex on the correct segment and closes the panel.
+  // ---------------------------------------------------------------------------
+  const handleJumpToCandidate = useCallback((cs: StoredCandidateSet, idx: number) => {
+    const candidate = cs.candidates[idx];
+    if (!candidate) return;
+    // Find the live segment that matches this candidate set's short-clip range
+    const seg = segments.find(s =>
+      Math.abs(s.shortStart - cs.shortStart) < 0.05 &&
+      Math.abs(s.shortEnd - cs.shortEnd) < 0.05);
+    if (seg) {
+      // pendingCandidateIndexRef prevents the "reset to recovered default"
+      // effect from overwriting the index we're about to set.
+      pendingCandidateIndexRef.current = idx;
+      handlePreviewSegment(seg);
+    } else {
+      // Segment was dropped from results (all candidates rejected) — just
+      // update the candidate index and reposition the reference video.
+      setCandidateIndex(idx);
+      setIsPlaying(false);
+      refVideoRef.current?.pause();
+      clipVideoRef.current?.pause();
+      if (refVideoRef.current) refVideoRef.current.currentTime = candidate.segment.movieStart;
+    }
+    setViewAllCandidatesForKey(null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segments]);
+
+  // ---------------------------------------------------------------------------
   // Manual per-segment Retry — user-triggered, independent of whatever verdict
   // the automatic pipeline already reached. Kicks off the server-side retry,
   // then polls the same per-segment candidates endpoint (now carrying a
@@ -1886,12 +1915,28 @@ export default function App() {
                           <ConfidenceBadge confidence={seg.confidence} isApproximate={seg.isApproximate} />
                         </td>
 
-                        {/* Compare button */}
+                        {/* Compare + View all candidates buttons */}
                         <td className="px-4 py-3 text-right">
-                          <button onClick={() => handlePreviewSegment(seg)}
-                            className={`inline-flex items-center gap-1 px-3 py-1.5 border rounded-lg text-xs font-medium transition cursor-pointer ${isActive ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300' : 'bg-blue-500/10 hover:bg-blue-500/20 border-blue-500/20 text-blue-400'}`}>
-                            <Play className="w-3 h-3" /> Compare
-                          </button>
+                          <div className="inline-flex items-center gap-1.5">
+                            {/* View all candidates — only shown when candidate history exists */}
+                            {(() => {
+                              const cs = findCandidateSetForSegment(seg);
+                              if (!cs) return null;
+                              const isOpen = viewAllCandidatesForKey === cs.segmentIndex;
+                              return (
+                                <button
+                                  onClick={() => setViewAllCandidatesForKey(isOpen ? null : cs.segmentIndex)}
+                                  title={`View all ${cs.candidates.length} candidate(s) for this segment`}
+                                  className={`inline-flex items-center gap-1 px-2 py-1.5 border rounded-lg text-xs font-medium transition cursor-pointer ${isOpen ? 'bg-purple-500/20 border-purple-500/40 text-purple-300' : 'bg-purple-500/10 hover:bg-purple-500/20 border-purple-500/20 text-purple-400'}`}>
+                                  <ListChecks className="w-3 h-3" />
+                                </button>
+                              );
+                            })()}
+                            <button onClick={() => handlePreviewSegment(seg)}
+                              className={`inline-flex items-center gap-1 px-3 py-1.5 border rounded-lg text-xs font-medium transition cursor-pointer ${isActive ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300' : 'bg-blue-500/10 hover:bg-blue-500/20 border-blue-500/20 text-blue-400'}`}>
+                              <Play className="w-3 h-3" /> Compare
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );
@@ -2250,6 +2295,75 @@ export default function App() {
         )}
 
       </div>
+
+      {/* ── View All Candidates modal overlay ── */}
+      {viewAllCandidatesFor && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm"
+          onClick={() => setViewAllCandidatesForKey(null)}>
+          <div
+            className="bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-lg max-h-[80vh] flex flex-col overflow-hidden"
+            onClick={e => e.stopPropagation()}>
+
+            {/* Header */}
+            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
+              <div className="flex items-center gap-2 min-w-0">
+                <ListChecks className="w-4 h-4 text-purple-400 shrink-0" />
+                <h3 className="text-sm font-semibold text-slate-200 truncate">
+                  All Candidates — Segment {viewAllCandidatesFor.segmentIndex + 1}
+                </h3>
+                <span className="text-xs text-slate-500 font-mono shrink-0">
+                  {fmt(viewAllCandidatesFor.shortStart)}–{fmt(viewAllCandidatesFor.shortEnd)}
+                </span>
+              </div>
+              <button
+                onClick={() => setViewAllCandidatesForKey(null)}
+                className="ml-3 text-slate-500 hover:text-slate-300 transition cursor-pointer shrink-0">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Candidate list */}
+            <div className="overflow-y-auto flex-1 divide-y divide-slate-800/60">
+              {viewAllCandidatesFor.candidates.length === 0 ? (
+                <p className="px-5 py-6 text-xs text-slate-500 text-center">No candidates recorded.</p>
+              ) : (
+                viewAllCandidatesFor.candidates.map((c, idx) => {
+                  const isUsed = idx === (viewAllCandidatesFor.recoveredCandidateIndex ?? -1);
+                  return (
+                    <button
+                      key={idx}
+                      onClick={() => handleJumpToCandidate(viewAllCandidatesFor, idx)}
+                      className="w-full px-5 py-3 flex items-center gap-3 hover:bg-slate-800/60 transition text-left cursor-pointer group">
+                      <span className="text-[11px] font-mono text-slate-600 w-5 shrink-0 group-hover:text-slate-500">
+                        {idx + 1}
+                      </span>
+                      <div className="flex-1 min-w-0">
+                        <div className="font-mono text-xs text-slate-300">
+                          {fmt(c.segment.movieStart)}
+                          <span className="text-slate-600 mx-1">→</span>
+                          {fmt(c.segment.movieEnd)}
+                        </div>
+                        {c.confidencePct != null && (
+                          <div className="text-[10px] text-slate-500 font-mono mt-0.5">
+                            {c.confidencePct.toFixed(1)}% confidence
+                          </div>
+                        )}
+                      </div>
+                      <CandidateVerdictBadge candidate={c} isUsed={isUsed} />
+                    </button>
+                  );
+                })
+              )}
+            </div>
+
+            <div className="px-5 py-3 border-t border-slate-800 text-[11px] text-slate-600">
+              Click any row to jump the preview to that candidate&apos;s movie location.
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

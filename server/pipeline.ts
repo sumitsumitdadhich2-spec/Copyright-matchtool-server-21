@@ -285,9 +285,16 @@ export function extractFingerprints(
           height: task.height
         }, [task.frameBuffer.buffer]);
       }
-      // Resume only when the queue has drained to half the limit AND RSS is
-      // comfortably below the flush threshold (prevents yo-yo pausing).
-      const resumeAt = Math.max(2, Math.floor(dynamicQueueLimit / 2));
+      // Resume when the queue has drained to 75% of the limit (instead of
+      // 50%) AND RSS is comfortably below the flush threshold.
+      //
+      // Why 75%? With NUM_WORKERS hashing frames in parallel, the 50% threshold
+      // created windows where workers drained the remaining half-queue faster
+      // than a single-threaded ffmpeg could refill it, leaving workers idle
+      // (visible in [PipelineDiag] as idleWorkers > 0 with taskQueue == 0).
+      // At 75% ffmpeg restarts while the queue still has 3× NUM_WORKERS of
+      // headroom, almost eliminating those starvation gaps.
+      const resumeAt = Math.max(NUM_WORKERS * 2, Math.floor(dynamicQueueLimit * 3 / 4));
       if (
         taskQueue.length < resumeAt &&
         process.memoryUsage().rss < RAM_FLUSH_THRESHOLD_BYTES * 0.85 &&
