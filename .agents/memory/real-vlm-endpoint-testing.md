@@ -1,0 +1,10 @@
+---
+name: Real VLM endpoint testing quirks
+description: Gotchas when testing the video-matching app against a real (non-mocked) VLM_ENDPOINT_URL instead of a mocked fetch.
+---
+
+- Background shell processes started with `nohup ... &` (even with `setsid`/`disown`) do not survive past the ShellExec call that started them in this sandbox — the process is gone by the next tool call even though it logs "Server running". To run a genuinely persistent second server instance for manual testing, configure a temporary Replit workflow (`configureWorkflow` with `outputType: "console"`) instead, and remove it when done.
+- Workflow ports are restricted to a fixed allow-list (3000, 3001, 3002, 3003, 4200, 5000-webview-only, 5173, 6000, 6800, 8000, 8008, 8080, 8099, 9000). Pick one of these for a second/test instance — arbitrary ports like 5001 will not bind via `configureWorkflow`.
+- This app's legacy `/api/upload` endpoint deletes the source video after fingerprinting; only the chunked `/api/upload-chunk` endpoint retains the file (`videoPath` in job meta). VLM frame extraction and the Retry endpoint both need the retained video, so any real-VLM (or real frame-extraction) test must upload via `/api/upload-chunk` (even as a single chunk), not `/api/upload`, or Retry fails with "Original videos are no longer available for frame extraction."
+- **Why:** discovered while building an end-to-end Retry-button test against a real ngrok-hosted Qwen2.5-VL endpoint — both issues silently broke the test setup before the actual feature could be exercised.
+- Verified once against a real small quantized VLM (Qwen2.5-VL-7B Q4_K_M behind ngrok): it reliably returns `{same:true, confidence:95}` for two identical real photos, but returned `{same:false, confidence:0}` for byte-identical frames extracted from synthetic ffmpeg `testsrc`/`mandelbrot` test patterns. Treat that as a model/content limitation of synthetic test videos, not a bug in the app's VLM integration — confirm with a real-photo sanity call before suspecting the app's parsing/plumbing.

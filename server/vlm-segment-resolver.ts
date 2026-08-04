@@ -1,0 +1,221 @@
+/**
+ * Retry/replace loop that gates matched segments through VLM scene
+ * verification. Runs strictly AFTER groundMatchedSegments() has already
+ * produced its candidates — it never touches hash-matching speed or accuracy.
+ */
+import type { MatchedSegment } from './matching-engine';
+import { getAlternateCandidatesForRange } from './matching-engine';
+import {
+  extractFrameAsBase64,
+  verifySameScene,
+  isVlmAvailable,
+  resetVlmCache,
+  VLM_CONFIDENCE_THRESHOLD,
+  VLM_MAX_ATTEMPTS,
+  VLM_CONCURRENCY,
+} from './vlm-verify';
+
+// Fixed batch size for VLM server cache-reset points. Purely a cache-hygiene
+// boundary — does not change segment order, candidate selection, or verdicts.
+const VLM_RESET_BATCH_SIZE = 48;
+
+export interface VlmProgressInfo {
+  segmentIndex: number;
+  totalSegments: number;
+  attempt: number;
+  verdict: 'accepted' | 'rejected' | 'unverifiable' | 'dropped';
+}
+
+/**
+ * Pick the representative (shortTime, movieTime) pair to verify for a segment.
+ * `bestFrameDetail` carries per-channel similarity scores but not timestamps,
+ * so the actual frame pair always comes from the matchSequence midpoint
+ * (falling back to the segment bounds if the sequence is empty).
+ */
+export function pickRepresentativeFrames(seg: MatchedSegment): { shortTime: number; movieTime: number } {
+  const mid = seg.matchSequence[Math.floor(seg.matchSequence.length / 2)];
+  if (mid) return { shortTime: mid.shortTime, movieTime: mid.movieTime };
+  return { shortTime: seg.shortStart, movieTime: seg.movieStart };
+}
+
+/**
+ * Resolve a set of matched segments through VLM verification. Rejected
+ * candidates are replaced with the next-best alternative for the same
+ * short-clip range (drawn from `candidatePool`, never a small time-shift of
+ * the same rejected spot). After VLM_MAX_ATTEMPTS rejections for a range (or
+ * no more candidates), the range is dropped from the result entirely.
+ *
+ * Gracefully returns `segments` unchanged if the VLM endpoint is not
+ * configured or unreachable — the tool must keep working with the AWS GPU
+ * server off.
+ */
+export interface SegmentCandidateAttempt {
+  /** The candidate segment that was actually run through VLM at this attempt. */
+  segment: MatchedSegment;
+  verdict: 'accepted' | 'rejected' | 'unverifiable';
+  /** Present whenever the VLM call itself returned a parsed result (accepted or rejected). */
+  confidencePct?: number;
+}
+
+export interface SegmentResolvedInfo {
+  segmentIndex: number;
+  original: MatchedSegment;
+  /** Every candidate this pass actually ran through VLM for this range, in attempt order. */
+  triedCandidates: SegmentCandidateAttempt[];
+  /** The candidate ultimately kept for this range, or null if the range was dropped entirely. */
+  accepted: MatchedSegment | null;
+}
+
+export async function resolveSegmentsWithVLM(
+  segments: MatchedSegment[],
+  shortVideoPath: string,
+  movieVideoPath: string,
+  candidatePool: MatchedSegment[] | undefined,
+  onProgress?: (info: VlmProgressInfo) => void,
+  /**
+   * Optional side-effect fired once per segment, the instant this pass has a
+   * final verdict for it (accepted immediately, accepted after retries, or
+   * dropped after VLM_MAX_ATTEMPTS/no more candidates). Purely additive —
+   * does not change which segments are accepted/dropped, their order, or
+   * timing. Used by server.ts to persist full candidate-comparison history
+   * (for every segment, not only dropped ones) and to kick off background
+   * candidate discovery for a later deferred recovery pass; never awaited here.
+   */
+  onSegmentResolved?: (info: SegmentResolvedInfo) => void,
+): Promise<MatchedSegment[]> {
+  if (segments.length === 0) return segments;
+
+  const available = await isVlmAvailable();
+  if (!available) return segments;
+
+  // Explicit guarantee (not an incidental side effect) that each new
+  // video pair's VLM verification starts from clean server-side cache state.
+  await resetVlmCache('for new video pair');
+
+  // Slot for each segment's final outcome, filled in whatever order segments
+  // within a batch happen to finish — collected and sorted at the end, so
+  // completion order never affects the returned result.
+  const outcomes: (MatchedSegment | null)[] = new Array(segments.length).fill(null);
+
+  /**
+   * Runs the exact same retry/replace loop as before for a single segment.
+   * Segments are fully independent of each other: each only reads its own
+   * `original` bounds and the shared, read-only `candidatePool` — so running
+   * several of these concurrently changes nothing about which candidates are
+   * tried, in what preference order, or what verdict each one gets. Only
+   * wall-clock time changes.
+   */
+  async function resolveOneSegment(i: number): Promise<void> {
+    const original = segments[i];
+    let candidate: MatchedSegment | undefined = original;
+    const rejectedMovieTimestamps: number[] = [];
+    const triedCandidates: SegmentCandidateAttempt[] = [];
+    let attempt = 0;
+    let accepted: MatchedSegment | null = null;
+
+    while (candidate && attempt < VLM_MAX_ATTEMPTS) {
+      attempt++;
+      const triedCandidate = candidate;
+      const { shortTime, movieTime } = pickRepresentativeFrames(candidate);
+
+      let verdict: VlmProgressInfo['verdict'] = 'unverifiable';
+      try {
+        const [shortFrame, movieFrame] = await Promise.all([
+          extractFrameAsBase64(shortVideoPath, shortTime),
+          extractFrameAsBase64(movieVideoPath, movieTime),
+        ]);
+        const result = await verifySameScene(shortFrame, movieFrame);
+
+        if (result === null) {
+          // Could not verify — do not silently pass or fail; keep the
+          // candidate as-is rather than crashing the whole match.
+          verdict = 'unverifiable';
+          accepted = candidate;
+          triedCandidates.push({ segment: triedCandidate, verdict: 'unverifiable' });
+          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          break;
+        }
+
+        if (result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
+          verdict = 'accepted';
+          accepted = candidate;
+          triedCandidates.push({ segment: triedCandidate, verdict: 'accepted', confidencePct: result.confidencePct });
+          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          break;
+        }
+
+        verdict = 'rejected';
+        triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: result.confidencePct });
+        onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+      } catch (err: any) {
+        // Frame extraction failure (e.g. bad timestamp) — treat as
+        // unverifiable for this attempt rather than crashing the match.
+        console.warn(`[VLM] Frame extraction failed for segment ${i}, attempt ${attempt}: ${err?.message || err}`);
+        verdict = 'unverifiable';
+        accepted = candidate;
+        triedCandidates.push({ segment: triedCandidate, verdict: 'unverifiable' });
+        onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+        break;
+      }
+
+      // Rejected — look for the next-best alternative elsewhere in the movie,
+      // never re-showing an already-rejected movie timestamp for this range.
+      rejectedMovieTimestamps.push(candidate.movieStart);
+      const alternatives = getAlternateCandidatesForRange(
+        candidatePool,
+        original.shortStart,
+        original.shortEnd,
+        rejectedMovieTimestamps,
+      );
+      candidate = alternatives[0];
+    }
+
+    if (accepted) {
+      outcomes[i] = accepted;
+    } else {
+      console.log(
+        `[VLM] No genuine match found after ${attempt} attempt(s) for short-clip range ` +
+        `[${original.shortStart.toFixed(2)}s–${original.shortEnd.toFixed(2)}s] — dropping.`
+      );
+      onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'dropped' });
+    }
+
+    // Fires for EVERY segment (accepted first try, accepted after retries, or
+    // dropped) so the caller can persist full candidate-comparison history —
+    // not just what happened to previously-dropped segments.
+    onSegmentResolved?.({ segmentIndex: i, original, triedCandidates, accepted });
+  }
+
+  /**
+   * Runs `indices` with up to VLM_CONCURRENCY segments in flight at once.
+   * Each worker pulls the next unclaimed index off the shared cursor, so
+   * segments that finish quickly (fewer retries) immediately pick up the
+   * next one instead of waiting for the slowest one in a fixed pairing.
+   */
+  async function runPool(indices: number[]): Promise<void> {
+    let cursor = 0;
+    const workerCount = Math.min(VLM_CONCURRENCY, indices.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (cursor < indices.length) {
+        const idx = indices[cursor++];
+        await resolveOneSegment(idx);
+      }
+    });
+    await Promise.all(workers);
+  }
+
+  // Process in fixed-size batches — identical cache-reset boundaries to the
+  // previous sequential version (every VLM_RESET_BATCH_SIZE segments, plus
+  // the final partial batch), just with up to VLM_CONCURRENCY segments
+  // within each batch running at once instead of one at a time.
+  for (let batchStart = 0; batchStart < segments.length; batchStart += VLM_RESET_BATCH_SIZE) {
+    const batchEnd = Math.min(batchStart + VLM_RESET_BATCH_SIZE, segments.length);
+    const indices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
+    await runPool(indices);
+    await resetVlmCache(`after batch (segments ${batchStart + 1}-${batchEnd})`);
+  }
+
+  const resolved = outcomes.filter((s): s is MatchedSegment => s !== null);
+  resolved.sort((a, b) => a.shortStart - b.shortStart);
+  return resolved;
+}

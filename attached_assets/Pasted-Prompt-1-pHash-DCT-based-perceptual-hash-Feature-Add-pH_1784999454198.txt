@@ -1,0 +1,16 @@
+Prompt 1 — pHash (DCT-based perceptual hash)
+Feature: Add pHash to improve match recall (currently missing ~40% of true matches)
+Current matching in src/shared/fingerprint.ts and server/matching-engine.ts only uses aHash (average hash, brightness-threshold based) and dHash (gradient hash). This is too sensitive to compression, color grading, and minor edits, causing ~40% of true matches to be missed (false negatives).
+Implementation:
+In src/shared/fingerprint.ts, add a new function buildPHash(imageData, size) alongside the existing buildAHash and buildDHash functions. Implement a standard pHash: convert the frame to grayscale, downscale to a small size (e.g. 32x32), apply a 2D DCT (Discrete Cosine Transform), keep the top-left low-frequency 8x8 (or similar) coefficients, compute the median of those coefficients (excluding the DC term), and produce a 64-bit (or configurable) binary hash string where each bit is 1 if the coefficient is above the median.
+Add a phash?: string field to the VariantHashes interface (same pattern as dhash/fhash).
+Wire it into computeHashAndFeatures so it's computed for the same variants that currently get aHash/dHash, and gets stored in the fingerprint output alongside the existing hashes.
+In server/matching-engine.ts, add pHash into the similarity scoring: build a flat pHash array (same pattern as the existing aFlat/dFlat typed arrays and hammingN comparison), compute a pSim similarity score using Hamming distance, and combine it into the existing weighted similarity formula alongside aSim and dSim (pHash should generally be given higher trust than aHash for compression/color-grading robustness, similar to or higher than dHash's current weight).
+Since pHash is more compute-intensive than aHash/dHash, keep the input size small (e.g. 32x32) so it doesn't meaningfully slow down frame processing throughput. Benchmark before/after and report the frame processing time difference.
+Strict rules for this task:
+Do not change or remove the existing aHash/dHash matching logic — pHash is additive, combined into the existing weighted scoring, not a replacement.
+Do not break backward compatibility with existing fingerprint JSON files already stored in uploads/ from prior jobs (they lack a phash field) — matching code must gracefully handle missing phash (skip that signal's contribution, same as it currently does for missing dhash/fhash).
+Must not change or affect the actual video processing speed of the pipeline (ffmpeg extraction, frame throughput) beyond the small, benchmarked pHash computation cost — report this cost explicitly.
+Must not change matching accuracy for cases that already worked correctly — this is a recall improvement for missed matches, not a rework of the existing scoring for cases that already pass.
+After implementing, run the existing test files (test_e2e_match.mjs, test_v3_accuracy.mts, test_checkpoint.mjs) to confirm nothing existing breaks. Do not consider this task complete until all existing tests still pass.
+Do not touch or modify any files/logic unrelated to hashing and similarity scoring (e.g. do not modify job management, upload handling, frontend UI) as part of this task.

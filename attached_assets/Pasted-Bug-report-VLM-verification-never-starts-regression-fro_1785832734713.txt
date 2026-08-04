@@ -1,0 +1,65 @@
+Bug report: VLM verification never starts — regression from the concurrency-limiting/retry-backoff work
+Symptom
+After the most recent changes (adding VLM_MAX_CONCURRENT_REQUESTS /
+VLM_RESET_MAX_CONCURRENT_REQUESTS, the Semaphore class in
+server/vlm-verify.ts, fetchWithRetry/backoff logic, and the
+inconclusive-vs-rejected tracking), VLM verification no longer starts at
+all — not on a small test case, not on a large one.
+Confirmed behavior:
+Hash matching completes normally and logs [Match ...] Done: N segments, M unmatched ranges — this part is unaffected.
+After that point, zero [VLM] log lines ever appear — not
+verifySameScene, not cache-reset logs, nothing.
+This reproduces on the known-good small baseline (1007 movie frames / 450
+short frames / 6 segments) that previously completed successfully with VLM
+verification working end to end (before this concurrency-limiting work was
+added) — so this is confirmed to be a regression from that work, not a
+size/scale issue.
+Confirmed via curl https://<vlm-endpoint>/v1/models that the VLM server
+itself is reachable and healthy from the AWS host at the time of the test —
+so the app is not even attempting to reach a working VLM server.
+ps/top on the AWS host show the Node process alive and occasionally
+showing nonzero CPU (14%+ in one snapshot) rather than crashed or exited,
+suggesting the process is stuck/blocked somewhere rather than having thrown
+and been silently swallowed — consistent with a deadlock or a promise that
+never resolves, most likely in the new Semaphore implementation or
+wherever it gates entry into the VLM verification call path.
+What's needed
+Find and fix the regression that's preventing VLM verification from ever
+starting. The most likely cause, given the symptoms, is a bug in the new
+Semaphore (or equivalent concurrency gate) added for
+VLM_MAX_CONCURRENT_REQUESTS — e.g. a permit that's acquired but never
+released on some code path, an off-by-one in available permits, or the gate
+being awaited before it's ever initialized/populated. Audit that code path
+specifically: trace exactly what happens between "[Match ...] Done" being
+logged and the first verifySameScene call being attempted, and find where
+that chain is breaking or blocking.
+Non-negotiable constraints
+Do not remove or disable the concurrency-limiting/retry-backoff/inconclusive-
+tracking features to "fix" this — the goal is to find and fix the actual
+bug in that new code, not to revert it. If reverting to isolate the bug is
+useful for debugging, that's fine, but the final state must have the
+concurrency limiting, retry-with-backoff, and inconclusive-tracking features
+all working correctly AND VLM verification actually running.
+Do not change matching engine logic, VLM prompt content, confidence
+thresholds, or any accuracy-related behavior — this is purely a "the new
+concurrency code is blocking everything" bug, not a matching/accuracy issue.
+Once fixed, re-verify the previously-passing small baseline (1007/450
+frames) end to end: matching completes, VLM verification actually runs and
+logs [VLM] lines, segments get accepted/rejected as expected, and the job
+finishes with a real result — not just matching output with zero VLM
+activity.
+Acceptance criteria
+Run the small baseline test (1007 movie frames / 450 short frames).
+Confirm [VLM] log lines appear (verifySameScene calls, cache resets,
+etc.) shortly after the [Match ...] Done line — VLM verification must
+visibly start and run to completion.
+Confirm the job's final result includes real VLM-verified outcomes (not
+just the raw hash-matched segments with no VLM pass applied).
+Confirm VLM_MAX_CONCURRENT_REQUESTS is still being respected (no more
+than the configured number of concurrent requests in flight) once
+verification is unblocked — the fix must not just "let everything through
+unbounded" as a workaround; the concurrency limiting must still function
+correctly for its intended purpose (see prior task).
+Report specifically what the root cause was (e.g. "the semaphore was
+awaiting a promise that never resolved because X") so it's clear this was
+actually diagnosed and fixed, not worked around.

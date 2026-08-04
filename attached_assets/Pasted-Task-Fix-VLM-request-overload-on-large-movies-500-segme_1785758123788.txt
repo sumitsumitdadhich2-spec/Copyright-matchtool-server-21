@@ -1,0 +1,154 @@
+Task: Fix VLM request overload on large movies (500+ segments) — without touching matching accuracy
+Working baseline — confirm this stays true
+On a small test pair (~1007 movie frames, ~450 short-clip frames, resulting
+in 6 segments), the full pipeline — hash matching, VLM verification, batching
+(48-segment groups with cache reset), background candidate discovery, and the
+deferred recovery pass — completes successfully end to end, with clean VLM
+responses and no connection errors. This is the known-good baseline. Nothing in
+this task may regress that baseline.
+The problem — only appears at scale (large movies)
+On a full-length movie (141,016 movie frames, 3,450 short-clip frames,
+361 scene chunks, 111 accepted segments + 53 unmatched ranges, and a candidate
+pool of 1,400 alternate locations across those 361 chunks), the VLM server
+(llama.cpp on a remote GPU, reached via VLM_ENDPOINT_URL/ngrok) becomes
+overloaded and starts failing partway through the run. Observed in server logs,
+in this order as load increased:
+[VLM] Slot 0 erase returned 501 Not Implemented (x4, one per slot) — a
+separate, already-diagnosed issue (server wasn't started with
+--slot-save-path; being fixed independently on the VLM server config side,
+not an app code issue).
+A burst of [VLM] Endpoint returned 500 Internal Server Error,
+503 Service Unavailable, then a long run of 502 Bad Gateway (dozens of
+consecutive occurrences) during the main verification pass.
+[VLM] Cache reset after batch (segments 1-48) and (segments 49-96)
+still fired (confirming batching itself kept working), but the 502s
+continued into and after each reset.
+Eventually ECONNRESET — Client network socket disconnected before secure TLS connection was established — the connection itself started failing,
+not just returning error statuses, both for verifySameScene calls and for
+slot-erase calls.
+Despite all this, the run did not crash — it completed
+(Done: 111 segments, 53 unmatched ranges), batching and cache-reset
+checkpoints kept firing on schedule, and the deferred recovery pass started
+afterward (111 previously-rejected segment(s) to re-examine) — the
+existing "reset/VLM failures are best-effort, never fail the job" design
+held up. The issue is not a crash; it's that under this much concurrent/
+rapid load, the remote VLM server (and/or the ngrok tunnel in front of it)
+couldn't keep up, so a large fraction of verification calls during the
+overloaded window got answered with error codes or dropped connections
+instead of real verdicts — meaning many segments that could have been
+correctly verified were likely marked as failed/unverified simply because
+the request never got a real answer, not because the content didn't match.
+Root cause (most likely) — request volume/rate, not correctness logic
+A movie of this size produces a candidate pool of 1,400 alternates across 361
+chunks. Between the 111 initial verifications, the deferred pass re-examining
+111 rejected segments (each with up to 10 candidates = up to 1,110 additional
+calls), and cache-reset calls interspersed throughout, this is a very large
+number of HTTP calls converging on a single remote GPU server with only 4
+inference slots, fronted by a free-tier ngrok tunnel. The small-clip baseline
+(6 segments) never gets close to this volume, which is why it doesn't show the
+problem — this is a load/concurrency issue that only manifests at scale, not a
+logic bug in matching or verification.
+Non-negotiable constraints — READ CAREFULLY
+Do not change matching accuracy, matching logic, or which candidate gets
+picked/accepted/rejected for any segment. This task is entirely about
+pacing and resilience of the network calls to the VLM server — not about
+changing the matching engine, VLM prompt, confidence thresholds, candidate
+selection order, or accept/reject criteria in any way.
+Specifically forbidden:
+Do NOT change groundMatchedSegments(), scene-chunk detection, pass 1/2/3
+logic, or context validation in server/matching-engine.ts.
+Do NOT change the VLM prompt, confidence thresholds, VLM_MAX_ATTEMPTS, or
+what counts as an accept/reject verdict.
+Do NOT change which candidates are tried or in what order for a given
+segment (background discovery, the 10-candidate limit, and the deferred
+pass's sequential per-segment/per-candidate order all stay as designed).
+Do NOT weaken batching's guarantee (48-segment groups, reset after each
+batch and at the start of each new video pair) — timing/pacing changes must
+work within that structure, not replace it.
+You MAY change: how quickly/concurrently requests are sent to the VLM
+server, retry behavior on transient failures (5xx, ECONNRESET), and any
+client-side throttling/backoff — as long as it never changes which
+candidate a segment ends up accepting or the final accept/reject outcome
+compared to what unlimited, always-available VLM capacity would have
+produced. In other words: fixing this may make a run take longer wall-clock
+time under heavy load, but must never make it pick a different answer.
+What to build
+1. Add retry-with-backoff for transient VLM failures
+For verifySameScene calls (and the reset/slot-erase calls), treat these as
+transient and retryable, distinct from a genuine "VLM says no match" verdict:
+HTTP 500, 502, 503 (server-side overload/unavailability)
+ECONNRESET and similar connection-level errors (not a real answer, just a
+failed attempt to get one)
+On these specific failures, retry with exponential backoff (e.g. wait 1s, then
+2s, then 4s, capped at a small number of attempts — 3 is reasonable) before
+giving up. This must be clearly distinguished from the existing
+VLM_MAX_ATTEMPTS logic (which governs how many different candidates get
+tried for a segment) — this retry is about getting a real answer for one
+specific request that failed to complete, not about moving to the next
+candidate. Only after retries are exhausted should a request be treated as
+"no verdict obtained," which should NOT be silently counted as a rejection —
+see point 3.
+2. Add basic concurrency limiting / rate limiting to the VLM request layer
+Introduce a simple concurrency cap (e.g. a semaphore or queue) on how many
+VLM requests are in flight to the remote server at once, across the whole
+pipeline — main verification pass, background candidate discovery, and the
+deferred pass combined. Pick a reasonable default (e.g. cap at 4 concurrent
+requests, matching the server's 4 inference slots) and make it configurable
+via an env var (e.g. VLM_MAX_CONCURRENT_REQUESTS) so it can be tuned without
+a code change. This spreads out request volume over time instead of firing
+everything at once, which is the most likely reason the server/tunnel got
+overwhelmed on the large-movie run.
+3. Do not silently treat "no verdict obtained" as a rejection
+Currently, if a VLM call fails, it's unclear from the logs whether the
+pipeline treats that as "rejected" (moves to next candidate) or as a distinct
+"couldn't verify" state. Audit this: if a segment/candidate's VLM call
+exhausts its retries (per point 1) without ever getting a real response, this
+must be logged and tracked as a distinct outcome (e.g. "verification
+inconclusive — VLM unreachable") separate from "VLM said no match." Do not let
+this silently consume one of the segment's VLM_MAX_ATTEMPTS candidate-tries in
+a way indistinguishable from a genuine rejection, since that would mean
+transient server overload — not real content mismatch — is what's causing
+segments to end up unmatched. Surface this distinctly so it's possible to
+tell, from results or logs, how many "unmatched" outcomes were genuine
+rejections versus inconclusive-due-to-server-overload.
+4. Keep the reset/slot-erase calls low-priority relative to verification calls
+Cache-reset calls (from the batching feature) are hygiene, not correctness —
+they should not compete for the same concurrency budget as actual
+verification calls that are blocking real progress on segments. If using a
+concurrency limiter (point 2), give reset calls their own small allowance or
+lower priority so a burst of verification requests isn't blocked waiting on
+reset calls, and vice versa a slow/hung reset call doesn't eat into
+verification's concurrency budget.
+Acceptance criteria
+Re-run the same small-clip baseline (1007/450 frames, 6 segments) end to
+end. Confirm identical behavior and timing to before this change — no
+regression on the working case.
+Re-run the large-movie case (or a comparably large test) that previously
+produced 502/503/ECONNRESET errors. Confirm:
+Transient 5xx/ECONNRESET failures are now retried with backoff rather
+than immediately counted against the segment.
+Request concurrency to the VLM server stays within the configured cap
+throughout the run (verify via logs or timing — no large bursts of
+simultaneous requests).
+Any verification that still fails after retries is logged and tracked
+distinctly as "inconclusive" rather than silently merged into normal
+rejection counts.
+Confirm the final accept/reject outcome for every segment in a controlled
+test (same input, VLM server healthy throughout) is identical whether this
+change is present or not — this task must not alter matching results, only
+the network resilience getting requests to and from the VLM server.
+Confirm batching (48-segment cache resets) and the new-video-pair reset
+still fire on the same schedule as before, and that reset calls no longer
+starve or get starved by verification calls under load.
+VLM_MAX_CONCURRENT_REQUESTS (or equivalent) is configurable via env var
+with a sensible default, documented in whatever .env/README convention
+the project already uses for other VLM-related env vars.
+Summary of the one rule that matters most
+This is a network resilience and pacing fix, not a matching or verification
+logic change. Add retries for transient failures (5xx, connection resets),
+cap concurrent requests to the VLM server so it doesn't get overwhelmed, and
+make sure requests that never got a real answer are tracked as "inconclusive"
+rather than silently counted as rejections. The final matching output for any
+given input, when the VLM server has enough capacity to answer everything,
+must be byte-for-byte identical to today's output — only the pipeline's
+resilience under overload should change.
