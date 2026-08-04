@@ -1165,12 +1165,17 @@ export default function App() {
   // ---------------------------------------------------------------------------
   // Preview: seek + auto-play
   // ---------------------------------------------------------------------------
-  const handlePreviewSegment = (seg: MatchedSegment) => {
+  // `movieSeekOverride` lets callers (e.g. jumping to a specific candidate
+  // from the "View all candidates" panel) land the reference video on a
+  // different movie timestamp than this segment's own accepted match,
+  // without touching the short-clip side (which always stays anchored to
+  // the segment, per `movieViewSegment`'s contract elsewhere in this file).
+  const handlePreviewSegment = (seg: MatchedSegment, movieSeekOverride?: number) => {
     setPreviewSegment(seg);
     setIsPlaying(false);
     setTimeout(() => {
       if (refVideoRef.current) {
-        refVideoRef.current.currentTime  = seg.movieStart;
+        refVideoRef.current.currentTime  = movieSeekOverride ?? seg.movieStart;
         refVideoRef.current.playbackRate = playbackSpeed;
       }
       if (clipVideoRef.current) {
@@ -1249,23 +1254,37 @@ export default function App() {
     const seg = segments.find(s =>
       Math.abs(s.shortStart - cs.shortStart) < 0.05 &&
       Math.abs(s.shortEnd - cs.shortEnd) < 0.05);
-    if (seg) {
-      // pendingCandidateIndexRef prevents the "reset to recovered default"
-      // effect from overwriting the index we're about to set.
+
+    if (seg && seg !== previewSegment) {
+      // Switching to a different segment. pendingCandidateIndexRef makes the
+      // "reset candidate index" effect land on this candidate instead of the
+      // recovered default, and movieSeekOverride seeks the reference video
+      // straight to THIS candidate's location — not the segment's own
+      // accepted match, which is what handlePreviewSegment would otherwise
+      // seek to on its own.
       pendingCandidateIndexRef.current = idx;
-      handlePreviewSegment(seg);
-    } else {
-      // Segment was dropped from results (all candidates rejected) — just
-      // update the candidate index and reposition the reference video.
+      handlePreviewSegment(seg, candidate.segment.movieStart);
+    } else if (seg) {
+      // Same segment already previewed — the "previewSegment changed" effect
+      // won't fire again (same object reference), so update candidateIndex
+      // and reposition the video directly here, mirroring handleCandidateStep.
       setCandidateIndex(idx);
       setIsPlaying(false);
       refVideoRef.current?.pause();
       clipVideoRef.current?.pause();
+      if (refVideoRef.current)  refVideoRef.current.currentTime  = candidate.segment.movieStart;
+      if (clipVideoRef.current) clipVideoRef.current.currentTime = seg.shortStart;
+    } else {
+      // Segment was dropped from results (all candidates rejected) — no
+      // previewSegment to switch to, just reposition the reference video.
+      setCandidateIndex(idx);
+      setIsPlaying(false);
+      refVideoRef.current?.pause();
       if (refVideoRef.current) refVideoRef.current.currentTime = candidate.segment.movieStart;
     }
     setViewAllCandidatesForKey(null);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [segments]);
+  }, [segments, previewSegment]);
 
   // ---------------------------------------------------------------------------
   // Manual per-segment Retry — user-triggered, independent of whatever verdict

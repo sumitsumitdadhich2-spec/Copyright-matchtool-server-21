@@ -1,0 +1,110 @@
+Replit Prompt — Fix 1: Worker pool underutilized during fingerprinting
+Problem
+On the AWS deploy (8 CPU cores, NUM_WORKERS correctly computed as 8 in
+server/pipeline.ts), fingerprinting is consistently slow on every new
+video, even after a clean restart and a fresh video upload. top during an
+active job shows:
+Overall CPU ~49% idle (should be near-saturated if 8 workers are busy)
+A single node process using ~363% CPU (~3.6 cores), not close to 800%
+load average moderate, not spiking to match 8 active workers
+This means the worker_threads pool in server/pipeline.ts is not keeping
+all 8 workers fed with frames during fingerprinting — throughput is capped
+well below what the hardware allows.
+What to investigate
+In server/pipeline.ts, look at assignTasks(), the ffmpeg stdout
+pipe/backpressure handling (ffmpegProcess.stdout.pause() /
+.resume()), and dynamicQueueLimit / RAM_FLUSH_THRESHOLD_BYTES
+logic. Confirm whether ffmpeg's raw-frame stdout stream is being
+paused/throttled too aggressively, starving the worker pool of frames
+even when workers are idle and CPU is available.
+Check whether taskQueue is actually being kept full enough that
+idleWorkers.length > 0 && taskQueue.length > 0 stays true throughout
+the run, or whether the queue frequently drains to zero (bottlenecked by
+ffmpeg decode speed rather than worker hashing speed).
+Confirm all NUM_WORKERS (8) workers are actually being assigned tasks
+concurrently — instrument or log idleWorkers.length /
+taskQueue.length over time during a real run to see whether the pool
+ever reaches 8 busy workers, or plateaus lower.
+Check if ffmpeg's own decode speed (single ffmpeg process, single-threaded
+by default for this codec/resolution) is the actual bottleneck — i.e.
+workers are idle because frames aren't arriving fast enough from ffmpeg,
+not because of a worker-side issue. If so, consider whether ffmpeg
+should be given more threads (-threads N) or whether decode itself is
+the ceiling.
+Constraints
+Do not change the perceptual-hashing / fingerprint algorithm itself, or
+any accuracy-affecting matching logic in matching-engine.ts,
+vlm-verify.ts, or vlm-segment-resolver.ts.
+Do not change NUM_WORKERS sizing logic in a way that could exceed
+available cores or destabilize other running jobs.
+Keep the existing RAM-based backpressure/flush safety mechanism intact —
+only fix if it is throttling more aggressively than necessary.
+Add temporary diagnostic logging if needed to confirm the actual
+bottleneck before changing behavior, and report what the logging showed.
+Replit Prompt — Fix 2: Always-visible Retry + full candidate history view
+Current behavior
+In the Compare / Side-by-Side segment preview UI (src/App.tsx), each
+segment already has a manual "Retry" button next to the Compare controls,
+but it is only rendered when activeCandidateSet is non-null — i.e. only
+when the on-disk <matchJobId>_candidates_<segmentIndex>.json file exists
+for that segment. Currently this file is written for segments the VLM pass
+touched (accepted or rejected), which is correct — the button is meant to
+work for both accepted and rejected segments already. What's missing is a
+way to see the entire candidate history at once, not just step through
+one candidate at a time with "Next Candidate".
+Requested changes
+1. Retry button — confirm/ensure it's available for every segment regardless of verdict
+The Retry button must appear next to the Compare action for every
+segment that has any candidate history — whether the VLM accepted the
+current match or rejected it. Do not gate it on verdict, only on candidate
+data existing. (Verify this is already true in the current
+activeCandidateSet && condition around line ~2072 of src/App.tsx; if
+there's any additional verdict-based gating anywhere else in the render
+path, remove it.)
+Retry must keep using the existing two-tier logic already implemented in
+server/candidate-retry.ts:
+Tier 1: try the next unchecked candidate from the existing
+unchecked_pool first (cheap, no new search).
+Tier 2: only if the pool is exhausted, run a broader_search limited to
+that segment's short-clip time range with relaxed thresholds.
+Do not change this retry algorithm — only ensure the button triggering it
+is consistently visible.
+2. New "View all candidates" button next to Compare
+Add a new icon button (suggest an arrow or list icon, distinguishable from
+the existing chevron-based Next/Previous Candidate buttons) placed directly
+beside the Compare button for every segment row in the results table.
+On click, it opens a panel/modal listing all candidates ever recorded
+for that segment's StoredCandidateSet (the full candidates: CandidateCheck[] array from server/candidate-recovery.ts — this data
+already contains verdict: 'accepted' | 'rejected' | 'unverifiable' and
+confidencePct per candidate, so no backend schema change should be
+needed to get this data; confirm the existing
+GET /api/match/{matchJobId}/candidates/{segmentIndex} route already
+returns the full array, and use that).
+For each candidate in the list, show:
+Its movie timestamp range
+Its verdict (accepted / rejected / unverifiable), visually distinguished
+(e.g. color-coded badge, reusing the existing CandidateVerdictBadge
+component if possible instead of building a new one)
+Its confidence percentage if present
+Whether it is the currently active/used candidate for this segment
+(recoveredCandidateIndex)
+Each row in this list should be clickable to jump the main preview to that
+specific candidate (reuse the existing handleCandidateStep /
+candidate-index-switching mechanism rather than duplicating it).
+Constraints
+Do not introduce a second candidate-discovery or scoring algorithm —
+this feature only needs to display data that
+buildCandidateHistoryEntry / buildAcceptedCandidateHistoryEntry in
+server/candidate-recovery.ts already persist to disk.
+Do not modify server/vlm-verify.ts, server/matching-engine.ts, or the
+accuracy-affecting parts of server/vlm-segment-resolver.ts.
+Keep this purely additive in the UI layer (src/App.tsx and any new
+small component you extract from it) plus, if genuinely needed, a
+read-only backend route reusing existing stored data — do not change the
+shape or meaning of any existing API response field other tools depend
+on.
+After implementing, confirm manually that: (a) Retry still works
+correctly on both an accepted and a rejected segment, (b) the new
+candidate-list button shows every candidate with the correct verdict and
+lets you jump to any of them, and (c) none of this affects the actual
+match results JSON written to disk.
