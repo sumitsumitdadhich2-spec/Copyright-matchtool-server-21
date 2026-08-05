@@ -441,6 +441,17 @@ export default function App() {
   const [retryingSegments, setRetryingSegments] = useState<Set<number>>(new Set());
   const [retryError, setRetryError] = useState<string>('');
 
+  // Inline per-segment candidate expansion (additive UI) — keyed by the
+  // candidate set's segmentIndex, same keying discipline as
+  // viewAllCandidatesForKey above so a Retry-triggered refetch never leaves a
+  // stale panel open. Multiple segments can be expanded at once.
+  const [expandedCandidateKeys, setExpandedCandidateKeys] = useState<Set<number>>(new Set());
+
+  // In-flight "Make main segment" selection — `${segmentIndex}:${candidateIndex}`
+  // while the POST is running, '' otherwise. Disables just that one button.
+  const [selectingCandidateKey, setSelectingCandidateKey] = useState<string>('');
+  const [selectError, setSelectError] = useState<string>('');
+
   const refVideoRef  = useRef<HTMLVideoElement>(null);
   const clipVideoRef = useRef<HTMLVideoElement>(null);
   const loopRef      = useRef({ loop: true, seg: null as MatchedSegment | null });
@@ -1336,6 +1347,66 @@ export default function App() {
   }, [segments, previewSegment]);
 
   // ---------------------------------------------------------------------------
+  // "Make main segment" — user promotes a candidate they visually verified to
+  // be the active match for its short-clip range. Purely additive: calls the
+  // new select-candidate endpoint (which reuses the exact segment-swap logic
+  // Retry already uses on acceptance), then refreshes state through the same
+  // fetch paths the rest of the app already uses. Never touches matching.
+  // ---------------------------------------------------------------------------
+  const handleMakeMainCandidate = async (cs: StoredCandidateSet, idx: number) => {
+    if (!matchJobId) { setSelectError('No active match job — re-run matching to enable selection.'); return; }
+    const key = `${cs.segmentIndex}:${idx}`;
+    if (selectingCandidateKey) return; // one selection at a time keeps state simple & safe
+    setSelectError('');
+    setSelectingCandidateKey(key);
+    try {
+      const res = await fetch(`/api/match/${matchJobId}/segment/${cs.segmentIndex}/select-candidate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ candidateIndex: idx }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setSelectError(err?.error || 'Could not make this candidate the main segment.');
+        return;
+      }
+      const data = await res.json();
+      const newSegments: MatchedSegment[] = data.segments || [];
+      setSegments(newSegments);
+      await refreshCandidateSets();
+
+      // Keep the preview in sync if the previewed segment covered this range —
+      // same range-overlap sync the Retry flow performs after a swap.
+      if (previewSegment) {
+        const overlapsPreview =
+          Math.min(previewSegment.shortEnd, cs.shortEnd) - Math.max(previewSegment.shortStart, cs.shortStart) > 0;
+        if (overlapsPreview) {
+          const promoted = newSegments.find(s =>
+            Math.min(s.shortEnd, cs.shortEnd) - Math.max(s.shortStart, cs.shortStart) > 0);
+          if (promoted && promoted !== previewSegment) {
+            pendingCandidateIndexRef.current = idx;
+            setPreviewSegment(promoted);
+          }
+        }
+      }
+      setStatus(`Candidate ${idx + 1} is now the main match for segment range ${fmt(cs.shortStart)}–${fmt(cs.shortEnd)}.`);
+    } catch {
+      setSelectError('Network error while making this candidate the main segment.');
+    } finally {
+      setSelectingCandidateKey('');
+    }
+  };
+
+  const toggleCandidateExpansion = (segmentKey: number) => {
+    setExpandedCandidateKeys(prev => {
+      const next = new Set(prev);
+      if (next.has(segmentKey)) next.delete(segmentKey);
+      else next.add(segmentKey);
+      return next;
+    });
+  };
+
+  // ---------------------------------------------------------------------------
   // Manual per-segment Retry — user-triggered, independent of whatever verdict
   // the automatic pipeline already reached. Kicks off the server-side retry,
   // then polls the same per-segment candidates endpoint (now carrying a
@@ -1921,8 +1992,11 @@ export default function App() {
                     const clipDur  = seg.shortEnd - seg.shortStart;
                     const movieDur = seg.movieEnd - seg.movieStart;
                     const isActive = previewSegment === seg;
+                    const rowCs = findCandidateSetForSegment(seg);
+                    const isExpanded = rowCs ? expandedCandidateKeys.has(rowCs.segmentIndex) : false;
                     return (
-                      <tr key={i}
+                      <React.Fragment key={i}>
+                      <tr
                         className={`transition-colors hover:bg-slate-800/40 ${isActive ? 'bg-indigo-900/20 ring-1 ring-inset ring-indigo-500/30' : ''}`}>
                         <td className="px-4 py-3 font-mono text-slate-500 text-xs">{i + 1}</td>
 
@@ -1986,6 +2060,18 @@ export default function App() {
                         {/* Compare + View all candidates buttons */}
                         <td className="px-4 py-3 text-right">
                           <div className="inline-flex items-center gap-1.5">
+                            {/* Inline candidate expansion toggle — shows every
+                                candidate (accepted / rejected / not checked)
+                                for this segment right below the row */}
+                            {rowCs && (
+                              <button
+                                onClick={() => toggleCandidateExpansion(rowCs.segmentIndex)}
+                                title={isExpanded ? 'Hide candidates' : `Show all ${rowCs.candidates.length} candidate(s) below this row`}
+                                className={`inline-flex items-center gap-1 px-2 py-1.5 border rounded-lg text-xs font-medium transition cursor-pointer ${isExpanded ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300' : 'bg-emerald-500/10 hover:bg-emerald-500/20 border-emerald-500/20 text-emerald-400'}`}>
+                                {isExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                                <span className="hidden sm:inline">{rowCs.candidates.length}</span>
+                              </button>
+                            )}
                             {/* View all candidates — only shown when candidate history exists */}
                             {(() => {
                               const cs = findCandidateSetForSegment(seg);
@@ -2007,11 +2093,98 @@ export default function App() {
                           </div>
                         </td>
                       </tr>
+
+                      {/* ── Inline candidate list (expanded) — additive UI ── */}
+                      {rowCs && isExpanded && (
+                        <tr className="bg-slate-950/60">
+                          <td colSpan={7} className="px-4 py-3">
+                            <div className="rounded-xl border border-slate-800 bg-slate-900/70 overflow-hidden">
+                              <div className="flex items-center justify-between px-4 py-2.5 border-b border-slate-800 bg-slate-950/50">
+                                <p className="text-[11px] font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                                  <ListChecks className="w-3.5 h-3.5 text-emerald-400" />
+                                  Candidates for Segment {i + 1}
+                                  <span className="font-normal font-mono text-slate-500 normal-case">
+                                    {fmt(rowCs.shortStart)}–{fmt(rowCs.shortEnd)}
+                                  </span>
+                                </p>
+                                <span className="text-[10px] font-mono text-slate-600">
+                                  {rowCs.candidates.length} candidate(s)
+                                </span>
+                              </div>
+                              {rowCs.candidates.length === 0 ? (
+                                <p className="px-4 py-4 text-xs text-slate-500 text-center">No candidates recorded for this segment.</p>
+                              ) : (
+                                <div className="divide-y divide-slate-800/60 max-h-64 overflow-y-auto">
+                                  {rowCs.candidates.map((c, cIdx) => {
+                                    const isUsed = cIdx === (rowCs.recoveredCandidateIndex ?? -1);
+                                    const selKey = `${rowCs.segmentIndex}:${cIdx}`;
+                                    const isSelecting = selectingCandidateKey === selKey;
+                                    const segmentBusy = retryingSegments.has(rowCs.segmentIndex) || !!rowCs.retrying;
+                                    return (
+                                      <div key={cIdx}
+                                        className={`px-4 py-2.5 flex flex-wrap items-center gap-3 transition-colors ${isUsed ? 'bg-indigo-500/5' : 'hover:bg-slate-800/40'}`}>
+                                        <span className="text-[11px] font-mono text-slate-600 w-5 shrink-0">{cIdx + 1}</span>
+                                        <div className="flex-1 min-w-[140px]">
+                                          <div className="font-mono text-xs text-slate-300">
+                                            {fmt(c.segment.movieStart)}
+                                            <span className="text-slate-600 mx-1">→</span>
+                                            {fmt(c.segment.movieEnd)}
+                                          </div>
+                                          {c.confidencePct != null && (
+                                            <div className="text-[10px] text-slate-500 font-mono mt-0.5">
+                                              {c.confidencePct.toFixed(1)}% confidence
+                                            </div>
+                                          )}
+                                        </div>
+                                        <CandidateVerdictBadge candidate={c} isUsed={isUsed} />
+                                        <div className="flex items-center gap-1.5 ml-auto">
+                                          <button
+                                            onClick={() => handleJumpToCandidate(rowCs, cIdx)}
+                                            title="Preview this candidate in the compare panel below"
+                                            className="inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-[11px] font-medium bg-blue-500/10 hover:bg-blue-500/20 border-blue-500/20 text-blue-400 transition cursor-pointer">
+                                            <Play className="w-3 h-3" /> Preview
+                                          </button>
+                                          {isUsed ? (
+                                            <span className="inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-[11px] font-semibold bg-indigo-500/10 border-indigo-500/25 text-indigo-300">
+                                              ★ Main
+                                            </span>
+                                          ) : (
+                                            <button
+                                              onClick={() => handleMakeMainCandidate(rowCs, cIdx)}
+                                              disabled={isSelecting || !!selectingCandidateKey || segmentBusy || isMatching}
+                                              title="Make this candidate the main match for this segment (you verified it yourself)"
+                                              className="inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-[11px] font-semibold bg-emerald-500/10 hover:bg-emerald-500/20 disabled:opacity-40 disabled:cursor-not-allowed border-emerald-500/25 text-emerald-300 transition cursor-pointer">
+                                              {isSelecting
+                                                ? <><RefreshCw className="w-3 h-3 animate-spin" /> Saving…</>
+                                                : <><CheckCircle2 className="w-3 h-3" /> Make Main</>}
+                                            </button>
+                                          )}
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      </React.Fragment>
                     );
                   })}
                 </tbody>
               </table>
             </div>
+
+            {selectError && (
+              <div className="px-4 py-2 border-t border-red-900/40 bg-red-500/5 flex items-center gap-2 text-xs text-red-300">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                {selectError}
+                <button onClick={() => setSelectError('')} className="ml-auto text-red-400/70 hover:text-red-300 cursor-pointer">
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
           </section>
         )}
 
@@ -2202,6 +2375,20 @@ export default function App() {
                       </button>
                     </div>
                     {currentCandidate && <CandidateVerdictBadge candidate={currentCandidate} isUsed={isUsed} />}
+                    {/* Make Main — promote the currently-stepped candidate the
+                        user just visually verified (hidden when it already IS
+                        the main match). Same handler as the inline table. */}
+                    {currentCandidate && !isUsed && (
+                      <button
+                        onClick={() => handleMakeMainCandidate(activeCandidateSet, candidateIndex)}
+                        disabled={!!selectingCandidateKey || isCurrentSegmentRetrying || isMatching}
+                        title="Make this candidate the main match for this segment"
+                        className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-emerald-500/10 hover:bg-emerald-500/20 disabled:opacity-40 disabled:cursor-not-allowed border border-emerald-500/30 text-emerald-300 transition cursor-pointer">
+                        {selectingCandidateKey === `${activeCandidateSet.segmentIndex}:${candidateIndex}`
+                          ? <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Saving…</>
+                          : <><CheckCircle2 className="w-3.5 h-3.5" /> Make Main</>}
+                      </button>
+                    )}
                   </>
                 );
               })()}

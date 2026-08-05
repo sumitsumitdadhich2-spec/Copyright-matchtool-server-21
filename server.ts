@@ -13,6 +13,7 @@ import {
   buildCandidateHistoryEntry,
   buildHashOnlyCandidateHistoryEntry,
   writeCandidatesFileAsync,
+  writeCandidatesFileSync,
   listCandidateFilesForJob,
   readCandidatesFile,
   deleteCandidateFilesForJob,
@@ -1404,6 +1405,85 @@ async function startServer() {
         retryInFlight.delete(key);
       }
     })();
+  });
+
+  // 6k. Manual candidate selection ("Make main segment") — purely additive,
+  // user-triggered action. NEVER touches the matching engine, VLM resolver, or
+  // recovery passes: it only swaps which already-discovered candidate is the
+  // active match for a short-clip range, exactly the same segment-swap +
+  // persist logic the Retry endpoint above already performs on acceptance.
+  app.post('/api/match/:matchJobId/segment/:segmentIndex/select-candidate', async (req, res) => {
+    const { matchJobId, segmentIndex: segmentIndexStr } = req.params;
+    const segmentIndex = Number(segmentIndexStr);
+    const candidateIndex = Number(req.body?.candidateIndex);
+    if (!Number.isFinite(segmentIndex)) return res.status(400).json({ error: 'segmentIndex must be a number' });
+    if (!Number.isFinite(candidateIndex)) return res.status(400).json({ error: 'candidateIndex must be a number' });
+
+    const job = matchJobs.get(matchJobId) ?? loadMatchJobFromDisk(matchJobId);
+    if (!job) return res.status(404).json({ error: 'Match job not found' });
+    if (job.status !== 'completed') return res.status(400).json({ error: 'Match job is not completed yet' });
+
+    // Don't fight a running Retry for the same segment — it would overwrite
+    // this selection (or vice versa) when it finishes.
+    if (retryInFlight.has(retryKey(matchJobId, segmentIndex))) {
+      return res.status(409).json({ error: 'A Retry is currently running for this segment — wait for it to finish first.' });
+    }
+
+    const entry = readCandidatesFile(uploadDir, matchJobId, segmentIndex);
+    if (!entry) return res.status(404).json({ error: 'No candidate data for this segment' });
+    const candidate = entry.candidates[candidateIndex];
+    if (!candidate) return res.status(404).json({ error: 'Candidate not found' });
+
+    const newSeg = candidate.segment;
+    const segsArr: any[] = job.segments ?? [];
+
+    // Find the active segment for this candidate file's short-clip range —
+    // exact range first (same 0.05s tolerance used everywhere), then largest
+    // overlap as fallback (a previous swap can shift the active range slightly).
+    let arrIdx = segsArr.findIndex((s: any) =>
+      Math.abs(s.shortStart - entry.shortStart) < 0.05 &&
+      Math.abs(s.shortEnd - entry.shortEnd) < 0.05);
+    if (arrIdx === -1) {
+      let bestOverlap = 0;
+      segsArr.forEach((s: any, i: number) => {
+        const overlap = Math.min(s.shortEnd, entry.shortEnd) - Math.max(s.shortStart, entry.shortStart);
+        if (overlap > bestOverlap) { bestOverlap = overlap; arrIdx = i; }
+      });
+    }
+
+    if (arrIdx !== -1) {
+      segsArr[arrIdx] = newSeg;
+      job.segments = segsArr;
+    } else {
+      // Range had no active segment (previously dropped) — add it now.
+      job.segments = [...segsArr, newSeg].sort((a: any, b: any) => a.shortStart - b.shortStart);
+    }
+
+    try {
+      await fs.promises.writeFile(matchResultPath(matchJobId), JSON.stringify({
+        segments: job.segments,
+        unmatchedRanges: job.unmatchedRanges,
+        movieFrames: job.movieFrames,
+        shortFrames: job.shortFrames,
+        vlmStats: job.vlmStats,
+      }));
+    } catch (e) {
+      console.error(`[SelectCandidate] Failed to persist result for ${matchJobId}:`, e);
+      return res.status(500).json({ error: 'Could not persist the selection to disk.' });
+    }
+
+    // Record the user's choice in the candidate history so the ★ Used badge
+    // follows the selection everywhere in the UI.
+    try {
+      entry.recoveredCandidateIndex = candidateIndex;
+      writeCandidatesFileSync(uploadDir, matchJobId, segmentIndex, entry);
+    } catch (e) {
+      console.error(`[SelectCandidate] Failed to update candidate file for ${matchJobId} seg ${segmentIndex}:`, e);
+      // Segments were already persisted — not fatal for the selection itself.
+    }
+
+    console.log(`[SelectCandidate] Match ${matchJobId} segment ${segmentIndex}: candidate ${candidateIndex} promoted to main match by user.`);
+    res.json({ ok: true, segments: job.segments, unmatchedRanges: job.unmatchedRanges });
   });
 
   // 7. Worker Accuracy Calibration
