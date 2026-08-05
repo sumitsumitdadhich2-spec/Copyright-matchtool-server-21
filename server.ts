@@ -1040,10 +1040,16 @@ async function startServer() {
         // this one for that same index. Purely additive — reuses the
         // already-computed candidatePool, never affects which segments the
         // main pass accepted or their order.
-        result.segments.forEach((segment, index) => {
+        // Awaited (in parallel) so the files are guaranteed on disk before
+        // the job can flip to `completed` — otherwise a fast no-VLM run lets
+        // the frontend fetch /candidates before any file exists and the
+        // "View all candidates" button never shows. Write failures are
+        // caught+logged inside writeCandidatesFileAsync, so this can never
+        // fail the match itself.
+        await Promise.all(result.segments.map((segment, index) => {
           const entry = buildHashOnlyCandidateHistoryEntry(index, segment, result.candidatePool);
-          writeCandidatesFileAsync(uploadDir, matchJobId, index, entry);
-        });
+          return writeCandidatesFileAsync(uploadDir, matchJobId, index, entry);
+        }));
 
         // ── Optional VLM scene-verification pass ────────────────────────────
         // Only runs when both original video files are still on disk (jobs from
@@ -1545,6 +1551,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
+    console.log('[v2] View-All-Candidates build active');
     console.log(`Server ready. Detected ${os.cpus().length} CPU cores. Worker pool sized to ${NUM_WORKERS} workers.`);
     console.log(`Server running on http://localhost:${PORT}`);
   });

@@ -179,18 +179,21 @@ export function buildHashOnlyCandidateHistoryEntry(
 }
 
 /**
- * Fire-and-forget write of a freshly-discovered candidate set to disk.
- * Never awaited by the caller — a failure here must not affect (or slow)
- * the ongoing main VLM verification pass, only be logged.
+ * Async write of a freshly-discovered candidate set to disk. Errors are
+ * always caught and logged internally — a failure here must not affect the
+ * ongoing main VLM verification pass. Returns the underlying promise so
+ * callers that need the file guaranteed on disk (e.g. before flipping a
+ * match job to `completed`) CAN await it; fire-and-forget callers (the VLM
+ * loop) simply ignore the return value, exactly as before.
  */
 export function writeCandidatesFileAsync(
   uploadDir: string,
   matchJobId: string,
   segmentIndex: number,
   entry: StoredCandidateSet,
-): void {
+): Promise<void> {
   const filePath = matchCandidatesFilePath(uploadDir, matchJobId, segmentIndex);
-  fs.promises.writeFile(filePath, JSON.stringify(entry)).catch(err => {
+  return fs.promises.writeFile(filePath, JSON.stringify(entry)).catch(err => {
     console.warn(`[CandidateRecovery] Failed to write candidates for match ${matchJobId} segment ${segmentIndex}: ${err?.message || err}`);
   });
 }

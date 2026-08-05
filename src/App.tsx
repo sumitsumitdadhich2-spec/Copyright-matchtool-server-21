@@ -480,14 +480,22 @@ export default function App() {
     ? retryingSegments.has(activeCandidateSet.segmentIndex) || !!activeCandidateSet.retrying
     : false;
 
-  // Fetch candidate data once a match job is available.
+  // Fetch candidate data once a match job is available — and again when
+  // matching finishes. `matchJobId` is set the moment a match STARTS, but
+  // candidate files are only written when it completes, so a fetch keyed on
+  // matchJobId alone always ran too early, got an empty list, and never
+  // refetched — which is why the "View all candidates" button never showed.
+  // Depending on `isMatching` too makes the completion transition
+  // (isMatching → false) trigger a fresh fetch once the files exist.
   useEffect(() => {
     if (!matchJobId) { setCandidateSets([]); return; }
+    let cancelled = false;
     fetch(`/api/match/${matchJobId}/candidates`)
       .then(r => r.ok ? r.json() : null)
-      .then(data => setCandidateSets(data?.segments ?? []))
-      .catch(() => setCandidateSets([]));
-  }, [matchJobId]);
+      .then(data => { if (!cancelled) setCandidateSets(data?.segments ?? []); })
+      .catch(() => { if (!cancelled) setCandidateSets([]); });
+    return () => { cancelled = true; };
+  }, [matchJobId, isMatching]);
 
   // Whenever the selected segment changes, reset candidate stepping to the
   // candidate that was actually accepted (if this segment was recovered),
