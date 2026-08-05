@@ -16,7 +16,7 @@ interface MatchJobProgress {
 interface JobEntry {
   id: string;
   type?: 'fingerprint' | 'match';
-  status: 'pending' | 'processing' | 'completed' | 'failed' | 'stopped';
+  status: 'uploading' | 'pending' | 'processing' | 'completed' | 'failed' | 'stopped';
   totalFrames: number;
   processedFrames: number;
   error?: string;
@@ -62,13 +62,19 @@ function fmtDuration(startedAt?: number, completedAt?: number) {
 
 function StatusBadge({ status }: { status: JobEntry['status'] }) {
   const cfg: Record<JobEntry['status'], { label: string; cls: string; dot?: string }> = {
+    uploading:  { label: 'Uploading',  cls: 'bg-blue-500/15 text-blue-400 border-blue-500/30',   dot: 'animate-pulse bg-blue-400' },
     processing: { label: 'Processing', cls: 'bg-green-500/15 text-green-400 border-green-500/30', dot: 'animate-pulse bg-green-400' },
     pending:    { label: 'Pending',    cls: 'bg-blue-500/15 text-blue-400 border-blue-500/30',   dot: 'bg-blue-400' },
     completed:  { label: 'Completed', cls: 'bg-teal-500/15 text-teal-400 border-teal-500/30' },
     failed:     { label: 'Failed',    cls: 'bg-red-500/15 text-red-400 border-red-500/30' },
     stopped:    { label: 'Stopped',   cls: 'bg-orange-500/15 text-orange-400 border-orange-500/30' },
   };
-  const c = cfg[status];
+  // Fallback for any unknown status value coming from the server so a
+  // missing config entry can never crash the render.
+  const c = cfg[status] ?? {
+    label: status ?? 'Unknown',
+    cls: 'bg-slate-500/15 text-slate-400 border-slate-500/30',
+  };
   return (
     <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-semibold border ${c.cls}`}>
       {c.dot && <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${c.dot}`} />}
@@ -105,7 +111,7 @@ function JobCard({
   const [stopping, setStopping] = useState(false);
 
   const isMatch = job.type === 'match';
-  const isRunning = job.status === 'processing' || job.status === 'pending';
+  const isRunning = job.status === 'processing' || job.status === 'pending' || job.status === 'uploading';
   const pct = job.totalFrames > 0
     ? Math.min(100, Math.round((job.processedFrames / job.totalFrames) * 100))
     : 0;
@@ -332,8 +338,8 @@ export function JobHistory({ onClose, onReattach }: JobHistoryProps) {
     } catch { /* ignore */ }
   }, []);
 
-  const runningJobs  = jobs.filter(j => j.status === 'processing' || j.status === 'pending');
-  const finishedJobs = jobs.filter(j => j.status !== 'processing' && j.status !== 'pending');
+  const runningJobs  = jobs.filter(j => j.status === 'processing' || j.status === 'pending' || j.status === 'uploading');
+  const finishedJobs = jobs.filter(j => j.status !== 'processing' && j.status !== 'pending' && j.status !== 'uploading');
 
   return (
     <section className="bg-slate-900 border border-slate-700 rounded-2xl overflow-hidden shadow-2xl">
