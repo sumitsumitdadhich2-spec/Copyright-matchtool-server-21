@@ -4,6 +4,7 @@ import cors from 'cors';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as http from 'http';
 import { createServer as createViteServer } from 'vite';
 import { extractFingerprints, NUM_WORKERS } from './server/pipeline';
 import { matchVideosFromFiles } from './server/matching-engine';
@@ -1619,10 +1620,23 @@ async function startServer() {
     }
   });
 
+  // Create an explicit HTTP server so Vite's HMR WebSocket can share the
+  // same port as the app. In middlewareMode Vite would otherwise open its
+  // own WS server on a separate port (24678), which the hosted preview proxy
+  // cannot route — producing "WebSocket closed without opened" in the client.
+  const httpServer = http.createServer(app);
+
   // --- VITE MIDDLEWARE CONFIGURATION ---
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true, allowedHosts: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        // Bind HMR to the shared HTTP server so the upgrade travels over the
+        // same port the proxy already routes. clientPort/protocol come from
+        // vite.config.ts (wss:443) so the browser connects through the proxy.
+        hmr: { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -1634,7 +1648,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log('[v2] View-All-Candidates build active');
     console.log(`Server ready. Detected ${os.cpus().length} CPU cores. Worker pool sized to ${NUM_WORKERS} workers.`);
     console.log(`Server running on http://localhost:${PORT}`);
