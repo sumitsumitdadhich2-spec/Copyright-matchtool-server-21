@@ -65,7 +65,6 @@ async function main() {
     // Rebuild a fully-checked (pool-exhausted) entry each time so this call
     // is forced into the broader_search branch, not unchecked_pool.
     const entry: StoredCandidateSet = {
-      matchJobId: FAKE_MATCH_JOB_ID,
       segmentIndex: SEGMENT_INDEX,
       shortStart: base.shortStart,
       shortEnd: base.shortEnd,

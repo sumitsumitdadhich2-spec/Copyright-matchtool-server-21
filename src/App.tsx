@@ -452,10 +452,26 @@ export default function App() {
   // preview panel (below) and every row of the results table (View all
   // candidates button) so there is only one place that defines "this segment
   // has candidate history".
-  const findCandidateSetForSegment = (seg: MatchedSegment): StoredCandidateSet | undefined =>
-    candidateSets.find(cs =>
+  const findCandidateSetForSegment = (seg: MatchedSegment): StoredCandidateSet | undefined => {
+    // Exact-range match first (0.05s tolerance) — the common case.
+    const exact = candidateSets.find(cs =>
       Math.abs(cs.shortStart - seg.shortStart) < 0.05 &&
       Math.abs(cs.shortEnd - seg.shortEnd) < 0.05);
+    if (exact) return exact;
+    // Fallback: overlap match. A VLM-accepted alternate or a manual-Retry
+    // swap can leave the active segment with a slightly different short-clip
+    // range than the original range its candidate file was keyed under, which
+    // made the exact match above miss and hid the candidate/Retry buttons.
+    // Pick the candidate set with the LARGEST overlap so adjacent segments
+    // can never grab each other's history.
+    let best: StoredCandidateSet | undefined;
+    let bestOverlap = 0;
+    for (const cs of candidateSets) {
+      const overlap = Math.min(cs.shortEnd, seg.shortEnd) - Math.max(cs.shortStart, seg.shortStart);
+      if (overlap > bestOverlap) { bestOverlap = overlap; best = cs; }
+    }
+    return best;
+  };
 
   const activeCandidateSet = previewSegment ? findCandidateSetForSegment(previewSegment) : undefined;
 
@@ -473,11 +489,25 @@ export default function App() {
   // changes which segment is selected.
   const movieViewSegment = activeCandidateSet?.candidates[candidateIndex]?.segment ?? previewSegment;
 
+  // Which segmentIndex a manual Retry for the currently-previewed segment
+  // should target. Prefers the candidate file's own segmentIndex; when no
+  // candidate set was fetched (yet), falls back to the segment's position in
+  // the results array — hash-only candidate files are written under exactly
+  // that index, so the Retry button stays permanently available instead of
+  // disappearing whenever candidate data hasn't loaded.
+  const retrySegmentIndex = activeCandidateSet
+    ? activeCandidateSet.segmentIndex
+    : previewSegment
+      ? segments.findIndex(s =>
+          Math.abs(s.shortStart - previewSegment.shortStart) < 0.05 &&
+          Math.abs(s.shortEnd - previewSegment.shortEnd) < 0.05)
+      : -1;
+
   // True while a manual Retry is running for the segment currently shown in
   // the preview — drives the spinner overlay. Independent of any other
   // segment's retry state, so navigating elsewhere is never blocked by it.
-  const isCurrentSegmentRetrying = activeCandidateSet
-    ? retryingSegments.has(activeCandidateSet.segmentIndex) || !!activeCandidateSet.retrying
+  const isCurrentSegmentRetrying = retrySegmentIndex >= 0
+    ? retryingSegments.has(retrySegmentIndex) || !!activeCandidateSet?.retrying
     : false;
 
   // Fetch candidate data once a match job is available — and again when
@@ -1314,8 +1344,8 @@ export default function App() {
   }, [matchJobId]);
 
   const handleRetrySegment = async () => {
-    if (!matchJobId || !activeCandidateSet) return;
-    const segmentIndex = activeCandidateSet.segmentIndex;
+    if (!matchJobId || retrySegmentIndex < 0) return;
+    const segmentIndex = retrySegmentIndex;
     setRetryError('');
     setRetryingSegments(prev => new Set(prev).add(segmentIndex));
 
@@ -1440,7 +1470,7 @@ export default function App() {
           <div>
             <h1 className="text-2xl font-bold text-white flex items-center gap-2.5">
               <ScanLine className="w-7 h-7 text-blue-500" />
-              Nexus Video Match
+              Shiva Video Match
             </h1>
             <p className="text-slate-500 text-sm mt-1">Sequence-alignment video fingerprint matching</p>
           </div>
@@ -2167,19 +2197,18 @@ export default function App() {
 
               {/* Manual Retry — independent of the automatic verdict; the
                   user clicks this when they visually judge the current match
-                  to be wrong. Disabled only while this same segment's own
-                  retry is running (other segments stay fully interactive). */}
-              {activeCandidateSet && (
-                <>
-                  <div className="w-px h-6 bg-slate-700 hidden sm:block" />
-                  <button onClick={handleRetrySegment} disabled={isCurrentSegmentRetrying}
-                    title="Manually re-search for a better match for this segment"
-                    className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-50 disabled:cursor-not-allowed border border-amber-500/30 text-amber-300 transition cursor-pointer">
-                    <RefreshCw className={`w-3.5 h-3.5 ${isCurrentSegmentRetrying ? 'animate-spin' : ''}`} />
-                    {isCurrentSegmentRetrying ? 'Retrying…' : 'Retry'}
-                  </button>
-                </>
-              )}
+                  to be wrong. PERMANENT: always visible for the previewed
+                  segment (candidates exist even without a VLM check, so the
+                  button must not depend on VLM/candidate data having loaded).
+                  Disabled only while this same segment's own retry is running
+                  (other segments stay fully interactive). */}
+              <div className="w-px h-6 bg-slate-700 hidden sm:block" />
+              <button onClick={handleRetrySegment} disabled={isCurrentSegmentRetrying || retrySegmentIndex < 0}
+                title="Manually re-search for a better match for this segment"
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-50 disabled:cursor-not-allowed border border-amber-500/30 text-amber-300 transition cursor-pointer">
+                <RefreshCw className={`w-3.5 h-3.5 ${isCurrentSegmentRetrying ? 'animate-spin' : ''}`} />
+                {isCurrentSegmentRetrying ? 'Retrying…' : 'Retry Segment'}
+              </button>
             </div>
 
             {retryError && (

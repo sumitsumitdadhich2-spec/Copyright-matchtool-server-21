@@ -52,7 +52,11 @@ async function startServer() {
   const app = express();
   app.use(cors());
   app.use(express.json());
-  const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+  const PORT = process.env.PORT
+    ? parseInt(process.env.PORT)
+    : process.env.DEV_PORT
+      ? parseInt(process.env.DEV_PORT)
+      : 3000;
 
   // Ensure upload directory exists
   const uploadDir = path.join(process.cwd(), 'uploads');
