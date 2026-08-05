@@ -4,6 +4,7 @@ import cors from 'cors';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as http from 'http';
 import { createServer as createViteServer } from 'vite';
 import { extractFingerprints, NUM_WORKERS } from './server/pipeline';
 import { matchVideosFromFiles } from './server/matching-engine';
@@ -1620,9 +1621,20 @@ async function startServer() {
   });
 
   // --- VITE MIDDLEWARE CONFIGURATION ---
+  // Create the HTTP server up-front so Vite's HMR WebSocket can attach to the
+  // SAME server/port that Express listens on. In middleware mode Vite would
+  // otherwise spin up its own WS server on a separate port, which the hosted
+  // preview proxy cannot reach — the browser's wss:// upgrade then fails with
+  // "WebSocket closed without opened".
+  const httpServer = http.createServer(app);
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true, allowedHosts: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        hmr: { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -1634,7 +1646,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log('[v2] View-All-Candidates build active');
     console.log(`Server ready. Detected ${os.cpus().length} CPU cores. Worker pool sized to ${NUM_WORKERS} workers.`);
     console.log(`Server running on http://localhost:${PORT}`);
