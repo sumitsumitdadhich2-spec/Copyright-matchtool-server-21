@@ -527,6 +527,17 @@ export default function App() {
     return () => { cancelled = true; };
   }, [matchJobId, isMatching]);
 
+  // Close the "View all candidates" modal with the Escape key — click-outside
+  // and the X button already work; this adds the standard keyboard path.
+  useEffect(() => {
+    if (viewAllCandidatesForKey === null) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setViewAllCandidatesForKey(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [viewAllCandidatesForKey]);
+
   // Whenever the selected segment changes, reset candidate stepping to the
   // candidate that was actually accepted (if this segment was recovered),
   // so the pane starts in sync with pair 1's selection.
