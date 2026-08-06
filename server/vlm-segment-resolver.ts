@@ -14,6 +14,7 @@ import {
   VLM_MAX_ATTEMPTS,
   VLM_CONCURRENCY,
 } from './vlm-verify';
+import { embeddingGateCheck, EMBED_UNVERIFIABLE_KEEP_SIM } from './embedding-gate';
 
 // Fixed batch size for VLM server cache-reset points. Purely a cache-hygiene
 // boundary — does not change segment order, candidate selection, or verdicts.
@@ -180,29 +181,67 @@ export async function resolveSegmentsWithVLM(
             return { shortFrameB64, movieFrameB64 };
           }),
         );
-        const result = await verifySameSceneMulti(extracted);
-
-        if (result === null) {
-          // Could not verify — do not silently pass or fail; keep the
-          // candidate as-is rather than crashing the whole match.
-          verdict = 'unverifiable';
-          accepted = candidate;
-          triedCandidates.push({ segment: triedCandidate, verdict: 'unverifiable' });
-          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-          break;
-        }
-
-        if (result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
+        // ------------------------------------------------------------------
+        // Embedding gate: a deterministic CLIP-similarity pre-check on the
+        // exact frames that would go to the VLM. Clear-cut cases are decided
+        // here (no VLM call at all); only the ambiguous middle band falls
+        // through to the VLM. If the gate is unavailable (model failed to
+        // load), gate === null and behavior is identical to before.
+        // ------------------------------------------------------------------
+        const gate = await embeddingGateCheck(extracted);
+        if (gate?.decision === 'accept') {
           verdict = 'accepted';
           accepted = candidate;
-          triedCandidates.push({ segment: triedCandidate, verdict: 'accepted', confidencePct: result.confidencePct });
+          triedCandidates.push({ segment: triedCandidate, verdict: 'accepted', confidencePct: Math.round(gate.medianSim * 100) });
           onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          console.log(`[EmbedGate] Segment ${i} attempt ${attempt}: auto-accept (median sim ${gate.medianSim.toFixed(3)})`);
           break;
         }
+        if (gate?.decision === 'reject') {
+          verdict = 'rejected';
+          triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: Math.round(gate.medianSim * 100) });
+          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          console.log(`[EmbedGate] Segment ${i} attempt ${attempt}: auto-reject (max sim ${gate.maxSim.toFixed(3)})`);
+        } else {
+          // Ambiguous (or gate unavailable) — the VLM is the tie-breaker.
+          const result = await verifySameSceneMulti(extracted);
 
-        verdict = 'rejected';
-        triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: result.confidencePct });
-        onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          if (result === null) {
+            // VLM could not produce a verdict (timeout/overload). The old
+            // policy silently ACCEPTED here, which meant every VLM outage
+            // passed unverified segments straight through — a major source
+            // of false accepts. New policy: keep the candidate only if the
+            // embedding similarity independently supports it; otherwise
+            // treat it as rejected and try the next candidate.
+            const keep = gate !== null && gate.medianSim >= EMBED_UNVERIFIABLE_KEEP_SIM;
+            if (keep || gate === null) {
+              // gate === null: no independent signal at all — keep the old
+              // conservative "don't drop on infrastructure failure" behavior.
+              verdict = 'unverifiable';
+              accepted = candidate;
+              triedCandidates.push({ segment: triedCandidate, verdict: 'unverifiable' });
+              onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+              break;
+            }
+            verdict = 'rejected';
+            triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: Math.round(gate.medianSim * 100) });
+            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+            console.log(
+              `[VLM] Segment ${i} attempt ${attempt}: VLM inconclusive and embedding sim ` +
+              `${gate.medianSim.toFixed(3)} < ${EMBED_UNVERIFIABLE_KEEP_SIM} — rejecting instead of blind-accepting`
+            );
+          } else if (result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
+            verdict = 'accepted';
+            accepted = candidate;
+            triedCandidates.push({ segment: triedCandidate, verdict: 'accepted', confidencePct: result.confidencePct });
+            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+            break;
+          } else {
+            verdict = 'rejected';
+            triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: result.confidencePct });
+            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          }
+        }
       } catch (err: any) {
         // Frame extraction failure (e.g. bad timestamp) — treat as
         // unverifiable for this attempt rather than crashing the match.

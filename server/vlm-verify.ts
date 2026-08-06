@@ -51,8 +51,13 @@ function describeFetchError(err: any): string {
 // combined — belt-and-suspenders against the server/tunnel getting more
 // concurrent HTTP requests than it can handle.
 // ---------------------------------------------------------------------------
+// Default 2, matching the server's actual slot count (llama.cpp logs
+// "n_slots = 2"). The previous default of 4 sent twice as many concurrent
+// requests as the server had slots — the excess queued server-side until the
+// client's timeout fired, producing the flood of "cancel task" log lines and
+// unverifiable (timed-out) verdicts.
 export const VLM_CONCURRENCY =
-  Number(process.env.VLM_CONCURRENCY) || 4;
+  Number(process.env.VLM_CONCURRENCY) || 2;
 
 // ---------------------------------------------------------------------------
 // Request-layer resilience — added to fix VLM request overload on large
@@ -77,7 +82,15 @@ export const VLM_CONCURRENCY =
 //   different candidate.
 // ---------------------------------------------------------------------------
 export const VLM_MAX_CONCURRENT_REQUESTS =
-  Number(process.env.VLM_MAX_CONCURRENT_REQUESTS) || 4;
+  Number(process.env.VLM_MAX_CONCURRENT_REQUESTS) || 2;
+
+// How long to wait for one VLM chat/completions call. The server needs
+// 15–25s of PROMPT PROCESSING alone for a 6-image request (~6000 tokens at
+// ~300 tok/s), so the old 20s timeout was routinely cancelling requests that
+// were still working — visible as "cancel task ... progress = 0.80" in the
+// server logs. 90s gives slow-but-successful requests room to finish.
+export const VLM_REQUEST_TIMEOUT_MS =
+  Number(process.env.VLM_REQUEST_TIMEOUT_MS) || 90_000;
 export const VLM_RESET_MAX_CONCURRENT_REQUESTS =
   Number(process.env.VLM_RESET_MAX_CONCURRENT_REQUESTS) || Math.min(2, VLM_MAX_CONCURRENT_REQUESTS);
 export const VLM_RETRY_ATTEMPTS =
@@ -291,11 +304,12 @@ export interface VlmFramePair {
  * per attempt — same request count, same timeout, same retry behavior as
  * before, so wall-clock time per attempt does not grow.
  *
- * Decision rule baked into the prompt: if ANY pair clearly shows the same
- * scene, the answer is "same". This is deliberately recall-biased — the
- * whole point of sending extra pairs is to stop the VLM from rejecting a
- * genuinely-matching segment because one unlucky frame (motion blur, cut
- * boundary, overlay) looked different.
+ * Decision rule: each pair is judged independently and the segment counts as
+ * "same" only when a strict MAJORITY of pairs agree (2 of 3, 2 of 2, 1 of 1).
+ * The majority is recomputed client-side from the per-pair verdicts (see the
+ * parse step below) rather than trusting the model's own aggregate — the old
+ * "any one pair => same" rule let a single hallucinated pair accept a wrong
+ * segment, which was a major source of false accepts.
  */
 export async function verifySameSceneMulti(
   pairs: VlmFramePair[],
@@ -323,12 +337,17 @@ export async function verifySameSceneMulti(
     `- a slightly different instant of the same continuous shot (people/objects moved a little)\n\n` +
     `Judge only the underlying content: same location, same people/characters, same objects, ` +
     `same camera setup or same continuous action.\n\n` +
-    `Decision rule: if AT LEAST ONE pair clearly shows the same scene, answer same=true — ` +
-    `do NOT reject just because one pair is ambiguous or blurry. ` +
-    `Answer same=false ONLY if the pairs clearly show different content ` +
-    `(different location AND different people/objects/action).\n\n` +
-    `Reply with ONLY JSON, no other text: {"same": true|false, "confidence": 0-100} ` +
-    `where confidence is how certain you are of your verdict.`;
+    `Decision rule: judge EACH pair independently and give a per-pair verdict. ` +
+    `The overall answer is same=true ONLY if a MAJORITY of the pairs show the same scene ` +
+    `(${n === 3 ? '2 of 3' : n === 2 ? '2 of 2' : '1 of 1'} pairs). ` +
+    `A pair counts as "same" only when you can point to concrete shared content ` +
+    `(same location AND same people/characters/objects or the same continuous action). ` +
+    `If a pair is too ambiguous or blurry to tell, count that pair as NOT same — ` +
+    `do not guess in favor of a match.\n\n` +
+    `Reply with ONLY JSON, no other text: ` +
+    `{"pairs": [true|false${n > 1 ? ', ...' : ''}], "same": true|false, "confidence": 0-100} ` +
+    `where "pairs" has exactly ${n} boolean(s) (one per pair, in order) and ` +
+    `confidence is how certain you are of your overall verdict.`;
 
   const content: any[] = [{ type: 'text', text: prompt }];
   for (const p of usable) {
@@ -357,7 +376,7 @@ export async function verifySameSceneMulti(
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       },
-      20_000,
+      VLM_REQUEST_TIMEOUT_MS,
       'verifySameScene',
     );
 
@@ -388,7 +407,29 @@ export async function verifySameSceneMulti(
       return null;
     }
 
-    return { same: parsed.same, confidencePct: parsed.confidence };
+    // Enforce the majority rule OURSELVES from the per-pair verdicts instead
+    // of trusting the model's own aggregate — 7B models frequently give
+    // per-pair answers that contradict their overall "same" field, and the
+    // per-pair answers are the more reliable of the two. Strict majority
+    // (floor(n/2)+1): 3 pairs need 2, 2 pairs need 2, 1 pair needs 1.
+    let same = parsed.same;
+    if (
+      Array.isArray(parsed.pairs) &&
+      parsed.pairs.length === n &&
+      parsed.pairs.every((v: any) => typeof v === 'boolean')
+    ) {
+      const trueCount = parsed.pairs.filter(Boolean).length;
+      const needed = Math.floor(n / 2) + 1;
+      same = trueCount >= needed;
+      if (same !== parsed.same) {
+        console.log(
+          `[VLM] Overriding model aggregate same=${parsed.same} with per-pair majority ` +
+          `(${trueCount}/${n} pairs same, need ${needed}) -> same=${same}`
+        );
+      }
+    }
+
+    return { same, confidencePct: parsed.confidence };
   } catch (err: any) {
     const attempts = err?.vlmAttempts || 1;
     if (attempts > 1) vlmNetworkStats.verifyInconclusive++;
@@ -411,7 +452,9 @@ export async function verifySameSceneMulti(
 // server restart. This is best-effort cache hygiene: a failed reset must
 // never abort or fail the match job, only log a warning.
 // ---------------------------------------------------------------------------
-const VLM_NUM_SLOTS = 4;
+// Must match the llama.cpp server's actual slot count ("n_slots = 2" in its
+// startup logs). Override with VLM_NUM_SLOTS if the server is reconfigured.
+const VLM_NUM_SLOTS = Number(process.env.VLM_NUM_SLOTS) || 2;
 const VLM_RESET_TIMEOUT_MS = 5_000;
 
 function getVlmBaseUrl(): string {
