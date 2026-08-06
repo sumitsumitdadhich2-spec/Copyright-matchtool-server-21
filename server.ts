@@ -1166,6 +1166,56 @@ async function startServer() {
             }
           }
 
+          // ── Keep best-confidence candidate for still-dropped ranges ─────
+          // Instead of silently removing a range where VLM rejected every
+          // candidate (main pass + deferred recovery), keep the
+          // highest-confidence already-checked candidate as the visible
+          // segment for that range. It renders exactly like any other
+          // segment, so the user can review it and use the per-segment
+          // Retry button. Purely additive presentation logic: the candidate
+          // file keeps `dropped: true` and every existing verdict untouched
+          // (all candidates checked = this range would have been dropped),
+          // so Retry / recovery / matching semantics are all unchanged.
+          if (matchJobs.get(matchJobId)?.status === 'processing') {
+            try {
+              let keptBest = 0;
+              for (const idx of listCandidateFilesForJob(uploadDir, matchJobId)) {
+                const entry = readCandidatesFile(uploadDir, matchJobId, idx);
+                if (!entry || entry.dropped !== true) continue;
+                // Skip ranges deferred recovery actually recovered — their
+                // file can keep dropped: true but has an accepted candidate.
+                if (entry.candidates.some(c => c.verdict === 'accepted')) continue;
+                // Skip if a final segment already covers this range.
+                const overlapsExisting = finalSegments.some(s =>
+                  Math.min(s.shortEnd, entry.shortEnd) - Math.max(s.shortStart, entry.shortStart) > 0.05);
+                if (overlapsExisting) continue;
+                // Highest-confidence checked (rejected) candidate wins;
+                // unverifiable ones have no confidence and rank last.
+                const checked = entry.candidates.filter(c => c.checked);
+                if (checked.length === 0) continue;
+                const best = checked.reduce((a, b) =>
+                  ((b.confidencePct ?? -1) > (a.confidencePct ?? -1) ? b : a));
+                const bestIdx = entry.candidates.indexOf(best);
+                finalSegments = [...finalSegments, best.segment].sort((a, b) => a.shortStart - b.shortStart);
+                // Mark it as the candidate currently shown ("★ Used") —
+                // without clearing dropped/verdicts, so history still shows
+                // every candidate was checked and rejected.
+                if (bestIdx !== -1) {
+                  entry.recoveredCandidateIndex = bestIdx;
+                  writeCandidatesFileSync(uploadDir, matchJobId, idx, entry);
+                }
+                keptBest++;
+              }
+              if (keptBest > 0) {
+                console.log(`[Match ${matchJobId}] Kept best-confidence candidate for ${keptBest} would-be-dropped segment(s) so they stay visible for manual Retry.`);
+              }
+            } catch (keepErr: any) {
+              // Strictly additive — a failure here must never regress below
+              // what the main + deferred passes already produced.
+              console.error(`[Match ${matchJobId}] Keep-best-candidate step failed:`, keepErr?.message || keepErr);
+            }
+          }
+
           // Outcome breakdown (point 3): how many "unmatched" outcomes were
           // genuine content rejections vs. inconclusive because the VLM
           // request never got a real answer (server overload/network
@@ -1381,9 +1431,22 @@ async function startServer() {
           const newSeg = refreshed?.candidates[result.acceptedCandidateIndex]?.segment;
           const liveJob = matchJobs.get(matchJobId);
           if (newSeg && liveJob?.segments) {
-            const arrIdx = liveJob.segments.findIndex((s: any) =>
+            let arrIdx = liveJob.segments.findIndex((s: any) =>
               Math.abs(s.shortStart - originalRange.shortStart) < 0.05 &&
               Math.abs(s.shortEnd - originalRange.shortEnd) < 0.05);
+            // Fallback: largest overlap with the candidate file's range —
+            // same logic select-candidate already uses. Needed because a
+            // kept best-confidence placeholder (or a previous swap) can have
+            // slightly different bounds than the original range; without
+            // this the accepted retry would be appended as a duplicate
+            // instead of replacing the placeholder.
+            if (arrIdx === -1) {
+              let bestOverlap = 0;
+              liveJob.segments.forEach((s: any, i: number) => {
+                const overlap = Math.min(s.shortEnd, originalRange.shortEnd) - Math.max(s.shortStart, originalRange.shortStart);
+                if (overlap > bestOverlap) { bestOverlap = overlap; arrIdx = i; }
+              });
+            }
             if (arrIdx !== -1) {
               liveJob.segments[arrIdx] = newSeg;
             } else {
