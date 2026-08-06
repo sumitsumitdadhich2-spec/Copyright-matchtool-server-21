@@ -8,6 +8,9 @@
  */
 import { spawn } from 'child_process';
 import { makeCleanEnv } from './pipeline';
+import { sscdGateCheck } from './sscd-verify-gate';
+import { geminiConfigured, geminiVerifyComposite, parseVerdictJson } from './gemini-vlm';
+import { buildSideBySideComposite } from './frame-composite';
 
 export const VLM_ENDPOINT_URL =
   process.env.VLM_ENDPOINT_URL || 'http://localhost:8000/v1/chat/completions';
@@ -310,8 +313,13 @@ export interface VlmFramePair {
  * parse step below) rather than trusting the model's own aggregate — the old
  * "any one pair => same" rule let a single hallucinated pair accept a wrong
  * segment, which was a major source of false accepts.
+ *
+ * LEGACY QWEN PROTOCOL — this is the exact pre-upgrade implementation,
+ * unchanged. It remains the default whenever GEMINI_API_KEY is not set, and
+ * the last-resort fallback when the new composite protocol cannot run.
+ * The exported verifySameSceneMulti below routes into it.
  */
-export async function verifySameSceneMulti(
+async function verifySameSceneMultiLegacy(
   pairs: VlmFramePair[],
   options?: {
     /**
@@ -501,10 +509,10 @@ export const VLM_SELF_CONSISTENCY = process.env.VLM_SELF_CONSISTENCY !== '0';
  *                         the confirmation call could not be completed) —
  *                         callers apply their existing unverifiable policy
  */
-export async function verifySameSceneChecked(
+async function verifySameSceneCheckedLegacy(
   pairs: VlmFramePair[],
 ): Promise<{ same: boolean; confidencePct: number } | null> {
-  const first = await verifySameSceneMulti(pairs);
+  const first = await verifySameSceneMultiLegacy(pairs);
   if (first === null) return null;
 
   // Only a passing accept triggers the confirmation call — a same=true below
@@ -512,7 +520,7 @@ export async function verifySameSceneChecked(
   const passing = first.same && first.confidencePct >= VLM_CONFIDENCE_THRESHOLD;
   if (!VLM_SELF_CONSISTENCY || !passing) return first;
 
-  const second = await verifySameSceneMulti(pairs, { swapped: true });
+  const second = await verifySameSceneMultiLegacy(pairs, { swapped: true });
   if (second === null) {
     // Accept claimed but could not be confirmed (timeout/overload on the
     // re-check). Surface as "no reliable verdict" so callers fall back to
@@ -529,6 +537,270 @@ export async function verifySameSceneChecked(
     return { same: false, confidencePct: Math.min(first.confidencePct, second.confidencePct) };
   }
   return { same: true, confidencePct: Math.min(first.confidencePct, second.confidencePct) };
+}
+
+// ===========================================================================
+// VERIFICATION ROUTER — SSCD gate + Gemini-primary composite protocol
+// ===========================================================================
+// The exported entry points (verifySameSceneMulti / verifySameSceneChecked)
+// keep their EXACT signatures and return contracts, so the callers
+// (vlm-segment-resolver.ts, candidate-retry.ts, deferred-recovery.ts) are
+// completely untouched. Routing happens transparently inside:
+//
+//   1. SSCD DECISION GATE (sscd-verify-gate.ts): clear-cut accept/reject
+//      decided from copy-detection similarity, VLM skipped entirely.
+//      Gate disabled/unhealthy -> transparent pass-through.
+//   2. If GEMINI_API_KEY is set: NEW COMPOSITE PROTOCOL — each frame pair is
+//      joined into ONE side-by-side labeled image, judged independently
+//      (Gemini primary, Qwen automatic fallback per call), final verdict by
+//      majority vote across pairs.
+//   3. Otherwise, or if the composite protocol yields no verdict at all:
+//      the LEGACY Qwen path, byte-for-byte the pre-upgrade behavior.
+//
+// With no GEMINI_API_KEY and no GPU_EMBED_SERVICE_URL, steps 1–2 are inert
+// and every call lands directly in step 3 — zero behavioral change.
+// ===========================================================================
+
+/** Strict single-composite prompt (Task 3) — used for BOTH providers. */
+const COMPOSITE_PROMPT =
+  `The image shows two video frames side by side, separated by a gray divider: ` +
+  `frame A on the LEFT (from a short vertical clip) and frame B on the RIGHT (from a movie).\n\n` +
+  `Question: Are these two frames from the SAME scene of the SAME video ` +
+  `(one may be cropped/zoomed/flipped/color-graded)?\n\n` +
+  `Important: frame A is often a narrow 9:16 vertical crop taken from ANY horizontal ` +
+  `position of frame B — scan frame B's full width, including the edges, before deciding. ` +
+  `Ignore differences in resolution, compression, letterboxing, color grading, watermarks, ` +
+  `subtitles, overlays, horizontal mirroring, or a slightly different instant of the same ` +
+  `continuous shot. BUT a different shot/angle/moment of the same movie, or merely ` +
+  `similar-looking footage, is NOT the same scene.\n\n` +
+  `You may reason briefly, but your FINAL line must be ONLY this JSON and nothing else: ` +
+  `{"same": true|false, "confidence": 0-100}`;
+
+/** One per-pair provider verdict in the composite protocol. */
+interface CompositeVote {
+  same: boolean;
+  confidence: number;
+  provider: 'gemini' | 'qwen';
+}
+
+/**
+ * Qwen fallback for the composite protocol: ONE composite image per request
+ * to the existing VLM_ENDPOINT_URL, reusing the same semaphore/retry/timeout
+ * infrastructure as the legacy path. Returns null on any failure.
+ */
+async function qwenVerifyComposite(
+  compositeB64: string,
+): Promise<{ same: boolean; confidence: number } | null> {
+  const body = {
+    model: VLM_MODEL,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: COMPOSITE_PROMPT },
+          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${compositeB64}` } },
+        ],
+      },
+    ],
+    max_tokens: 300,
+    temperature: 0,
+  };
+
+  const release = await verifyGate.acquire();
+  try {
+    const { response: res, attempts } = await fetchWithRetry(
+      VLM_ENDPOINT_URL,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+      VLM_REQUEST_TIMEOUT_MS,
+      'qwenVerifyComposite',
+    );
+    if (!res.ok) {
+      if (attempts > 1) vlmNetworkStats.verifyInconclusive++;
+      console.warn(`[VLM] Composite endpoint returned ${res.status} ${res.statusText}`);
+      return null;
+    }
+    const json: any = await res.json();
+    const raw: string = json?.choices?.[0]?.message?.content ?? '';
+    const verdict = parseVerdictJson(raw);
+    if (!verdict) {
+      console.warn(`[VLM] Composite response unparseable: ${String(raw).slice(0, 200)}`);
+      return null;
+    }
+    return verdict;
+  } catch (err: any) {
+    const attempts = err?.vlmAttempts || 1;
+    if (attempts > 1) vlmNetworkStats.verifyInconclusive++;
+    console.warn(`[VLM] qwenVerifyComposite failed: ${describeFetchError(err)}`);
+    return null;
+  } finally {
+    release();
+  }
+}
+
+/** Gemini primary, Qwen automatic fallback — for a single composite image. */
+async function providerVerifyComposite(
+  compositeB64: string,
+): Promise<CompositeVote | null> {
+  if (geminiConfigured()) {
+    const g = await geminiVerifyComposite(compositeB64, COMPOSITE_PROMPT);
+    if (g) return { ...g, provider: 'gemini' };
+    console.log('[Verify] gemini unavailable for this pair — falling back to qwen');
+  }
+  const q = await qwenVerifyComposite(compositeB64);
+  if (q) return { ...q, provider: 'qwen' };
+  return null;
+}
+
+function medianNum(values: number[]): number {
+  const s = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 === 1 ? s[mid] : Math.round((s[mid - 1] + s[mid]) / 2);
+}
+
+interface CompositeMajorityResult {
+  same: boolean;
+  confidencePct: number;
+  provider: string;
+  votesFor: number;
+  votesTotal: number;
+}
+
+/**
+ * Task 3 — multi-frame majority vote over up to 3 composite images (same
+ * frame pairs the SSCD gate sampled). Each pair gets an independent verdict;
+ * a strict majority (2/3, 2/2, 1/1) decides. Returns null only when NO pair
+ * could be judged at all (composites failed or both providers failed on
+ * every pair) — the caller then falls back to the legacy path.
+ */
+async function compositeMajorityVerify(
+  pairs: VlmFramePair[],
+): Promise<CompositeMajorityResult | null> {
+  const usable = pairs.slice(0, 3);
+  if (usable.length === 0) return null;
+
+  const composites = await Promise.all(
+    usable.map((p) => buildSideBySideComposite(p.shortFrameB64, p.movieFrameB64)),
+  );
+  const validComposites = composites.filter((c): c is string => !!c);
+  if (validComposites.length === 0) return null;
+
+  // Sequential per-pair calls: gentle on Gemini free-tier rate limits and on
+  // the Qwen server's slot budget.
+  const votes: CompositeVote[] = [];
+  for (const composite of validComposites) {
+    const vote = await providerVerifyComposite(composite);
+    if (vote) votes.push(vote);
+  }
+  if (votes.length === 0) return null;
+
+  const trueCount = votes.filter((v) => v.same).length;
+  const needed = Math.floor(votes.length / 2) + 1;
+  const same = trueCount >= needed;
+  const agreeing = votes.filter((v) => v.same === same);
+  const confidencePct = medianNum(agreeing.map((v) => v.confidence));
+
+  const providers = new Set(votes.map((v) => v.provider));
+  const provider =
+    providers.size === 1 ? votes[0].provider : 'gemini+qwen';
+
+  return {
+    same,
+    confidencePct,
+    provider,
+    votesFor: same ? trueCount : votes.length - trueCount,
+    votesTotal: votes.length,
+  };
+}
+
+/**
+ * The router itself. `legacyFn` is the exact pre-upgrade behavior for the
+ * specific entry point being wrapped, invoked verbatim when the new layers
+ * are disabled or cannot produce a verdict.
+ */
+async function routedVerify(
+  pairs: VlmFramePair[],
+  legacyFn: () => Promise<{ same: boolean; confidencePct: number } | null>,
+): Promise<{ same: boolean; confidencePct: number } | null> {
+  // ---- Layer 1: SSCD decision gate (fail-safe: null = pass-through) ----
+  let gateLabel = 'skipped';
+  let simLabel = '-';
+  try {
+    const gate = await sscdGateCheck(pairs);
+    if (gate) {
+      gateLabel = 'sscd';
+      simLabel = gate.medianSim.toFixed(2);
+      if (gate.verdict === 'accept') {
+        console.log(`[Verify] gate=sscd sim=${simLabel} provider=none votes=0/0 verdict=accept conf=100`);
+        return { same: true, confidencePct: 100 };
+      }
+      if (gate.verdict === 'reject') {
+        console.log(`[Verify] gate=sscd sim=${simLabel} provider=none votes=0/0 verdict=reject conf=100`);
+        return { same: false, confidencePct: 100 };
+      }
+      // 'ambiguous' -> fall through to the VLM layers below.
+    }
+  } catch {
+    // Gate must never break verification — proceed as if it were disabled.
+  }
+
+  // ---- Layer 2: composite protocol (only when Gemini is configured) ----
+  // When GEMINI_API_KEY is absent, this whole layer is skipped so the
+  // no-new-env-vars behavior is EXACTLY the pre-upgrade Qwen path.
+  if (geminiConfigured()) {
+    const result = await compositeMajorityVerify(pairs);
+    if (result) {
+      console.log(
+        `[Verify] gate=${gateLabel} sim=${simLabel} provider=${result.provider} ` +
+        `votes=${result.votesFor}/${result.votesTotal} ` +
+        `verdict=${result.same ? 'accept' : 'reject'} conf=${result.confidencePct}`
+      );
+      return { same: result.same, confidencePct: result.confidencePct };
+    }
+    console.log('[Verify] composite protocol yielded no verdict — falling back to legacy Qwen path');
+  }
+
+  // ---- Layer 3: legacy path (byte-for-byte pre-upgrade behavior) ----
+  const legacy = await legacyFn();
+  if (legacy) {
+    const verdict = legacy.same && legacy.confidencePct >= VLM_CONFIDENCE_THRESHOLD
+      ? 'accept'
+      : 'reject';
+    console.log(
+      `[Verify] gate=${gateLabel} sim=${simLabel} provider=qwen votes=- ` +
+      `verdict=${verdict} conf=${legacy.confidencePct}`
+    );
+  }
+  return legacy;
+}
+
+/**
+ * Exported entry point — same signature/contract as always. Callers
+ * (candidate-retry.ts) are untouched; routing happens inside.
+ */
+export async function verifySameSceneMulti(
+  pairs: VlmFramePair[],
+  options?: { swapped?: boolean },
+): Promise<{ same: boolean; confidencePct: number } | null> {
+  // Swapped calls only exist as the legacy self-consistency re-check —
+  // they must not re-run the gate or the composite protocol.
+  if (options?.swapped) return verifySameSceneMultiLegacy(pairs, options);
+  return routedVerify(pairs, () => verifySameSceneMultiLegacy(pairs, options));
+}
+
+/**
+ * Exported entry point — same signature/contract as always. Callers
+ * (vlm-segment-resolver.ts, deferred-recovery.ts) are untouched.
+ * In the composite protocol the per-pair majority vote replaces the legacy
+ * swap self-consistency check; the legacy path keeps it as before.
+ */
+export async function verifySameSceneChecked(
+  pairs: VlmFramePair[],
+): Promise<{ same: boolean; confidencePct: number } | null> {
+  return routedVerify(pairs, () => verifySameSceneCheckedLegacy(pairs));
 }
 
 // ---------------------------------------------------------------------------
