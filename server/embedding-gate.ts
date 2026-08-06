@@ -110,6 +110,31 @@ async function embedFrame(extractor: any, b64: string): Promise<Float32Array | n
 }
 
 /**
+ * Public helper for other candidate-side modules (candidate-embedding-rank):
+ * embed one base64 JPEG frame with the shared lazily-loaded CLIP model.
+ * Returns null when the model is unavailable — callers must fail-safe to
+ * their previous behavior, exactly like the gate itself does. Purely
+ * additive: never changes the gate's own decisions.
+ */
+export async function embedFrameB64(b64: string): Promise<Float32Array | null> {
+  const extractor = await getExtractor();
+  if (!extractor) return null;
+  try {
+    return await embedFrame(extractor, b64);
+  } catch {
+    return null;
+  }
+}
+
+/** Public cosine-similarity helper (same implementation the gate uses). */
+export function cosineSimilarity(
+  a: Float32Array | number[],
+  b: Float32Array | number[],
+): number {
+  return cosineSim(a, b);
+}
+
+/**
  * Run the embedding gate over the frame pairs of one candidate segment.
  * Returns null when the gate is unavailable (model failed to load, or an
  * unexpected embedding error) — callers must then behave exactly as before

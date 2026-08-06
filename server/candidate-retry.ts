@@ -29,6 +29,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
 import { MatchedSegment, matchVideosFromFiles } from './candidate-matching-engine';
+import { rankCandidatesCropRobust } from './candidate-embedding-rank';
 import { pickVerificationFramePairs } from './vlm-segment-resolver';
 import { extractFrameAsBase64, verifySameSceneMulti, VLM_CONFIDENCE_THRESHOLD } from './vlm-verify';
 import {
@@ -222,6 +223,20 @@ export async function retrySegmentCandidates(
     // away and nothing is lost if verification below throws.
     writeCandidatesFileSync(uploadDir, matchJobId, segmentIndex, entry);
   }
+
+  // Crop-robust embedding ranking (candidate system only): try the
+  // candidates whose movie frame — full OR any left/center/right 9:16
+  // window of it — looks most like the short frame FIRST, so a vertically
+  // cropped short doesn't burn VLM attempts on wrong locations. Reorders
+  // only; on failure (model unavailable etc.) the original order is kept.
+  const ranked = await rankCandidatesCropRobust(
+    entry.candidates,
+    uncheckedIdxs,
+    shortVideoPath,
+    movieVideoPath,
+    'CandidateRetry',
+  );
+  if (ranked) uncheckedIdxs = ranked;
 
   let acceptedIdx: number | undefined;
   for (const idx of uncheckedIdxs) {

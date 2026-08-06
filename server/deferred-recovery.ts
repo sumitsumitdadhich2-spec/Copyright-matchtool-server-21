@@ -14,6 +14,7 @@
  * decision logic.
  */
 import { MatchedSegment } from './candidate-matching-engine';
+import { rankCandidatesCropRobust } from './candidate-embedding-rank';
 import { pickVerificationFramePairs } from './vlm-segment-resolver';
 import { extractFrameAsBase64, verifySameSceneChecked, VLM_CONFIDENCE_THRESHOLD, VLM_CONCURRENCY } from './vlm-verify';
 import {
@@ -70,12 +71,29 @@ export async function runDeferredRecoveryPass(
 
     let acceptedIdx: number | null = null;
 
-    for (let c = 0; c < entry.candidates.length; c++) {
+    // Only fresh, never-tried candidates need deferred verification —
+    // candidates the main pass already ran through VLM are history-only.
+    let uncheckedOrder = entry.candidates
+      .map((cand, i) => (cand.checked ? -1 : i))
+      .filter(i => i !== -1);
+
+    // Crop-robust embedding ranking (candidate system only): verify the
+    // candidates whose movie frame — full OR any left/center/right 9:16
+    // window — best matches the short frame FIRST, so a vertically cropped
+    // short is recovered on an early attempt instead of exhausting the
+    // pool on wrong locations. Reorder-only and fail-safe: if ranking is
+    // unavailable, the original candidate order is used exactly as before.
+    const ranked = await rankCandidatesCropRobust(
+      entry.candidates,
+      uncheckedOrder,
+      shortVideoPath,
+      movieVideoPath,
+      'DeferredRecovery',
+    );
+    if (ranked) uncheckedOrder = ranked;
+
+    for (const c of uncheckedOrder) {
       const candidateEntry = entry.candidates[c];
-      // Skip candidates the main pass already ran through VLM (now included
-      // for comparison history) — only fresh, never-tried candidates need
-      // deferred verification.
-      if (candidateEntry.checked) continue;
       const framePairs = pickVerificationFramePairs(candidateEntry.segment);
 
       let verdict: DeferredRecoveryProgress['verdict'] = 'unverifiable';

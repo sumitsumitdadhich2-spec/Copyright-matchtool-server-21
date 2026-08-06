@@ -341,15 +341,31 @@ export async function verifySameSceneMulti(
     `In each pair the FIRST image is a frame from the ${firstDesc} and the SECOND image is a frame ` +
     `from the ${secondDesc}. All pairs come from the SAME candidate segment, sampled at different moments.\n\n` +
     `Task: decide if the pairs show the same underlying scene/footage.\n\n` +
-    `IMPORTANT — treat frames as the SAME scene even if they differ in:\n` +
+    `CRITICAL — VERTICAL CROP: the short clip is usually a 9:16 vertical crop cut from ` +
+    `SOME horizontal position (left, center, OR right — the editor chooses freely) of the ` +
+    `widescreen movie frame. This means the ${swapped ? 'second' : 'first'} image may show only a NARROW SLICE ` +
+    `of what the ${swapped ? 'first' : 'second'} image shows. Before judging a pair, mentally scan the ENTIRE ` +
+    `movie frame from left edge to right edge and check whether the short frame's content appears ` +
+    `in ANY region of it — including near the edges. A person/object visible in the short frame ` +
+    `may sit at the far left or far right of the movie frame. NEVER reject a pair merely because ` +
+    `the movie frame contains extra people, objects, or scenery on either side that the short ` +
+    `frame does not show, or because the subject is positioned differently within the frame.\n\n` +
+    `Also treat frames as the SAME scene even if they differ in:\n` +
     `- compression artifacts, resolution, blur, or sharpness\n` +
-    `- cropping, zooming, letterboxing/pillarboxing, or aspect ratio\n` +
+    `- zooming, letterboxing/pillarboxing, or aspect ratio\n` +
     `- color grading, filters, brightness, contrast, or saturation\n` +
     `- watermarks, logos, subtitles, captions, or UI overlays added on top\n` +
     `- horizontal mirroring (flipped image)\n` +
     `- a slightly different instant of the same continuous shot (people/objects moved a little)\n\n` +
     `Judge only the underlying content: same location, same people/characters, same objects, ` +
     `same camera setup or same continuous action.\n\n` +
+    `EQUALLY IMPORTANT — do NOT confuse merely similar footage with the same footage. ` +
+    `A DIFFERENT moment of the same movie (same characters/costumes/location but a different ` +
+    `shot, camera angle, or action) is NOT the same scene. Generic look-alikes ` +
+    `(similar rooms, similar landscapes, similar crowds) are NOT the same scene. ` +
+    `To count a pair as same, the cropped region of the movie frame must show the SAME shot: ` +
+    `matching subject pose/action, matching background details, matching lighting — not just ` +
+    `the same characters somewhere similar.\n\n` +
     `Decision rule: judge EACH pair independently and give a per-pair verdict. ` +
     `The overall answer is same=true ONLY if a MAJORITY of the pairs show the same scene ` +
     `(${n === 3 ? '2 of 3' : n === 2 ? '2 of 2' : '1 of 1'} pairs). ` +
