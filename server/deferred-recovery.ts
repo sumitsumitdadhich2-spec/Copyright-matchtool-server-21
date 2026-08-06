@@ -13,7 +13,7 @@
  * Never modifies matching-engine.ts / vlm-verify.ts / vlm-segment-resolver.ts
  * decision logic.
  */
-import { MatchedSegment } from './matching-engine';
+import { MatchedSegment } from './candidate-matching-engine';
 import { pickVerificationFramePairs } from './vlm-segment-resolver';
 import { extractFrameAsBase64, verifySameSceneChecked, VLM_CONFIDENCE_THRESHOLD, VLM_CONCURRENCY } from './vlm-verify';
 import {
