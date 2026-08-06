@@ -28,7 +28,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
-import { MatchedSegment, matchVideosFromFiles } from './matching-engine';
+import { MatchedSegment, matchVideosFromFiles } from './candidate-matching-engine';
 import { pickVerificationFramePairs } from './vlm-segment-resolver';
 import { extractFrameAsBase64, verifySameSceneMulti, VLM_CONFIDENCE_THRESHOLD } from './vlm-verify';
 import {
