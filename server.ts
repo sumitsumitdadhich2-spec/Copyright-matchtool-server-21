@@ -1550,6 +1550,97 @@ async function startServer() {
     res.json({ ok: true, segments: job.segments, unmatchedRanges: job.unmatchedRanges });
   });
 
+  // 6l. Manual candidate boundary adjustment — user-triggered, purely additive.
+  // Nudges ONE edge (movieStart or movieEnd) of ONE stored candidate by ±1 s.
+  // NEVER touches the matching engine, VLM resolver, or recovery passes: it
+  // only edits the candidate file, and — iff that candidate is the currently
+  // Used/main one — mirrors the change into the active segment with the exact
+  // same range-find + persist logic select-candidate already uses.
+  app.post('/api/match/:matchJobId/segment/:segmentIndex/adjust-candidate', async (req, res) => {
+    const { matchJobId, segmentIndex: segmentIndexStr } = req.params;
+    const segmentIndex = Number(segmentIndexStr);
+    const candidateIndex = Number(req.body?.candidateIndex);
+    const edge = req.body?.edge;
+    const deltaSec = Number(req.body?.deltaSec);
+    if (!Number.isFinite(segmentIndex)) return res.status(400).json({ error: 'segmentIndex must be a number' });
+    if (!Number.isFinite(candidateIndex)) return res.status(400).json({ error: 'candidateIndex must be a number' });
+    if (edge !== 'start' && edge !== 'end') return res.status(400).json({ error: "edge must be 'start' or 'end'" });
+    if (deltaSec !== 1 && deltaSec !== -1) return res.status(400).json({ error: 'deltaSec must be +1 or -1' });
+
+    const job = matchJobs.get(matchJobId) ?? loadMatchJobFromDisk(matchJobId);
+    if (!job) return res.status(404).json({ error: 'Match job not found' });
+    if (job.status !== 'completed') return res.status(400).json({ error: 'Match job is not completed yet' });
+
+    // Don't fight a running Retry for the same segment — it could overwrite
+    // this candidate file when it finishes.
+    if (retryInFlight.has(retryKey(matchJobId, segmentIndex))) {
+      return res.status(409).json({ error: 'A Retry is currently running for this segment — wait for it to finish first.' });
+    }
+
+    const entry = readCandidatesFile(uploadDir, matchJobId, segmentIndex);
+    if (!entry) return res.status(404).json({ error: 'No candidate data for this segment' });
+    const candidate = entry.candidates[candidateIndex];
+    if (!candidate) return res.status(404).json({ error: 'Candidate not found' });
+
+    const seg: any = candidate.segment;
+    let newStart = seg.movieStart;
+    let newEnd = seg.movieEnd;
+    if (edge === 'start') newStart = seg.movieStart + deltaSec;
+    else newEnd = seg.movieEnd + deltaSec;
+
+    // Timeline is one-directional: clamp at 0 and keep at least 0.5 s of
+    // segment so start can never cross end (or vice versa).
+    if (newStart < 0) return res.status(400).json({ error: 'Cannot extend before 0:00 — movie start is already at the beginning.' });
+    if (newEnd - newStart < 0.5) return res.status(400).json({ error: 'Segment would become too short (minimum 0.5 s).' });
+
+    seg.movieStart = newStart;
+    seg.movieEnd = newEnd;
+
+    try {
+      writeCandidatesFileSync(uploadDir, matchJobId, segmentIndex, entry);
+    } catch (e) {
+      console.error(`[AdjustCandidate] Failed to persist candidate file for ${matchJobId} seg ${segmentIndex}:`, e);
+      return res.status(500).json({ error: 'Could not persist the adjustment to disk.' });
+    }
+
+    // If this candidate IS the active/main match for its range, mirror the
+    // new bounds into the live segments + persisted result JSON.
+    let segmentsUpdated = false;
+    if (entry.recoveredCandidateIndex === candidateIndex) {
+      const segsArr: any[] = job.segments ?? [];
+      let arrIdx = segsArr.findIndex((s: any) =>
+        Math.abs(s.shortStart - entry.shortStart) < 0.05 &&
+        Math.abs(s.shortEnd - entry.shortEnd) < 0.05);
+      if (arrIdx === -1) {
+        let bestOverlap = 0;
+        segsArr.forEach((s: any, i: number) => {
+          const overlap = Math.min(s.shortEnd, entry.shortEnd) - Math.max(s.shortStart, entry.shortStart);
+          if (overlap > bestOverlap) { bestOverlap = overlap; arrIdx = i; }
+        });
+      }
+      if (arrIdx !== -1) {
+        segsArr[arrIdx] = { ...segsArr[arrIdx], movieStart: newStart, movieEnd: newEnd };
+        job.segments = segsArr;
+        segmentsUpdated = true;
+        try {
+          await fs.promises.writeFile(matchResultPath(matchJobId), JSON.stringify({
+            segments: job.segments,
+            unmatchedRanges: job.unmatchedRanges,
+            movieFrames: job.movieFrames,
+            shortFrames: job.shortFrames,
+            vlmStats: job.vlmStats,
+          }));
+        } catch (e) {
+          console.error(`[AdjustCandidate] Failed to persist result for ${matchJobId}:`, e);
+          return res.status(500).json({ error: 'Adjusted the candidate but could not persist the main result to disk.' });
+        }
+      }
+    }
+
+    console.log(`[AdjustCandidate] Match ${matchJobId} segment ${segmentIndex}: candidate ${candidateIndex} ${edge} ${deltaSec > 0 ? '+' : ''}${deltaSec}s → ${newStart.toFixed(2)}–${newEnd.toFixed(2)} (mainUpdated=${segmentsUpdated}).`);
+    res.json({ ok: true, entry, segmentsUpdated, segments: job.segments, unmatchedRanges: job.unmatchedRanges });
+  });
+
   // 7. Worker Accuracy Calibration
   // Tests hash DETERMINISM: send each synthetic frame to the worker TWICE.
   // If both passes return identical 256-bit hashes → worker is stable & correct.

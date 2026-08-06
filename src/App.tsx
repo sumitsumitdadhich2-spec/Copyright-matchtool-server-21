@@ -3,7 +3,8 @@ import {
   CloudUpload, Video, Server, Monitor, Play, Pause, Download, Search,
   Film, ScanLine, Activity, X, AlertCircle, CheckCircle2, Layers,
   Sliders, RotateCcw, RefreshCw, ChevronDown, ChevronUp, Repeat,
-  ShieldCheck, Cpu, Zap, Trash2, Database, History, ChevronLeft, ChevronRight, ListChecks
+  ShieldCheck, Cpu, Zap, Trash2, Database, History, ChevronLeft, ChevronRight, ListChecks,
+  Plus, Minus
 } from 'lucide-react';
 import { processVideoFile, processVideoOnServer } from './VideoProcessor';
 import { clearVideoFingerprints } from './utils/db';
@@ -450,6 +451,11 @@ export default function App() {
   // In-flight "Make main segment" selection — `${segmentIndex}:${candidateIndex}`
   // while the POST is running, '' otherwise. Disables just that one button.
   const [selectingCandidateKey, setSelectingCandidateKey] = useState<string>('');
+
+  // Manual ±1 s boundary trim (adjust-candidate feature). One adjustment in
+  // flight at a time — key is `${segmentIndex}:${candidateIndex}:${edge}`.
+  const [adjustingKey, setAdjustingKey] = useState<string>('');
+  const [adjustError, setAdjustError] = useState<string>('');
   const [selectError, setSelectError] = useState<string>('');
 
   const refVideoRef  = useRef<HTMLVideoElement>(null);
@@ -1397,6 +1403,113 @@ export default function App() {
     }
   };
 
+  // ---------------------------------------------------------------------------
+  // Manual ±1 s candidate boundary trim — user nudges the movie-side start or
+  // end of a candidate they like. Purely additive: calls the adjust-candidate
+  // endpoint, then refreshes through the exact same fetch paths the rest of
+  // the app already uses. Never touches matching. The timeline is
+  // one-directional, so the server clamps at 0:00 and enforces a minimum
+  // segment length — the UI just surfaces those errors.
+  // ---------------------------------------------------------------------------
+  const handleAdjustCandidate = async (cs: StoredCandidateSet, idx: number, edge: 'start' | 'end', deltaSec: 1 | -1) => {
+    if (!matchJobId) { setAdjustError('No active match job — re-run matching to enable adjustments.'); return; }
+    if (adjustingKey || selectingCandidateKey) return; // one mutation at a time keeps state simple & safe
+    const key = `${cs.segmentIndex}:${idx}:${edge}`;
+    setAdjustError('');
+    setAdjustingKey(key);
+    try {
+      const res = await fetch(`/api/match/${matchJobId}/segment/${cs.segmentIndex}/adjust-candidate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ candidateIndex: idx, edge, deltaSec }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setAdjustError(err?.error || 'Could not adjust this candidate.');
+        return;
+      }
+      const data = await res.json();
+      const updatedSeg: MatchedSegment | undefined = data?.entry?.candidates?.[idx]?.segment;
+
+      // Refresh candidate history so every list/stepper shows the new bounds.
+      await refreshCandidateSets();
+
+      // If the adjusted candidate was the main match, the server also updated
+      // the active segments — re-link previewSegment to its new object so
+      // Next/Previous and the stepper stay consistent (same pattern as
+      // handleMakeMainCandidate).
+      if (data.segmentsUpdated && Array.isArray(data.segments)) {
+        const newSegments: MatchedSegment[] = data.segments;
+        setSegments(newSegments);
+        if (previewSegment) {
+          const relinked = newSegments.find(s =>
+            Math.abs(s.shortStart - previewSegment.shortStart) < 0.05 &&
+            Math.abs(s.shortEnd - previewSegment.shortEnd) < 0.05);
+          if (relinked && relinked !== previewSegment) {
+            pendingCandidateIndexRef.current = candidateIndex;
+            setPreviewSegment(relinked);
+          }
+        }
+      }
+
+      // If the user extended/shrunk the START of the candidate currently in
+      // the compare panel, seek the reference video there so they instantly
+      // see the extra (or trimmed) second.
+      if (updatedSeg && edge === 'start' &&
+          activeCandidateSet?.segmentIndex === cs.segmentIndex && candidateIndex === idx &&
+          refVideoRef.current) {
+        refVideoRef.current.currentTime = updatedSeg.movieStart;
+      }
+
+      if (updatedSeg) {
+        setStatus(`Candidate ${idx + 1} ${edge === 'start' ? 'start' : 'end'} moved ${deltaSec > 0 ? '+1s' : '-1s'} → movie ${fmt(updatedSeg.movieStart)}–${fmt(updatedSeg.movieEnd)}.`);
+      }
+    } catch {
+      setAdjustError('Network error while adjusting this candidate.');
+    } finally {
+      setAdjustingKey('');
+    }
+  };
+
+  // Compact [−|+ Start … End −|+] button group rendered next to a candidate.
+  // Left "+" extends the segment 1 s earlier (start − 1), left "−" shrinks it
+  // (start + 1); right "+" extends 1 s later (end + 1), right "−" shrinks it
+  // (end − 1). Reused by the preview stepper and the inline candidate list.
+  const renderTrimControls = (cs: StoredCandidateSet, idx: number, disabled: boolean) => {
+    const seg = cs.candidates[idx]?.segment;
+    if (!seg) return null;
+    const busy = !!adjustingKey || disabled;
+    const btnCls = 'inline-flex items-center justify-center w-6 h-6 rounded-md border border-slate-700 bg-slate-800/80 hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-slate-800/80 text-slate-300 transition cursor-pointer';
+    return (
+      <div className="flex items-center gap-1.5 rounded-lg border border-cyan-500/20 bg-cyan-500/5 px-2 py-1">
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-cyan-300/70">Start</span>
+        <button onClick={() => handleAdjustCandidate(cs, idx, 'start', -1)} disabled={busy || seg.movieStart < 1}
+          title="Extend start 1 s earlier (e.g. 4s → 3s)" className={btnCls}>
+          <Plus className="w-3 h-3" />
+        </button>
+        <button onClick={() => handleAdjustCandidate(cs, idx, 'start', 1)} disabled={busy || seg.movieEnd - seg.movieStart < 1.5}
+          title="Shrink from the start by 1 s" className={btnCls}>
+          <Minus className="w-3 h-3" />
+        </button>
+        <span className="font-mono text-[11px] text-cyan-200/90 px-1 whitespace-nowrap">
+          {fmt(seg.movieStart)}<span className="text-slate-600 mx-0.5">→</span>{fmt(seg.movieEnd)}
+        </span>
+        <button onClick={() => handleAdjustCandidate(cs, idx, 'end', -1)} disabled={busy || seg.movieEnd - seg.movieStart < 1.5}
+          title="Shrink from the end by 1 s" className={btnCls}>
+          <Minus className="w-3 h-3" />
+        </button>
+        <button onClick={() => handleAdjustCandidate(cs, idx, 'end', 1)} disabled={busy}
+          title="Extend end 1 s later (e.g. 6s → 7s)" className={btnCls}>
+          <Plus className="w-3 h-3" />
+        </button>
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-cyan-300/70">End</span>
+        {adjustingKey.startsWith(`${cs.segmentIndex}:${idx}:`) && (
+          <RefreshCw className="w-3 h-3 text-cyan-300 animate-spin" />
+        )}
+      </div>
+    );
+  };
+
   const toggleCandidateExpansion = (segmentKey: number) => {
     setExpandedCandidateKeys(prev => {
       const next = new Set(prev);
@@ -2137,6 +2250,7 @@ export default function App() {
                                           )}
                                         </div>
                                         <CandidateVerdictBadge candidate={c} isUsed={isUsed} />
+                                        {renderTrimControls(rowCs, cIdx, isSelecting || !!selectingCandidateKey || segmentBusy || isMatching)}
                                         <div className="flex items-center gap-1.5 ml-auto">
                                           <button
                                             onClick={() => handleJumpToCandidate(rowCs, cIdx)}
@@ -2181,6 +2295,16 @@ export default function App() {
                 <AlertCircle className="w-3.5 h-3.5 shrink-0" />
                 {selectError}
                 <button onClick={() => setSelectError('')} className="ml-auto text-red-400/70 hover:text-red-300 cursor-pointer">
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+
+            {adjustError && (
+              <div className="px-4 py-2 border-t border-red-900/40 bg-red-500/5 flex items-center gap-2 text-xs text-red-300">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                {adjustError}
+                <button onClick={() => setAdjustError('')} className="ml-auto text-red-400/70 hover:text-red-300 cursor-pointer">
                   <X className="w-3.5 h-3.5" />
                 </button>
               </div>
@@ -2375,6 +2499,10 @@ export default function App() {
                       </button>
                     </div>
                     {currentCandidate && <CandidateVerdictBadge candidate={currentCandidate} isUsed={isUsed} />}
+                    {/* ±1 s boundary trim for the currently-stepped candidate */}
+                    {currentCandidate && renderTrimControls(
+                      activeCandidateSet, candidateIndex,
+                      !!selectingCandidateKey || isCurrentSegmentRetrying || isMatching)}
                     {/* Make Main — promote the currently-stepped candidate the
                         user just visually verified (hidden when it already IS
                         the main match). Same handler as the inline table. */}
@@ -2413,6 +2541,16 @@ export default function App() {
               <div className="px-4 py-2 border-t border-red-900/40 bg-red-500/5 flex items-center gap-2 text-xs text-red-300">
                 <AlertCircle className="w-3.5 h-3.5 shrink-0" />
                 {retryError}
+              </div>
+            )}
+
+            {adjustError && (
+              <div className="px-4 py-2 border-t border-red-900/40 bg-red-500/5 flex items-center gap-2 text-xs text-red-300">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                {adjustError}
+                <button onClick={() => setAdjustError('')} className="ml-auto text-red-400/70 hover:text-red-300 cursor-pointer">
+                  <X className="w-3.5 h-3.5" />
+                </button>
               </div>
             )}
 
