@@ -154,29 +154,55 @@ const LOOK_AHEAD = 25;
  * Base half-width of the movie-frame search window during the walk.
  * Extended by frameDrift (user param) + missCount (per missed frame),
  * capped at WALK_LOOK_AHEAD_MAX.
+ *
+ * CANDIDATE-ENGINE TUNING: widened vs the main engine (7/18) so the
+ * candidate walk can survive bigger frame drift / re-timed edits. Slower,
+ * but this engine's only job is to FIND the right clip — VLM verifies after.
  */
-const WALK_LOOK_AHEAD     = 7;
-const WALK_LOOK_AHEAD_MAX = 18;
+const WALK_LOOK_AHEAD     = 12;
+const WALK_LOOK_AHEAD_MAX = 40;
 
 /** Base minimum similarity (%) for a frame to extend the segment walk */
-const WALK_MIN_SIM = 50;
+const WALK_MIN_SIM = 45;
 
 /**
  * How many consecutive low-confidence short frames we tolerate before ending
- * a segment. Lower than v4 (12 vs 25) so the walk stops sooner when it
- * drifts past the chunk boundary due to a missed cut.
+ * a segment. CANDIDATE-ENGINE: raised vs main engine (12) so heavy edits
+ * (overlays, color grading bursts) don't prematurely kill a correct walk.
  */
-const GAP_LOOKAHEAD = 12;
+const GAP_LOOKAHEAD = 20;
 
 /** Relax WALK_MIN_SIM by this many % per 25 matched frames */
 const ADAPTIVE_DROP_PER_STEP = 1;
 const ADAPTIVE_STEP_FRAMES   = 25;
-const ADAPTIVE_FLOOR         = 40;
+const ADAPTIVE_FLOOR         = 32;
 
-/** Multi-candidate seeding */
-const MAX_SEED_CANDIDATES = 8;
+/** Multi-candidate seeding — CANDIDATE-ENGINE: 20 vs main engine's 8 */
+const MAX_SEED_CANDIDATES = 20;
 /** Candidates closer than this many movie frames are merged (2 s @ 25 fps) */
 const SEED_SEPARATION = 50;
+
+/**
+ * CANDIDATE-ENGINE dense seeding: instead of only 5 strategic positions
+ * (0/25/50/75/100%), probe one seed roughly every SEED_DENSITY_FRAMES frames
+ * within each scene chunk, capped at MAX_SEEDS_PER_CHUNK. Massively raises
+ * the chance that at least one seed frame survives the edit intact.
+ */
+const SEED_DENSITY_FRAMES = 10;
+const MAX_SEEDS_PER_CHUNK = 25;
+
+/** Build the dense candidate-engine seed set for a chunk [start, end]. */
+function candidateSeedPositions(start: number, end: number): Set<number> {
+  const size = end - start + 1;
+  const seeds = new Set<number>();
+  // Always keep the 5 strategic anchors (main-engine behavior superset)
+  for (let p = 0; p <= 4; p++) {
+    seeds.add(start + Math.round(p * (size - 1) / 4));
+  }
+  const step = Math.max(SEED_DENSITY_FRAMES, Math.ceil(size / MAX_SEEDS_PER_CHUNK));
+  for (let si = start; si <= end; si += step) seeds.add(si);
+  return seeds;
+}
 
 /**
  * VLM-fallback candidate retention. Independent of MAX_SEED_CANDIDATES, which
@@ -186,7 +212,7 @@ const SEED_SEPARATION = 50;
  * candidates get kept around afterward so the VLM retry loop has real
  * alternatives to fall back on instead of coming up empty after one rejection.
  */
-const ALT_CANDIDATES_PER_CHUNK = 10;
+const ALT_CANDIDATES_PER_CHUNK = 24;
 /** Slightly larger than ALT_CANDIDATES_PER_CHUNK to leave room for SEED_SEPARATION dedup */
 const ALT_CANDIDATE_SLICE = ALT_CANDIDATES_PER_CHUNK + 4;
 
@@ -1335,6 +1361,92 @@ async function buildAltCandidatesForChunkWindowed(
 }
 
 // ---------------------------------------------------------------------------
+// CANDIDATE-ENGINE consensus rescue (Pass 2.5) — offset-histogram voting
+// ---------------------------------------------------------------------------
+//
+// Single-frame seeding can fail when EVERY individual probe frame is degraded
+// (heavy grading, overlays, blur). But the correct alignment offset
+// (movieIndex - shortIndex) is shared by ALL frames of the chunk. So instead
+// of trusting one frame, we let every Nth frame of the chunk vote: each probe
+// scans the whole movie, its top local-maxima positions vote (weighted by
+// similarity) into a bucketized offset histogram. Offsets that many frames
+// weakly agree on rise to the top even when no single frame scores high.
+// This is a Hough-transform-style consensus — brute force, O(chunkFrames/step
+// × movieFrames × variants²), but deliberately so: this engine is allowed to
+// be slow as long as it FINDS the clip. Only runs for chunks that Passes 1+2
+// left unmatched, so the normal fast path is unaffected.
+
+/** Probe every Nth chunk frame during consensus voting */
+const CONSENSUS_PROBE_STEP = 3;
+/** Top local-maxima movie positions each probe frame votes for */
+const CONSENSUS_VOTES_PER_PROBE = 6;
+/** Offset histogram bucket width, in movie frames */
+const CONSENSUS_BUCKET_FRAMES = 8;
+/** How many top-voted offsets to try walking from */
+const CONSENSUS_TOP_OFFSETS = 12;
+
+interface ConsensusSeed {
+  offset: number;   // representative alignment offset (mi - si)
+  votes: number;    // number of probe frames that voted for this bucket
+  simSum: number;   // similarity-weighted vote mass
+  bestSi: number;   // probe frame with the strongest individual score
+  bestMi: number;   // its best movie position
+  bestSim: number;
+}
+
+async function consensusRescueSeeds(
+  sSet: PreSet,
+  mSet: PreSet,
+  chunkStart: number,
+  chunkEnd: number,
+): Promise<ConsensusSeed[]> {
+  const buckets = new Map<number, ConsensusSeed>();
+  let iter = 0;
+
+  for (let si = chunkStart; si <= chunkEnd; si += CONSENSUS_PROBE_STEP) {
+    // Full-movie scan for this probe: keep one local maximum per
+    // SEED_SEPARATION region (same grouping the seed scan uses).
+    const local: Array<{ mi: number; sim: number }> = [];
+    let last: { mi: number; sim: number } | null = null;
+    for (let mi = 0; mi < mSet.fps.length; mi++) {
+      const yp = yieldIfNeeded(iter++, 2000);
+      if (yp) await yp;
+      const s = hashSimBestCross(sSet, si, mSet, mi);
+      if (last && mi - last.mi < SEED_SEPARATION) {
+        if (s > last.sim) { last.mi = mi; last.sim = s; }
+      } else {
+        last = { mi, sim: s };
+        local.push(last);
+      }
+    }
+    local.sort((a, b) => b.sim - a.sim);
+
+    for (const c of local.slice(0, CONSENSUS_VOTES_PER_PROBE)) {
+      const key = Math.round((c.mi - si) / CONSENSUS_BUCKET_FRAMES);
+      let b = buckets.get(key);
+      if (!b) {
+        b = { offset: c.mi - si, votes: 0, simSum: 0, bestSi: si, bestMi: c.mi, bestSim: c.sim };
+        buckets.set(key, b);
+      }
+      b.votes++;
+      b.simSum += c.sim;
+      if (c.sim > b.bestSim) {
+        b.bestSim = c.sim;
+        b.bestSi  = si;
+        b.bestMi  = c.mi;
+        b.offset  = c.mi - si;
+      }
+    }
+  }
+
+  const list = [...buckets.values()];
+  // Votes dominate; similarity mass breaks ties. An offset that 20 frames
+  // weakly agree on beats an offset one frame loves.
+  list.sort((a, b) => (b.votes - a.votes) || (b.simSum - a.simSum));
+  return list.slice(0, CONSENSUS_TOP_OFFSETS);
+}
+
+// ---------------------------------------------------------------------------
 // Post-process: merge temporally adjacent segments that belong to the same run
 // ---------------------------------------------------------------------------
 
@@ -1565,12 +1677,9 @@ export async function groundMatchedSegments(
       // Minimum frames needed to accept a segment (scales with chunk size)
       const chunkMinFrames = Math.min(minConsecutiveFrames, Math.max(3, Math.floor(chunkSize * 0.4)));
 
-      // Try seeding from 5 strategic positions within the chunk:
-      // 0%, 25%, 50%, 75%, 100%
-      const seedPositions = new Set<number>();
-      for (let p = 0; p <= 4; p++) {
-        seedPositions.add(chunk.start + Math.round(p * (chunkSize - 1) / 4));
-      }
+      // CANDIDATE-ENGINE: dense seeding — one seed every ~SEED_DENSITY_FRAMES
+      // frames (plus the 5 strategic anchors), capped at MAX_SEEDS_PER_CHUNK.
+      const seedPositions = candidateSeedPositions(chunk.start, chunk.end);
 
       let bestSeq: RawSeq[] | null = null;
       let bestSeqConf = 0;
@@ -1595,7 +1704,10 @@ export async function groundMatchedSegments(
         const yp = yieldIfNeeded(ci * 5);
         if (yp) await yp;
 
-        const fastFloor = passMinSim - 20;
+        // CANDIDATE-ENGINE: floor relaxed (-30 vs main engine's -20) so weak
+        // but real locations still enter the walk-candidate list. VLM is the
+        // real accept gate downstream.
+        const fastFloor = passMinSim - 30;
         const cands: Array<{ mi: number; sim: number }> = [];
         let lastCand: { mi: number; sim: number } | null = null;
 
@@ -1612,7 +1724,11 @@ export async function groundMatchedSegments(
         let lastPoolCand: AlignedCand | null = null;
 
         for (let mi = 0; mi < movieFps.length; mi++) {
-          const s = hashSimFastCross(sSet, si, mSet, mi);
+          // CANDIDATE-ENGINE: full best-cross scan (every short-variant ×
+          // movie-variant pair) instead of fast-cross (full-frame variant
+          // only). ~13× slower but catches cropped / zoomed / reframed edits
+          // that the fast scan misses entirely. Slow is acceptable here.
+          const s = hashSimBestCross(sSet, si, mSet, mi);
           const offset = mi - si;
 
           if (lastPoolCand && offset - lastPoolCand.offset < SEED_SEPARATION) {
@@ -1642,11 +1758,15 @@ export async function groundMatchedSegments(
         if (cands.length === 0) continue;
         cands.sort((a, b) => b.sim - a.sim);
         const topCands = cands.slice(0, MAX_SEED_CANDIDATES);
-        if (topCands[0].sim < passMinSim - 18) continue;
+        // CANDIDATE-ENGINE: relaxed (-28 vs main's -18)
+        if (topCands[0].sim < passMinSim - 28) continue;
 
         for (const cand of topCands) {
           const seedSim = frameSim(sSet, si, mSet, cand.mi);
-          if (seedSim < passMinSim) continue;
+          // CANDIDATE-ENGINE: allow slightly weaker seeds (-8) — the walk's
+          // own confidence average still governs segment quality, and VLM
+          // verifies every candidate before it's ever shown as a match.
+          if (seedSim < passMinSim - 8) continue;
 
           const seq = buildSegment(
             sSet, mSet, si, cand.mi, seedSim,
@@ -1679,6 +1799,71 @@ export async function groundMatchedSegments(
     }
 
     console.log(`[Matcher] Pass ${pass} (minSim=${passMinSim}%): ${passCount} chunk(s) matched.`);
+  }
+
+  // ------------------------------------------------------------------
+  // CANDIDATE-ENGINE Pass 2.5: consensus rescue for still-unmatched chunks.
+  // Offset-histogram voting across ALL chunk frames — finds alignments no
+  // single seed frame could. Slow by design; only runs on leftover chunks.
+  // ------------------------------------------------------------------
+  let rescueCount = 0;
+  for (const chunk of chunks) {
+    const chunkSize = chunk.end - chunk.start + 1;
+    let hasUnmatched = false;
+    for (let si = chunk.start; si <= chunk.end; si++) {
+      if (!usedShort[si]) { hasUnmatched = true; break; }
+    }
+    if (!hasUnmatched || chunkSize < 3) continue;
+
+    console.log(`[Matcher] Pass 2.5 (consensus): chunk [${chunk.start}–${chunk.end}] — offset voting…`);
+    const rescueSeeds = await consensusRescueSeeds(sSet, mSet, chunk.start, chunk.end);
+    if (rescueSeeds.length === 0) continue;
+
+    const chunkMinFrames = Math.min(minConsecutiveFrames, Math.max(3, Math.floor(chunkSize * 0.4)));
+    let bestSeq: RawSeq[] | null = null;
+    let bestSeqConf = 0;
+
+    for (const seed of rescueSeeds) {
+      const seedSim = frameSim(sSet, seed.bestSi, mSet, seed.bestMi);
+      const seq = buildSegment(
+        sSet, mSet, seed.bestSi, seed.bestMi, seedSim,
+        usedShort, isCut, frameDrift,
+        chunk.start, chunk.end
+      );
+      if (seq.length < chunkMinFrames) continue;
+      const conf = seq.reduce((a, f) => a + f.sim, 0) / seq.length;
+      if (conf < 40) continue; // same floor as Pass 2
+      if (
+        bestSeq === null ||
+        seq.length > bestSeq.length ||
+        (seq.length === bestSeq.length && conf > bestSeqConf)
+      ) {
+        bestSeq = seq;
+        bestSeqConf = conf;
+      }
+    }
+
+    if (bestSeq) {
+      for (const item of bestSeq) usedShort[item.si] = 1;
+      segments.push(acceptSegment(bestSeq, shortFps, movieFps, true, sSet, mSet));
+      rescueCount++;
+      console.log(
+        `[Matcher] Pass 2.5: rescued chunk [${chunk.start}–${chunk.end}] ` +
+        `(${bestSeq.length} frames @ ${bestSeqConf.toFixed(1)}% avg).`
+      );
+    }
+
+    // Regardless of walk outcome, feed EVERY top-voted offset into the VLM
+    // fallback pool so the retry loop can visually verify each alignment.
+    altCandidatePool.push(
+      ...buildAltCandidatesForChunk(
+        rescueSeeds.map(s => ({ offset: s.offset, sim: s.simSum / Math.max(1, s.votes) })),
+        sSet, mSet, shortFps, movieFps, chunk.start, chunk.end, frameDrift
+      )
+    );
+  }
+  if (rescueCount > 0) {
+    console.log(`[Matcher] Pass 2.5: ${rescueCount} chunk(s) rescued via consensus voting.`);
   }
 
   onProgress?.({ phase: 'finalizing', pct: 92 });
@@ -1730,7 +1915,7 @@ export async function groundMatchedSegments(
     // likely doesn't exist in the reference movie (e.g. CGI insert, green-screen
     // overlay, third-party clip).  Leave it as an unmatched range rather than
     // fabricating a low-quality segment.
-    const UNMATCHED_SIM_GATE = 65; // below this avg % → altered / unmatched
+    const UNMATCHED_SIM_GATE = 55; // CANDIDATE-ENGINE: lowered from 65 — weak but real matches still surface; VLM rejects fabrications
     const avgForcedSim = bestOf.reduce((s, f) => s + f.sim, 0) / bestOf.length;
     if (avgForcedSim < UNMATCHED_SIM_GATE) {
       console.log(
@@ -2242,7 +2427,8 @@ async function groundMatchedSegmentsChunked(
 
   const shortFps        = shortSet.fps;
   const totalMovieFrames = movieMetaFps.length;
-  const fastFloor        = minSimilarity - 20;
+  // CANDIDATE-ENGINE: relaxed floor (-30 vs main's -20)
+  const fastFloor        = minSimilarity - 30;
 
   // ── 1. Scene cut detection on short clip ─────────────────────────────────
   const isCut  = detectSceneCuts(shortSet);
@@ -2266,13 +2452,10 @@ async function groundMatchedSegmentsChunked(
   // SAME real match reports a different raw mi per seed).
   const poolCands = new Map<number, AlignedCand[]>();
 
-  // Seed positions to probe (5 strategic points per scene chunk)
+  // CANDIDATE-ENGINE: dense seed positions per scene chunk (vs main's 5)
   const seedSiSet = new Set<number>();
   for (const sc of chunks) {
-    const sz = sc.end - sc.start + 1;
-    for (let p = 0; p <= 4; p++) {
-      seedSiSet.add(sc.start + Math.round(p * (sz - 1) / 4));
-    }
+    for (const si of candidateSeedPositions(sc.start, sc.end)) seedSiSet.add(si);
   }
   for (const si of seedSiSet) { allCands.set(si, []); poolCands.set(si, []); }
 
@@ -2289,7 +2472,9 @@ async function groundMatchedSegmentsChunked(
       let lastPoolCand: AlignedCand | null = null;
 
       for (let localMi = 0; localMi < chunkLen; localMi++) {
-        const s = hashSimFastCross(shortSet, si, chunkSet, localMi);
+        // CANDIDATE-ENGINE: full best-cross scan (all variant pairs) — see
+        // full-load path comment. Slower but catches crops/zooms/reframes.
+        const s = hashSimBestCross(shortSet, si, chunkSet, localMi);
         const globalMi = chunkStart + localMi;
         const offset = globalMi - si;
 
@@ -2345,11 +2530,8 @@ async function groundMatchedSegmentsChunked(
   // force-find scores above. Never affects Pass 1/2/3 segment selection.
   const altCandidatePool: MatchedSegment[] = [];
   for (const sc of chunks) {
-    const sz = sc.end - sc.start + 1;
-    const chunkSeedSis: number[] = [];
-    for (let p = 0; p <= 4; p++) {
-      chunkSeedSis.push(sc.start + Math.round(p * (sz - 1) / 4));
-    }
+    // CANDIDATE-ENGINE: pool sourced from the same dense seed set as the scan
+    const chunkSeedSis = [...candidateSeedPositions(sc.start, sc.end)];
     const raw: AlignedCand[] = [];
     for (const si of chunkSeedSis) {
       const list = poolCands.get(si);
@@ -2382,10 +2564,8 @@ async function groundMatchedSegmentsChunked(
       if (!hasUnmatched) continue;
 
       const chunkMinFrames = Math.min(minConsFrames, Math.max(3, Math.floor(scSize * 0.4)));
-      const seedPositions  = new Set<number>();
-      for (let p = 0; p <= 4; p++) {
-        seedPositions.add(sc.start + Math.round(p * (scSize - 1) / 4));
-      }
+      // CANDIDATE-ENGINE: dense seeds (must mirror the scan's seedSiSet)
+      const seedPositions = candidateSeedPositions(sc.start, sc.end);
 
       let bestSeq: RawSeq[] | null = null;
       let bestSeqConf = 0;
@@ -2402,7 +2582,8 @@ async function groundMatchedSegmentsChunked(
           if (!found) continue;
         }
 
-        const cands = (allCands.get(si) ?? []).filter(c => c.sim >= passMinSim - 18);
+        // CANDIDATE-ENGINE: relaxed (-28 vs main's -18)
+        const cands = (allCands.get(si) ?? []).filter(c => c.sim >= passMinSim - 28);
         if (cands.length === 0) continue;
 
         for (const cand of cands.slice(0, MAX_SEED_CANDIDATES)) {
@@ -2412,7 +2593,8 @@ async function groundMatchedSegmentsChunked(
 
           const winSet  = await loadMovieWindowPreset(movieFilePath, byteOffsets, winStart, winEnd, meta);
           const seedSim = frameSim(shortSet, si, winSet, localMi);
-          if (seedSim < passMinSim) continue;
+          // CANDIDATE-ENGINE: allow slightly weaker seeds (-8)
+          if (seedSim < passMinSim - 8) continue;
 
           const seq = buildSegment(shortSet, winSet, si, localMi, seedSim,
             usedShort, isCut, frameDrift, sc.start, sc.end);
@@ -2460,7 +2642,7 @@ async function groundMatchedSegmentsChunked(
     }
 
     const avgSim = bestOf.length > 0 ? bestOf.reduce((s, f) => s + f.sim, 0) / bestOf.length : 0;
-    if (avgSim < 65) continue;
+    if (avgSim < 55) continue; // CANDIDATE-ENGINE: lowered from 65
 
     let k = 0;
     while (k < bestOf.length) {
