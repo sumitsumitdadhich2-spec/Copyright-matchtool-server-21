@@ -274,21 +274,74 @@ export async function verifySameScene(
   shortFrameB64: string,
   movieFrameB64: string,
 ): Promise<{ same: boolean; confidencePct: number } | null> {
+  return verifySameSceneMulti([{ shortFrameB64, movieFrameB64 }]);
+}
+
+/** One (short-frame, movie-frame) pair from the same candidate segment. */
+export interface VlmFramePair {
+  shortFrameB64: string;
+  movieFrameB64: string;
+}
+
+/**
+ * Multi-pair variant of verifySameScene: sends up to 3 (short, movie) frame
+ * pairs from the SAME candidate segment in ONE request (max 6 images), so
+ * the VLM can cross-check its verdict across several moments of the segment
+ * instead of judging from a single frame pair. Still exactly one HTTP call
+ * per attempt — same request count, same timeout, same retry behavior as
+ * before, so wall-clock time per attempt does not grow.
+ *
+ * Decision rule baked into the prompt: if ANY pair clearly shows the same
+ * scene, the answer is "same". This is deliberately recall-biased — the
+ * whole point of sending extra pairs is to stop the VLM from rejecting a
+ * genuinely-matching segment because one unlucky frame (motion blur, cut
+ * boundary, overlay) looked different.
+ */
+export async function verifySameSceneMulti(
+  pairs: VlmFramePair[],
+): Promise<{ same: boolean; confidencePct: number } | null> {
+  const usable = pairs.slice(0, 3);
+  if (usable.length === 0) return null;
+
+  const n = usable.length;
+  const pairList = usable
+    .map((_, i) => `Pair ${i + 1} = images ${i * 2 + 1} & ${i * 2 + 2}`)
+    .join('; ');
+
   const prompt =
-    'Compare these two video frames. Are they showing the same scene/subject ' +
-    '(allowing for compression, crop, or color grading differences)? Reply with ' +
-    'ONLY JSON: {"same": true|false, "confidence": 0-100}';
+    `You are verifying whether a short video clip was copied from a movie. ` +
+    `You are given ${n} pair(s) of video frames, ${n * 2} images total, in order: ${pairList}. ` +
+    `In each pair the FIRST image is a frame from the short clip and the SECOND image is a frame ` +
+    `from the movie. All pairs come from the SAME candidate segment, sampled at different moments.\n\n` +
+    `Task: decide if the pairs show the same underlying scene/footage.\n\n` +
+    `IMPORTANT — treat frames as the SAME scene even if they differ in:\n` +
+    `- compression artifacts, resolution, blur, or sharpness\n` +
+    `- cropping, zooming, letterboxing/pillarboxing, or aspect ratio\n` +
+    `- color grading, filters, brightness, contrast, or saturation\n` +
+    `- watermarks, logos, subtitles, captions, or UI overlays added on top\n` +
+    `- horizontal mirroring (flipped image)\n` +
+    `- a slightly different instant of the same continuous shot (people/objects moved a little)\n\n` +
+    `Judge only the underlying content: same location, same people/characters, same objects, ` +
+    `same camera setup or same continuous action.\n\n` +
+    `Decision rule: if AT LEAST ONE pair clearly shows the same scene, answer same=true — ` +
+    `do NOT reject just because one pair is ambiguous or blurry. ` +
+    `Answer same=false ONLY if the pairs clearly show different content ` +
+    `(different location AND different people/objects/action).\n\n` +
+    `Reply with ONLY JSON, no other text: {"same": true|false, "confidence": 0-100} ` +
+    `where confidence is how certain you are of your verdict.`;
+
+  const content: any[] = [{ type: 'text', text: prompt }];
+  for (const p of usable) {
+    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${p.shortFrameB64}` } });
+    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${p.movieFrameB64}` } });
+  }
 
   const body = {
     model: VLM_MODEL,
     messages: [
       {
         role: 'user',
-        content: [
-          { type: 'text', text: prompt },
-          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${shortFrameB64}` } },
-          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${movieFrameB64}` } },
-        ],
+        content,
       },
     ],
     max_tokens: 100,
@@ -320,18 +373,18 @@ export async function verifySameScene(
     }
 
     const json: any = await res.json();
-    let content: string = json?.choices?.[0]?.message?.content ?? '';
-    if (!content) {
+    let raw: string = json?.choices?.[0]?.message?.content ?? '';
+    if (!raw) {
       console.warn('[VLM] Empty response content');
       return null;
     }
 
     // Strip markdown code fences if the model wrapped its JSON in them.
-    content = content.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+    raw = raw.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
 
-    const parsed = JSON.parse(content);
+    const parsed = JSON.parse(raw);
     if (typeof parsed.same !== 'boolean' || typeof parsed.confidence !== 'number') {
-      console.warn(`[VLM] Unexpected response shape: ${content.slice(0, 200)}`);
+      console.warn(`[VLM] Unexpected response shape: ${raw.slice(0, 200)}`);
       return null;
     }
 
