@@ -1453,21 +1453,18 @@ export default function App() {
       }
 
       // Make the preview react instantly to the adjustment: if the adjusted
-      // candidate is the one currently shown in the compare panel, seek the
-      // reference video to the edge that just moved — the new START, or a
-      // couple of seconds before the new END — so the user immediately sees
-      // the extra (or trimmed) second without touching anything else.
+      // candidate is the one currently shown in the compare panel, seek ONLY
+      // the reference (movie) video to the edge that just moved — the new
+      // START, or a couple of seconds before the new END. The short/clip
+      // video is deliberately left untouched: the user is only changing the
+      // movie side, the short stays exactly as it is.
       if (updatedSeg &&
           activeCandidateSet?.segmentIndex === cs.segmentIndex && candidateIndex === idx &&
           refVideoRef.current) {
         if (edge === 'start') {
           refVideoRef.current.currentTime = updatedSeg.movieStart;
-          if (clipVideoRef.current && previewSegment) clipVideoRef.current.currentTime = previewSegment.shortStart;
         } else {
           refVideoRef.current.currentTime = Math.max(updatedSeg.movieStart, updatedSeg.movieEnd - 2);
-          if (clipVideoRef.current && previewSegment) {
-            clipVideoRef.current.currentTime = Math.max(previewSegment.shortStart, previewSegment.shortEnd - 2);
-          }
         }
       }
 
