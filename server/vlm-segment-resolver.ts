@@ -7,7 +7,7 @@ import type { MatchedSegment } from './matching-engine';
 import { getAlternateCandidatesForRange } from './matching-engine';
 import {
   extractFrameAsBase64,
-  verifySameScene,
+  verifySameScenePairs,
   isVlmAvailable,
   resetVlmCache,
   VLM_CONFIDENCE_THRESHOLD,
@@ -36,6 +36,36 @@ export function pickRepresentativeFrames(seg: MatchedSegment): { shortTime: numb
   const mid = seg.matchSequence[Math.floor(seg.matchSequence.length / 2)];
   if (mid) return { shortTime: mid.shortTime, movieTime: mid.movieTime };
   return { shortTime: seg.shortStart, movieTime: seg.movieStart };
+}
+
+/**
+ * Pick up to 3 (shortTime, movieTime) pairs for multi-frame VLM evidence:
+ *  1. The matchSequence midpoint (identical to pickRepresentativeFrames —
+ *     preserves the existing behavior as pair #1).
+ *  2. The highest-similarity frame pair in the segment.
+ *  3. The second-highest-similarity frame pair.
+ * Pairs closer than MIN_GAP seconds to an already-chosen one are skipped so
+ * the VLM sees genuinely distinct moments, not 3 near-identical frames.
+ * Always returns at least 1 pair (segment-bounds fallback), so callers can
+ * never regress below the old single-pair behavior.
+ */
+export function pickRepresentativeFramePairs(seg: MatchedSegment): Array<{ shortTime: number; movieTime: number }> {
+  const MIN_GAP = 0.4;
+  const chosen: Array<{ shortTime: number; movieTime: number }> = [];
+  const isFarEnough = (t: number) => chosen.every(c => Math.abs(c.shortTime - t) >= MIN_GAP);
+
+  const mid = seg.matchSequence[Math.floor(seg.matchSequence.length / 2)];
+  if (mid) chosen.push({ shortTime: mid.shortTime, movieTime: mid.movieTime });
+  else chosen.push({ shortTime: seg.shortStart, movieTime: seg.movieStart });
+
+  // Highest- and second-highest-similarity pairs from the hash matcher.
+  const bySim = [...seg.matchSequence].sort((a, b) => b.similarity - a.similarity);
+  for (const f of bySim) {
+    if (chosen.length >= 3) break;
+    if (isFarEnough(f.shortTime)) chosen.push({ shortTime: f.shortTime, movieTime: f.movieTime });
+  }
+
+  return chosen;
 }
 
 /**
@@ -116,15 +146,23 @@ export async function resolveSegmentsWithVLM(
     while (candidate && attempt < VLM_MAX_ATTEMPTS) {
       attempt++;
       const triedCandidate = candidate;
-      const { shortTime, movieTime } = pickRepresentativeFrames(candidate);
+      const framePairs = pickRepresentativeFramePairs(candidate);
 
       let verdict: VlmProgressInfo['verdict'] = 'unverifiable';
       try {
-        const [shortFrame, movieFrame] = await Promise.all([
-          extractFrameAsBase64(shortVideoPath, shortTime),
-          extractFrameAsBase64(movieVideoPath, movieTime),
-        ]);
-        const result = await verifySameScene(shortFrame, movieFrame);
+        // Extract every frame in parallel (up to 6), then ONE VLM request
+        // with all pairs — request count per attempt is unchanged (still 1),
+        // so wall-clock time stays essentially the same as the 2-frame version.
+        const extracted = await Promise.all(
+          framePairs.map(async (fp) => {
+            const [short, movie] = await Promise.all([
+              extractFrameAsBase64(shortVideoPath, fp.shortTime),
+              extractFrameAsBase64(movieVideoPath, fp.movieTime),
+            ]);
+            return { short, movie };
+          }),
+        );
+        const result = await verifySameScenePairs(extracted);
 
         if (result === null) {
           // Could not verify — do not silently pass or fail; keep the

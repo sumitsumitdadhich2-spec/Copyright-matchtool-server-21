@@ -29,8 +29,8 @@ import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
 import { MatchedSegment, matchVideosFromFiles } from './matching-engine';
-import { pickRepresentativeFrames } from './vlm-segment-resolver';
-import { extractFrameAsBase64, verifySameScene, VLM_CONFIDENCE_THRESHOLD } from './vlm-verify';
+import { pickRepresentativeFramePairs } from './vlm-segment-resolver';
+import { extractFrameAsBase64, verifySameScenePairs, VLM_CONFIDENCE_THRESHOLD } from './vlm-verify';
 import {
   StoredCandidateSet,
   CandidateCheck,
@@ -146,13 +146,19 @@ async function checkCandidate(
   shortVideoPath: string,
   movieVideoPath: string,
 ): Promise<void> {
-  const { shortTime, movieTime } = pickRepresentativeFrames(candidate.segment);
+  const framePairs = pickRepresentativeFramePairs(candidate.segment);
   try {
-    const [shortFrame, movieFrame] = await Promise.all([
-      extractFrameAsBase64(shortVideoPath, shortTime),
-      extractFrameAsBase64(movieVideoPath, movieTime),
-    ]);
-    const result = await verifySameScene(shortFrame, movieFrame);
+    // Same multi-frame evidence as the main pass: up to 3 pairs, one request.
+    const extracted = await Promise.all(
+      framePairs.map(async (fp) => {
+        const [short, movie] = await Promise.all([
+          extractFrameAsBase64(shortVideoPath, fp.shortTime),
+          extractFrameAsBase64(movieVideoPath, fp.movieTime),
+        ]);
+        return { short, movie };
+      }),
+    );
+    const result = await verifySameScenePairs(extracted);
     if (result === null) {
       candidate.checked = true;
       candidate.verdict = 'unverifiable';

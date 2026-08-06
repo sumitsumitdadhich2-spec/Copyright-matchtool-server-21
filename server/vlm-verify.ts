@@ -274,21 +274,68 @@ export async function verifySameScene(
   shortFrameB64: string,
   movieFrameB64: string,
 ): Promise<{ same: boolean; confidencePct: number } | null> {
+  return verifySameScenePairs([{ short: shortFrameB64, movie: movieFrameB64 }]);
+}
+
+/** One (short-clip frame, movie frame) pair, both base64 JPEG. */
+export interface FramePairB64 {
+  short: string;
+  movie: string;
+}
+
+/**
+ * Multi-pair variant of verifySameScene: sends every pair (up to 3 pairs =
+ * 6 frames) in a SINGLE request and gets one combined verdict. Same network
+ * contract as verifySameScene — one HTTP call through the same verifyGate,
+ * same retry/timeout behavior, same {same, confidencePct} | null result —
+ * so callers' pacing and error handling are unchanged.
+ */
+export async function verifySameScenePairs(
+  pairs: FramePairB64[],
+): Promise<{ same: boolean; confidencePct: number } | null> {
+  if (pairs.length === 0) return null;
+  const n = pairs.length;
+
   const prompt =
-    'Compare these two video frames. Are they showing the same scene/subject ' +
-    '(allowing for compression, crop, or color grading differences)? Reply with ' +
-    'ONLY JSON: {"same": true|false, "confidence": 0-100}';
+    `You are a video copyright-detection verifier. You are given ${n} pair(s) of frames ` +
+    `sampled from the SAME candidate segment. In each pair, the FIRST image is from a short ` +
+    `clip and the SECOND image is from a movie. Your task: decide whether the short clip was ` +
+    `taken from this movie scene — i.e. whether each pair shows the same underlying footage.\n\n` +
+    `The short clip is typically re-uploaded and re-encoded. You MUST IGNORE these differences, ` +
+    `they do NOT mean the content is different:\n` +
+    `- compression artifacts, blur, lower resolution\n` +
+    `- cropping, zooming, different aspect ratio, letterboxing/black bars\n` +
+    `- color grading, filters, brightness/contrast/saturation shifts\n` +
+    `- horizontal mirroring (flipped image)\n` +
+    `- added watermarks, logos, channel names, captions, subtitles, emojis, or UI overlays\n` +
+    `- a slight timing offset (the frames may be a fraction of a second apart within the same shot)\n\n` +
+    `Answer "same": true when the pairs show the same footage: same scene, same people/subjects, ` +
+    `same setting, same camera composition. Answer "same": false ONLY when the actual content ` +
+    `clearly differs — different scene, different people, different location, or a completely ` +
+    `different action.\n\n` +
+    (n > 1
+      ? `Judge the pairs together: if the MAJORITY of pairs clearly show the same footage, answer ` +
+        `same=true even if one pair is ambiguous (it may land on a scene cut, motion blur, or a ` +
+        `dark frame). Do not reject the whole segment because of a single ambiguous pair.\n\n`
+      : `If this single pair is genuinely ambiguous (too dark, too blurry), lean on overall ` +
+        `composition and any recognizable subjects before deciding.\n\n`) +
+    `Reply with ONLY this JSON, nothing else: {"same": true|false, "confidence": 0-100} ` +
+    `where confidence is how certain you are of your decision.`;
+
+  const content: any[] = [{ type: 'text', text: prompt }];
+  pairs.forEach((p, i) => {
+    content.push({ type: 'text', text: `Pair ${i + 1} — short clip frame:` });
+    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${p.short}` } });
+    content.push({ type: 'text', text: `Pair ${i + 1} — movie frame:` });
+    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${p.movie}` } });
+  });
 
   const body = {
     model: VLM_MODEL,
     messages: [
       {
         role: 'user',
-        content: [
-          { type: 'text', text: prompt },
-          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${shortFrameB64}` } },
-          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${movieFrameB64}` } },
-        ],
+        content,
       },
     ],
     max_tokens: 100,

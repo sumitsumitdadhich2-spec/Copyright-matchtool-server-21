@@ -14,8 +14,8 @@
  * decision logic.
  */
 import { MatchedSegment } from './matching-engine';
-import { pickRepresentativeFrames } from './vlm-segment-resolver';
-import { extractFrameAsBase64, verifySameScene, VLM_CONFIDENCE_THRESHOLD, VLM_CONCURRENCY } from './vlm-verify';
+import { pickRepresentativeFramePairs } from './vlm-segment-resolver';
+import { extractFrameAsBase64, verifySameScenePairs, VLM_CONFIDENCE_THRESHOLD, VLM_CONCURRENCY } from './vlm-verify';
 import {
   listCandidateFilesForJob,
   readCandidatesFile,
@@ -76,15 +76,21 @@ export async function runDeferredRecoveryPass(
       // for comparison history) — only fresh, never-tried candidates need
       // deferred verification.
       if (candidateEntry.checked) continue;
-      const { shortTime, movieTime } = pickRepresentativeFrames(candidateEntry.segment);
+      const framePairs = pickRepresentativeFramePairs(candidateEntry.segment);
 
       let verdict: DeferredRecoveryProgress['verdict'] = 'unverifiable';
       try {
-        const [shortFrame, movieFrame] = await Promise.all([
-          extractFrameAsBase64(shortVideoPath, shortTime),
-          extractFrameAsBase64(movieVideoPath, movieTime),
-        ]);
-        const result = await verifySameScene(shortFrame, movieFrame);
+        // Same multi-frame evidence as the main pass: up to 3 pairs, one request.
+        const extracted = await Promise.all(
+          framePairs.map(async (fp) => {
+            const [short, movie] = await Promise.all([
+              extractFrameAsBase64(shortVideoPath, fp.shortTime),
+              extractFrameAsBase64(movieVideoPath, fp.movieTime),
+            ]);
+            return { short, movie };
+          }),
+        );
+        const result = await verifySameScenePairs(extracted);
 
         if (result === null) {
           candidateEntry.checked = true;
