@@ -15,7 +15,7 @@
  */
 import { MatchedSegment } from './matching-engine';
 import { pickVerificationFramePairs } from './vlm-segment-resolver';
-import { extractFrameAsBase64, verifySameSceneMulti, VLM_CONFIDENCE_THRESHOLD, VLM_CONCURRENCY } from './vlm-verify';
+import { extractFrameAsBase64, verifySameSceneChecked, VLM_CONFIDENCE_THRESHOLD, VLM_CONCURRENCY } from './vlm-verify';
 import {
   listCandidateFilesForJob,
   readCandidatesFile,
@@ -89,7 +89,9 @@ export async function runDeferredRecoveryPass(
             return { shortFrameB64, movieFrameB64 };
           }),
         );
-        const result = await verifySameSceneMulti(extracted);
+        // Accept-side self-consistency re-check included: a recovered
+        // candidate is accepted only if the swapped-order re-check agrees.
+        const result = await verifySameSceneChecked(extracted);
 
         if (result === null) {
           candidateEntry.checked = true;

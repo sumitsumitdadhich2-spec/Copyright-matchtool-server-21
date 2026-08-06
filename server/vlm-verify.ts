@@ -313,20 +313,33 @@ export interface VlmFramePair {
  */
 export async function verifySameSceneMulti(
   pairs: VlmFramePair[],
+  options?: {
+    /**
+     * When true, each pair is sent with the MOVIE frame first and the short
+     * frame second (and the prompt describes that order). Used by the
+     * self-consistency double-check: the same content in a genuinely
+     * different presentation, so agreement between the two calls is a real
+     * signal rather than the model repeating its own cached answer.
+     */
+    swapped?: boolean;
+  },
 ): Promise<{ same: boolean; confidencePct: number } | null> {
   const usable = pairs.slice(0, 3);
   if (usable.length === 0) return null;
 
+  const swapped = options?.swapped === true;
   const n = usable.length;
   const pairList = usable
     .map((_, i) => `Pair ${i + 1} = images ${i * 2 + 1} & ${i * 2 + 2}`)
     .join('; ');
 
+  const firstDesc = swapped ? 'movie' : 'short clip';
+  const secondDesc = swapped ? 'short clip' : 'movie';
   const prompt =
     `You are verifying whether a short video clip was copied from a movie. ` +
     `You are given ${n} pair(s) of video frames, ${n * 2} images total, in order: ${pairList}. ` +
-    `In each pair the FIRST image is a frame from the short clip and the SECOND image is a frame ` +
-    `from the movie. All pairs come from the SAME candidate segment, sampled at different moments.\n\n` +
+    `In each pair the FIRST image is a frame from the ${firstDesc} and the SECOND image is a frame ` +
+    `from the ${secondDesc}. All pairs come from the SAME candidate segment, sampled at different moments.\n\n` +
     `Task: decide if the pairs show the same underlying scene/footage.\n\n` +
     `IMPORTANT — treat frames as the SAME scene even if they differ in:\n` +
     `- compression artifacts, resolution, blur, or sharpness\n` +
@@ -351,8 +364,10 @@ export async function verifySameSceneMulti(
 
   const content: any[] = [{ type: 'text', text: prompt }];
   for (const p of usable) {
-    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${p.shortFrameB64}` } });
-    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${p.movieFrameB64}` } });
+    const first = swapped ? p.movieFrameB64 : p.shortFrameB64;
+    const second = swapped ? p.shortFrameB64 : p.movieFrameB64;
+    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${first}` } });
+    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${second}` } });
   }
 
   const body = {
@@ -444,6 +459,60 @@ export async function verifySameSceneMulti(
   } finally {
     release();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Self-consistency double-check — a 7B model's single "same=true" verdict is
+// not trustworthy enough on its own. When the first call ACCEPTS (same=true
+// at/above the confidence threshold), a second call is made with the image
+// order inside every pair swapped (movie frame first). Only if BOTH calls
+// independently say "same" does the accept stand. Rejections and
+// inconclusive results are never double-checked (they can only cost recall,
+// not precision), so the extra VLM traffic applies only to would-be accepts
+// — which the embedding gate has already thinned out.
+//
+// Disable with VLM_SELF_CONSISTENCY=0 if VLM capacity is too tight.
+// ---------------------------------------------------------------------------
+export const VLM_SELF_CONSISTENCY = process.env.VLM_SELF_CONSISTENCY !== '0';
+
+/**
+ * verifySameSceneMulti + swap self-consistency. Same return contract:
+ *  - {same:true, ...}  => both calls agreed the footage is the same
+ *                         (confidence = the LOWER of the two calls)
+ *  - {same:false, ...} => first call rejected, OR the swapped re-check
+ *                         disagreed with an initial accept
+ *  - null              => no reliable verdict (first call inconclusive, or
+ *                         the confirmation call could not be completed) —
+ *                         callers apply their existing unverifiable policy
+ */
+export async function verifySameSceneChecked(
+  pairs: VlmFramePair[],
+): Promise<{ same: boolean; confidencePct: number } | null> {
+  const first = await verifySameSceneMulti(pairs);
+  if (first === null) return null;
+
+  // Only a passing accept triggers the confirmation call — a same=true below
+  // the confidence threshold is already treated as a rejection by callers.
+  const passing = first.same && first.confidencePct >= VLM_CONFIDENCE_THRESHOLD;
+  if (!VLM_SELF_CONSISTENCY || !passing) return first;
+
+  const second = await verifySameSceneMulti(pairs, { swapped: true });
+  if (second === null) {
+    // Accept claimed but could not be confirmed (timeout/overload on the
+    // re-check). Surface as "no reliable verdict" so callers fall back to
+    // their unverifiable policy (embedding-similarity backed) instead of
+    // accepting on a single unconfirmed opinion.
+    console.log('[VLM] Self-consistency: initial accept could not be confirmed (re-check inconclusive) — treating as unverifiable');
+    return null;
+  }
+  if (!second.same) {
+    console.log(
+      `[VLM] Self-consistency: swapped re-check DISAGREED with initial accept ` +
+      `(conf ${first.confidencePct} vs ${second.confidencePct}) — rejecting`
+    );
+    return { same: false, confidencePct: Math.min(first.confidencePct, second.confidencePct) };
+  }
+  return { same: true, confidencePct: Math.min(first.confidencePct, second.confidencePct) };
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ import type { MatchedSegment } from './matching-engine';
 import { getAlternateCandidatesForRange } from './matching-engine';
 import {
   extractFrameAsBase64,
-  verifySameSceneMulti,
+  verifySameSceneChecked,
   isVlmAvailable,
   resetVlmCache,
   VLM_CONFIDENCE_THRESHOLD,
@@ -203,8 +203,10 @@ export async function resolveSegmentsWithVLM(
           onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
           console.log(`[EmbedGate] Segment ${i} attempt ${attempt}: auto-reject (max sim ${gate.maxSim.toFixed(3)})`);
         } else {
-          // Ambiguous (or gate unavailable) — the VLM is the tie-breaker.
-          const result = await verifySameSceneMulti(extracted);
+          // Ambiguous (or gate unavailable) — the VLM is the tie-breaker,
+          // with an accept-side self-consistency re-check (swapped image
+          // order): an accept stands only if both calls agree.
+          const result = await verifySameSceneChecked(extracted);
 
           if (result === null) {
             // VLM could not produce a verdict (timeout/overload). The old
