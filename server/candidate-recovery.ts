@@ -17,7 +17,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { MatchedSegment, getAlternateCandidatesForRange } from './matching-engine';
+import { MatchedSegment, getAlternateCandidatesForRange } from './candidate-matching-engine';
 
 export interface CandidateCheck {
   segment: MatchedSegment;

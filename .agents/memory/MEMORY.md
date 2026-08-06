@@ -14,3 +14,4 @@
 - [In-process VLM/candidate testing](vlm-candidate-test-pattern.md) — mock global.fetch + real ffmpeg frames beats a second HTTP server (ad hoc ports are unreliable here); set VLM_* env vars via shell, not in-file (import hoisting).
 - [Real VLM endpoint testing](real-vlm-endpoint-testing.md) — background nohup servers die between tool calls (use a temp workflow instead); legacy /api/upload deletes source video, use /api/upload-chunk for Retry/VLM tests.
 - [VLM concurrency deadlock audit](vlm-concurrency-deadlock-audit.md) — "VLM never starts" bug blamed the Semaphore; stress-tested with real sockets/latency/black-hole timeouts, found no leak/deadlock — likely infra (tunnel), not app code.
+- [Candidate engine split](candidate-engine-split.md) — candidate-find system runs on `candidate-matching-engine.ts` (1:1 copy); `matching-engine.ts` is the protected main engine — never edit it for candidate behavior.
