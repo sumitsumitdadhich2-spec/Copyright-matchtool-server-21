@@ -1452,13 +1452,23 @@ export default function App() {
         }
       }
 
-      // If the user extended/shrunk the START of the candidate currently in
-      // the compare panel, seek the reference video there so they instantly
-      // see the extra (or trimmed) second.
-      if (updatedSeg && edge === 'start' &&
+      // Make the preview react instantly to the adjustment: if the adjusted
+      // candidate is the one currently shown in the compare panel, seek the
+      // reference video to the edge that just moved — the new START, or a
+      // couple of seconds before the new END — so the user immediately sees
+      // the extra (or trimmed) second without touching anything else.
+      if (updatedSeg &&
           activeCandidateSet?.segmentIndex === cs.segmentIndex && candidateIndex === idx &&
           refVideoRef.current) {
-        refVideoRef.current.currentTime = updatedSeg.movieStart;
+        if (edge === 'start') {
+          refVideoRef.current.currentTime = updatedSeg.movieStart;
+          if (clipVideoRef.current && previewSegment) clipVideoRef.current.currentTime = previewSegment.shortStart;
+        } else {
+          refVideoRef.current.currentTime = Math.max(updatedSeg.movieStart, updatedSeg.movieEnd - 2);
+          if (clipVideoRef.current && previewSegment) {
+            clipVideoRef.current.currentTime = Math.max(previewSegment.shortStart, previewSegment.shortEnd - 2);
+          }
+        }
       }
 
       if (updatedSeg) {
@@ -2459,6 +2469,42 @@ export default function App() {
                 </div>
               </div>
             </div>
+
+            {/* ── Quick adjust bar — sits right under the videos so the user
+                can trim the boundaries and confirm without scrolling up.
+                Same handlers as everywhere else (renderTrimControls /
+                handleMakeMainCandidate) — purely a second placement. ── */}
+            {activeCandidateSet && activeCandidateSet.candidates.length > 0 && (() => {
+              const currentCandidate = activeCandidateSet.candidates[candidateIndex];
+              if (!currentCandidate) return null;
+              const isUsed = candidateIndex === (activeCandidateSet.recoveredCandidateIndex ?? -1);
+              const busy = !!selectingCandidateKey || isCurrentSegmentRetrying || isMatching;
+              return (
+                <div className="px-4 py-3 border-t border-cyan-500/15 bg-cyan-500/[0.03] flex flex-wrap items-center gap-3">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider text-cyan-300/60 flex items-center gap-1.5">
+                    <Zap className="w-3 h-3" /> Quick Adjust
+                  </span>
+                  {/* ±1 s trim — preview seeks to the moved edge instantly */}
+                  {renderTrimControls(activeCandidateSet, candidateIndex, busy)}
+                  {/* Confirm — make this candidate the main segment */}
+                  {isUsed ? (
+                    <span className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-emerald-500/10 border border-emerald-500/30 text-emerald-300">
+                      <CheckCircle2 className="w-3.5 h-3.5" /> Main Segment Set
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => handleMakeMainCandidate(activeCandidateSet, candidateIndex)}
+                      disabled={busy}
+                      title="Confirm — make this candidate the main segment"
+                      className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed border border-emerald-500 text-white transition cursor-pointer">
+                      {selectingCandidateKey === `${activeCandidateSet.segmentIndex}:${candidateIndex}`
+                        ? <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Saving…</>
+                        : <><CheckCircle2 className="w-3.5 h-3.5" /> Confirm — Make Main</>}
+                    </button>
+                  )}
+                </div>
+              );
+            })()}
 
             {/* ── Preview navigation ── */}
             <div className="px-4 py-3 border-t border-slate-800 bg-slate-950/40 flex flex-wrap items-center gap-4">
