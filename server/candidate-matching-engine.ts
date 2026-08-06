@@ -1376,14 +1376,17 @@ async function buildAltCandidatesForChunkWindowed(
 // be slow as long as it FINDS the clip. Only runs for chunks that Passes 1+2
 // left unmatched, so the normal fast path is unaffected.
 
-/** Probe every Nth chunk frame during consensus voting */
-const CONSENSUS_PROBE_STEP = 3;
-/** Top local-maxima movie positions each probe frame votes for */
-const CONSENSUS_VOTES_PER_PROBE = 6;
+/** Probe every Nth chunk frame during consensus voting.
+ *  BULLETPROOF: 2 (was 3) — 50% more probe frames vote per chunk. */
+const CONSENSUS_PROBE_STEP = 2;
+/** Top local-maxima movie positions each probe frame votes for.
+ *  BULLETPROOF: 10 (was 6) — weak-but-real positions still get a vote. */
+const CONSENSUS_VOTES_PER_PROBE = 10;
 /** Offset histogram bucket width, in movie frames */
 const CONSENSUS_BUCKET_FRAMES = 8;
-/** How many top-voted offsets to try walking from */
-const CONSENSUS_TOP_OFFSETS = 12;
+/** How many top-voted offsets to try walking from.
+ *  BULLETPROOF: 20 (was 12) — more alignments tried before giving up. */
+const CONSENSUS_TOP_OFFSETS = 20;
 
 interface ConsensusSeed {
   offset: number;   // representative alignment offset (mi - si)
@@ -1444,6 +1447,102 @@ async function consensusRescueSeeds(
   // weakly agree on beats an offset one frame loves.
   list.sort((a, b) => (b.votes - a.votes) || (b.simSum - a.simSum));
   return list.slice(0, CONSENSUS_TOP_OFFSETS);
+}
+
+// ---------------------------------------------------------------------------
+// CANDIDATE-ENGINE speed-ratio sweep rescue (Pass 2.7)
+// ---------------------------------------------------------------------------
+//
+// consensusRescueSeeds assumes a CONSTANT alignment offset — i.e. the clip
+// plays at 1.0x speed. Re-timed edits (0.5x slow-mo, 2x speed-up, TikTok-style
+// re-timing) break that assumption: every frame's offset is different, so the
+// offset histogram never accumulates votes. This sweep explicitly tests a set
+// of playback-speed hypotheses: for each slope, it slides an anchor across the
+// whole movie and scores the average similarity of probe frames mapped along
+// the sloped line mi = anchor + slope * (si - midSi). Brute force by design —
+// this engine is allowed to be slow as long as it FINDS the clip. Only runs
+// for chunks Passes 1 + 2 + 2.5 all left unmatched.
+
+/** Playback-speed hypotheses to test (1.0x is consensus rescue's job) */
+const SWEEP_SLOPES = [0.5, 0.6, 0.7, 0.8, 1.25, 1.5, 1.75, 2.0];
+/** Movie-frame stride between tested anchors */
+const SWEEP_ANCHOR_STEP = 4;
+/** Max probe frames sampled per chunk */
+const SWEEP_MAX_PROBES = 12;
+/** Local-maxima anchors kept per slope */
+const SWEEP_TOP_PER_SLOPE = 4;
+/** Total sweep seeds returned across all slopes */
+const SWEEP_TOP_TOTAL = 12;
+
+interface SweepSeed {
+  midSi:    number;  // chunk midpoint probe (seed short frame)
+  anchorMi: number;  // movie frame aligned with midSi under this hypothesis
+  slope:    number;  // playback-speed hypothesis (Δmi/Δsi)
+  score:    number;  // avg probe similarity (then refined with frameSim)
+}
+
+async function speedSweepRescueSeeds(
+  sSet: PreSet,
+  mSet: PreSet,
+  chunkStart: number,
+  chunkEnd: number,
+): Promise<SweepSeed[]> {
+  const size  = chunkEnd - chunkStart + 1;
+  const midSi = Math.round((chunkStart + chunkEnd) / 2);
+  const probeStep = Math.max(1, Math.floor(size / SWEEP_MAX_PROBES));
+  const probes: number[] = [];
+  for (let si = chunkStart; si <= chunkEnd; si += probeStep) probes.push(si);
+  if (probes.length < 2) return [];
+
+  const movieLen = mSet.fps.length;
+  const all: SweepSeed[] = [];
+  let iter = 0;
+
+  for (const slope of SWEEP_SLOPES) {
+    const local: SweepSeed[] = [];
+    let last: SweepSeed | null = null;
+
+    for (let ma = 0; ma < movieLen; ma += SWEEP_ANCHOR_STEP) {
+      const yp = yieldIfNeeded(iter++, 500);
+      if (yp) await yp;
+
+      // Fast-cross here (full-frame variant) keeps the sweep tractable; the
+      // top anchors get re-scored with the full best-cross frameSim below.
+      let sum = 0, n = 0;
+      for (const si of probes) {
+        const mi = Math.round(ma + slope * (si - midSi));
+        if (mi < 0 || mi >= movieLen) continue;
+        sum += hashSimFastCross(sSet, si, mSet, mi);
+        n++;
+      }
+      // Require at least half the probes in-range so edge anchors can't win
+      // on 1-2 lucky frames.
+      if (n < Math.max(2, probes.length >> 1)) continue;
+      const score = sum / n;
+
+      if (last && Math.abs(ma - last.anchorMi) < SEED_SEPARATION) {
+        if (score > last.score) { last.anchorMi = ma; last.score = score; }
+      } else {
+        last = { midSi, anchorMi: ma, slope, score };
+        local.push(last);
+      }
+    }
+
+    local.sort((a, b) => b.score - a.score);
+    all.push(...local.slice(0, SWEEP_TOP_PER_SLOPE));
+  }
+
+  // Refine: blend the sweep-average with the full multi-channel frameSim at
+  // the anchor midpoint, so richer signals (signature grids, temporal motion,
+  // all crop-variant pairs) re-rank the finalists.
+  for (const s of all) {
+    const yp = yieldIfNeeded(iter++, 50);
+    if (yp) await yp;
+    const mi = Math.min(movieLen - 1, Math.max(0, s.anchorMi));
+    s.score = 0.5 * s.score + 0.5 * frameSim(sSet, s.midSi, mSet, mi);
+  }
+  all.sort((a, b) => b.score - a.score);
+  return all.slice(0, SWEEP_TOP_TOTAL);
 }
 
 // ---------------------------------------------------------------------------
@@ -1787,7 +1886,19 @@ export async function groundMatchedSegments(
         }
       }
 
-      if (!bestSeq) continue;
+      // BULLETPROOF: never discard the force-find pool of a FAILED chunk.
+      // Previously chunkAltRaw only reached the VLM pool when the walk
+      // produced a segment — chunks where both passes failed silently lost
+      // every candidate their full-movie scans had already computed. Pass 2
+      // (final attempt) now always banks the pool, matched or not.
+      if (!bestSeq) {
+        if (pass === 2 && chunkAltRaw.length > 0) {
+          altCandidatePool.push(
+            ...buildAltCandidatesForChunk(chunkAltRaw, sSet, mSet, shortFps, movieFps, chunk.start, chunk.end, frameDrift)
+          );
+        }
+        continue;
+      }
 
       for (const item of bestSeq) usedShort[item.si] = 1;
       segments.push(acceptSegment(bestSeq, shortFps, movieFps, isApprox, sSet, mSet));
@@ -1832,7 +1943,9 @@ export async function groundMatchedSegments(
       );
       if (seq.length < chunkMinFrames) continue;
       const conf = seq.reduce((a, f) => a + f.sim, 0) / seq.length;
-      if (conf < 40) continue; // same floor as Pass 2
+      // BULLETPROOF: 32 (was 40) — ADAPTIVE_FLOOR parity. Weak-but-real
+      // rescues surface; VLM verification is the real accept gate downstream.
+      if (conf < 32) continue;
       if (
         bestSeq === null ||
         seq.length > bestSeq.length ||
@@ -1864,6 +1977,73 @@ export async function groundMatchedSegments(
   }
   if (rescueCount > 0) {
     console.log(`[Matcher] Pass 2.5: ${rescueCount} chunk(s) rescued via consensus voting.`);
+  }
+
+  // ------------------------------------------------------------------
+  // CANDIDATE-ENGINE Pass 2.7: speed-ratio sweep for chunks consensus
+  // rescue also couldn't crack. Tests explicit playback-speed hypotheses
+  // (0.5x–2.0x) so re-timed / slow-mo / sped-up edits — invisible to the
+  // constant-offset consensus vote — still get found. Slow by design.
+  // ------------------------------------------------------------------
+  let sweepCount = 0;
+  for (const chunk of chunks) {
+    const chunkSize = chunk.end - chunk.start + 1;
+    let hasUnmatched = false;
+    for (let si = chunk.start; si <= chunk.end; si++) {
+      if (!usedShort[si]) { hasUnmatched = true; break; }
+    }
+    if (!hasUnmatched || chunkSize < 3) continue;
+
+    console.log(`[Matcher] Pass 2.7 (speed sweep): chunk [${chunk.start}–${chunk.end}] — testing ${SWEEP_SLOPES.length} speed hypotheses…`);
+    const sweepSeeds = await speedSweepRescueSeeds(sSet, mSet, chunk.start, chunk.end);
+    if (sweepSeeds.length === 0) continue;
+
+    const chunkMinFrames = Math.min(minConsecutiveFrames, Math.max(3, Math.floor(chunkSize * 0.4)));
+    let bestSeq: RawSeq[] | null = null;
+    let bestSeqConf = 0;
+
+    for (const seed of sweepSeeds) {
+      const seedMi  = Math.min(movieFps.length - 1, Math.max(0, seed.anchorMi));
+      const seedSim = frameSim(sSet, seed.midSi, mSet, seedMi);
+      const seq = buildSegment(
+        sSet, mSet, seed.midSi, seedMi, seedSim,
+        usedShort, isCut, frameDrift,
+        chunk.start, chunk.end
+      );
+      if (seq.length < chunkMinFrames) continue;
+      const conf = seq.reduce((a, f) => a + f.sim, 0) / seq.length;
+      if (conf < 32) continue; // ADAPTIVE_FLOOR parity, same as Pass 2.5
+      if (
+        bestSeq === null ||
+        seq.length > bestSeq.length ||
+        (seq.length === bestSeq.length && conf > bestSeqConf)
+      ) {
+        bestSeq = seq;
+        bestSeqConf = conf;
+      }
+    }
+
+    if (bestSeq) {
+      for (const item of bestSeq) usedShort[item.si] = 1;
+      segments.push(acceptSegment(bestSeq, shortFps, movieFps, true, sSet, mSet));
+      sweepCount++;
+      console.log(
+        `[Matcher] Pass 2.7: rescued chunk [${chunk.start}–${chunk.end}] ` +
+        `(${bestSeq.length} frames @ ${bestSeqConf.toFixed(1)}% avg).`
+      );
+    }
+
+    // Regardless of walk outcome, feed every sweep anchor into the VLM
+    // fallback pool so the retry loop can visually verify each hypothesis.
+    altCandidatePool.push(
+      ...buildAltCandidatesForChunk(
+        sweepSeeds.map(s => ({ offset: s.anchorMi - s.midSi, sim: s.score })),
+        sSet, mSet, shortFps, movieFps, chunk.start, chunk.end, frameDrift
+      )
+    );
+  }
+  if (sweepCount > 0) {
+    console.log(`[Matcher] Pass 2.7: ${sweepCount} chunk(s) rescued via speed-ratio sweep.`);
   }
 
   onProgress?.({ phase: 'finalizing', pct: 92 });
@@ -1953,6 +2133,53 @@ export async function groundMatchedSegments(
 
   if (pass3Count > 0) {
     console.log(`[Matcher] Pass 3: ${pass3Count} forced segment(s).`);
+  }
+
+  // ------------------------------------------------------------------
+  // CANDIDATE-ENGINE Pass 4 (pool-only): guaranteed candidate coverage.
+  // Any chunk that STILL has unmatched frames — including ones Pass 3
+  // skipped (too small) or gated out (avg sim < UNMATCHED_SIM_GATE) —
+  // gets a fresh 3-probe full-movie scan whose top offsets ALWAYS enter
+  // the VLM fallback pool. Never touches `segments` or `usedShort`, so
+  // accepted-match behavior is unchanged; it only guarantees the VLM
+  // retry loop is never left empty-handed for any scene.
+  // ------------------------------------------------------------------
+  for (const chunk of chunks) {
+    let hasUnmatched = false;
+    for (let si = chunk.start; si <= chunk.end; si++) {
+      if (!usedShort[si]) { hasUnmatched = true; break; }
+    }
+    if (!hasUnmatched) continue;
+
+    const midSi = Math.round((chunk.start + chunk.end) / 2);
+    const probeSis = [...new Set([chunk.start, midSi, chunk.end])];
+    const raw: AlignedCand[] = [];
+    let iter = 0;
+
+    for (const si of probeSis) {
+      let last: AlignedCand | null = null;
+      for (let mi = 0; mi < movieFps.length; mi++) {
+        const yp = yieldIfNeeded(iter++, 2000);
+        if (yp) await yp;
+        const s = hashSimBestCross(sSet, si, mSet, mi);
+        const offset = mi - si;
+        if (last && offset - last.offset < SEED_SEPARATION) {
+          if (s > last.sim) { last.offset = offset; last.sim = s; }
+        } else {
+          last = { offset, sim: s };
+          raw.push(last);
+        }
+      }
+    }
+
+    const guaranteed = buildAltCandidatesForChunk(
+      raw, sSet, mSet, shortFps, movieFps, chunk.start, chunk.end, frameDrift
+    );
+    altCandidatePool.push(...guaranteed);
+    console.log(
+      `[Matcher] Pass 4 (pool): chunk [${chunk.start}–${chunk.end}] — ` +
+      `+${guaranteed.length} guaranteed VLM candidate(s).`
+    );
   }
 
   // ------------------------------------------------------------------
