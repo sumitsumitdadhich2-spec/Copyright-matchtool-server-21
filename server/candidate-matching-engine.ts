@@ -155,29 +155,66 @@ const LOOK_AHEAD = 25;
  * Base half-width of the movie-frame search window during the walk.
  * Extended by frameDrift (user param) + missCount (per missed frame),
  * capped at WALK_LOOK_AHEAD_MAX.
+ *
+ * BULLETPROOF (candidate system): widened vs the main engine (7/18) so the
+ * walk survives bigger edit-speed drift and re-timed clips. Slower, but the
+ * candidate system's only job is to find the clip the main engine missed.
  */
-const WALK_LOOK_AHEAD     = 7;
-const WALK_LOOK_AHEAD_MAX = 18;
+const WALK_LOOK_AHEAD     = 12;
+const WALK_LOOK_AHEAD_MAX = 45;
 
 /** Base minimum similarity (%) for a frame to extend the segment walk */
-const WALK_MIN_SIM = 50;
+const WALK_MIN_SIM = 45;
 
 /**
  * How many consecutive low-confidence short frames we tolerate before ending
- * a segment. Lower than v4 (12 vs 25) so the walk stops sooner when it
- * drifts past the chunk boundary due to a missed cut.
+ * a segment. BULLETPROOF: raised vs the main engine (12) so the walk pushes
+ * through longer stretches of heavy grading / overlays / motion blur before
+ * giving up on a segment.
  */
-const GAP_LOOKAHEAD = 12;
+const GAP_LOOKAHEAD = 30;
 
 /** Relax WALK_MIN_SIM by this many % per 25 matched frames */
 const ADAPTIVE_DROP_PER_STEP = 1;
 const ADAPTIVE_STEP_FRAMES   = 25;
-const ADAPTIVE_FLOOR         = 40;
+const ADAPTIVE_FLOOR         = 35;
 
-/** Multi-candidate seeding */
-const MAX_SEED_CANDIDATES = 8;
+/**
+ * Multi-candidate seeding.
+ * BULLETPROOF: 32 candidates per seed (main engine: 8) — the walk gets far
+ * more shots at the true location before settling.
+ */
+const MAX_SEED_CANDIDATES = 32;
 /** Candidates closer than this many movie frames are merged (2 s @ 25 fps) */
 const SEED_SEPARATION = 50;
+
+/**
+ * BULLETPROOF dense seeding: in addition to the 5 strategic anchor positions
+ * (0/25/50/75/100%), probe a seed every SEED_STRIDE short frames, capped at
+ * MAX_SEEDS_PER_CHUNK per scene chunk. Every extra seed is one more
+ * independent full-movie scan that can catch an alignment the anchors missed
+ * (e.g. when the chunk's edges are re-graded but its middle is clean).
+ */
+const SEED_STRIDE         = 12;
+const MAX_SEEDS_PER_CHUNK = 25;
+
+/**
+ * BULLETPROOF scan-gate margins. The main engine gates seed candidates at
+ * (passMinSim − 20) during the scan and (passMinSim − 18) before the walk.
+ * The candidate system loosens both so weak-but-real locations (heavy
+ * color-grade, letterboxing, re-encode artifacts) survive to the walk stage —
+ * VLM verification downstream is the real accept/reject gate.
+ */
+const FAST_FLOOR_MARGIN    = 35;
+const SEED_TOP_GATE_MARGIN = 30;
+
+/**
+ * BULLETPROOF pass ladder: three walk passes instead of two, descending to a
+ * 35 % floor. Pass thresholds: [minSimilarity, 55, 35]. Everything accepted
+ * below pass 1 is flagged isApproximate and still goes through VLM.
+ */
+const PASS2_MIN_SIM = 55;
+const PASS3_MIN_SIM = 35;
 
 /**
  * VLM-fallback candidate retention. Independent of MAX_SEED_CANDIDATES, which
@@ -187,9 +224,9 @@ const SEED_SEPARATION = 50;
  * candidates get kept around afterward so the VLM retry loop has real
  * alternatives to fall back on instead of coming up empty after one rejection.
  */
-const ALT_CANDIDATES_PER_CHUNK = 10;
+const ALT_CANDIDATES_PER_CHUNK = 30;
 /** Slightly larger than ALT_CANDIDATES_PER_CHUNK to leave room for SEED_SEPARATION dedup */
-const ALT_CANDIDATE_SLICE = ALT_CANDIDATES_PER_CHUNK + 4;
+const ALT_CANDIDATE_SLICE = ALT_CANDIDATES_PER_CHUNK + 8;
 
 /**
  * A VLM-fallback alt-candidate, keyed by *alignment offset* (movie frame
@@ -767,6 +804,37 @@ function splitBySceneCuts(
     }
   }
   return chunks;
+}
+
+/**
+ * BULLETPROOF dense seed positions for one scene chunk.
+ *
+ * Main engine probes exactly 5 anchors (0/25/50/75/100%). The candidate
+ * system additionally probes every SEED_STRIDE frames across the chunk,
+ * capped at MAX_SEEDS_PER_CHUNK (anchors always survive the cap). Each seed
+ * runs its own full-movie scan, so more seeds = more independent chances to
+ * lock onto the true alignment when parts of the chunk are heavily edited.
+ */
+function denseSeedPositions(start: number, end: number): number[] {
+  const size = end - start + 1;
+  const anchors = new Set<number>();
+  for (let p = 0; p <= 4; p++) {
+    anchors.add(start + Math.round(p * (size - 1) / 4));
+  }
+  const dense: number[] = [];
+  for (let si = start; si <= end; si += SEED_STRIDE) {
+    if (!anchors.has(si)) dense.push(si);
+  }
+  const room = Math.max(0, MAX_SEEDS_PER_CHUNK - anchors.size);
+  // Spread the kept dense seeds evenly across the chunk if over budget
+  let kept: number[] = dense;
+  if (dense.length > room) {
+    kept = [];
+    for (let k = 0; k < room; k++) {
+      kept.push(dense[Math.round(k * (dense.length - 1) / Math.max(1, room - 1))]);
+    }
+  }
+  return [...new Set([...anchors, ...kept])].sort((a, b) => a - b);
 }
 
 // ---------------------------------------------------------------------------
@@ -1534,16 +1602,18 @@ export async function groundMatchedSegments(
   // ------------------------------------------------------------------
   // Passes 1 & 2: per-chunk seeded matching
   // ------------------------------------------------------------------
-  for (let pass = 1; pass <= 2; pass++) {
-    const passMinSim = pass === 1 ? minSimilarity : 40;
-    const isApprox   = pass === 2;
+  // BULLETPROOF: three-pass ladder (main engine: two passes ending at 40%).
+  const passThresholds = [minSimilarity, PASS2_MIN_SIM, PASS3_MIN_SIM];
+  for (let pass = 1; pass <= passThresholds.length; pass++) {
+    const passMinSim = passThresholds[pass - 1];
+    const isApprox   = pass >= 2;
     let   passCount  = 0;
 
     for (let ci = 0; ci < chunks.length; ci++) {
       const chunk     = chunks[ci];
       const chunkSize = chunk.end - chunk.start + 1;
 
-      // Report progress per chunk in pass 1 (pass 2 is a lighter retry — not double-reported)
+      // Report progress per chunk in pass 1 (later passes are lighter retries — not double-reported)
       if (pass === 1) {
         onProgress?.({
           phase: 'matching',
@@ -1566,12 +1636,9 @@ export async function groundMatchedSegments(
       // Minimum frames needed to accept a segment (scales with chunk size)
       const chunkMinFrames = Math.min(minConsecutiveFrames, Math.max(3, Math.floor(chunkSize * 0.4)));
 
-      // Try seeding from 5 strategic positions within the chunk:
-      // 0%, 25%, 50%, 75%, 100%
-      const seedPositions = new Set<number>();
-      for (let p = 0; p <= 4; p++) {
-        seedPositions.add(chunk.start + Math.round(p * (chunkSize - 1) / 4));
-      }
+      // BULLETPROOF dense seeding: 5 strategic anchors + a seed every
+      // SEED_STRIDE frames (capped at MAX_SEEDS_PER_CHUNK).
+      const seedPositions = new Set<number>(denseSeedPositions(chunk.start, chunk.end));
 
       let bestSeq: RawSeq[] | null = null;
       let bestSeqConf = 0;
@@ -1596,7 +1663,7 @@ export async function groundMatchedSegments(
         const yp = yieldIfNeeded(ci * 5);
         if (yp) await yp;
 
-        const fastFloor = passMinSim - 20;
+        const fastFloor = Math.max(0, passMinSim - FAST_FLOOR_MARGIN);
         const cands: Array<{ mi: number; sim: number }> = [];
         let lastCand: { mi: number; sim: number } | null = null;
 
@@ -1613,7 +1680,11 @@ export async function groundMatchedSegments(
         let lastPoolCand: AlignedCand | null = null;
 
         for (let mi = 0; mi < movieFps.length; mi++) {
-          const s = hashSimFastCross(sSet, si, mSet, mi);
+          // BULLETPROOF: full best-cross scoring (all short crop/zoom variants
+          // × all movie variants) instead of the cheap full-variant-only scan.
+          // Strictly ≥ the fast score, so nothing the fast scan would find is
+          // ever lost — but re-cropped/zoomed edits now score correctly.
+          const s = hashSimBestCross(sSet, si, mSet, mi);
           const offset = mi - si;
 
           if (lastPoolCand && offset - lastPoolCand.offset < SEED_SEPARATION) {
@@ -1643,7 +1714,7 @@ export async function groundMatchedSegments(
         if (cands.length === 0) continue;
         cands.sort((a, b) => b.sim - a.sim);
         const topCands = cands.slice(0, MAX_SEED_CANDIDATES);
-        if (topCands[0].sim < passMinSim - 18) continue;
+        if (topCands[0].sim < passMinSim - SEED_TOP_GATE_MARGIN) continue;
 
         for (const cand of topCands) {
           const seedSim = frameSim(sSet, si, mSet, cand.mi);
@@ -1692,9 +1763,9 @@ export async function groundMatchedSegments(
   // segment for them produces spurious 1–4 frame segments with random movie
   // times.  Skip them; they'll become tiny "unmatched" ranges (< 0.2 s) which
   // are invisible to the user.
-  // Minimum 10 frames = reference algorithm's stated threshold for a valid segment.
-  // Smaller leftovers are almost always false-cut fragments or CGI/altered content.
-  const MIN_FORCED_FRAMES = 10;
+  // BULLETPROOF: lowered from 10 → 6 so smaller genuine leftovers still get a
+  // forced best-match attempt (VLM verification filters out the junk anyway).
+  const MIN_FORCED_FRAMES = 6;
   let pass3Count = 0;
 
   for (const chunk of chunks) {
@@ -1731,7 +1802,9 @@ export async function groundMatchedSegments(
     // likely doesn't exist in the reference movie (e.g. CGI insert, green-screen
     // overlay, third-party clip).  Leave it as an unmatched range rather than
     // fabricating a low-quality segment.
-    const UNMATCHED_SIM_GATE = 65; // below this avg % → altered / unmatched
+    // BULLETPROOF: 55 instead of 65 — surface more forced candidates; VLM
+    // verification downstream rejects the fabricated ones.
+    const UNMATCHED_SIM_GATE = 55; // below this avg % → altered / unmatched
     const avgForcedSim = bestOf.reduce((s, f) => s + f.sim, 0) / bestOf.length;
     if (avgForcedSim < UNMATCHED_SIM_GATE) {
       console.log(
