@@ -465,6 +465,94 @@ async function startServer() {
     res.json({ status: 'ok' });
   });
 
+  // 1b. Runtime settings (Gemini API key + GPU embed service URL).
+  // Persisted to runtime-settings.json so they survive restarts, and applied
+  // to process.env immediately so all later-spawned worker threads inherit them.
+  // Env vars already set at process launch take precedence at boot, but a POST
+  // from the UI always overrides for the current run.
+  const settingsPath = path.join(process.cwd(), 'runtime-settings.json');
+  const loadRuntimeSettings = () => {
+    try {
+      if (fs.existsSync(settingsPath)) {
+        const saved = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+        if (saved.geminiApiKey && !process.env.GEMINI_API_KEY) {
+          process.env.GEMINI_API_KEY = saved.geminiApiKey;
+        }
+        if (saved.gpuEmbedServiceUrl && !process.env.GPU_EMBED_SERVICE_URL) {
+          process.env.GPU_EMBED_SERVICE_URL = saved.gpuEmbedServiceUrl;
+        }
+        console.log('[settings] Loaded runtime settings from runtime-settings.json');
+      }
+    } catch (e) {
+      console.warn('[settings] Failed to load runtime-settings.json:', e);
+    }
+  };
+  loadRuntimeSettings();
+
+  const maskKey = (k?: string) =>
+    k && k.length > 8 ? `${k.slice(0, 4)}…${k.slice(-4)}` : k ? '••••' : '';
+
+  app.get('/api/settings', (req, res) => {
+    res.json({
+      geminiConfigured: !!process.env.GEMINI_API_KEY,
+      geminiKeyMasked: maskKey(process.env.GEMINI_API_KEY),
+      gpuEmbedServiceUrl: process.env.GPU_EMBED_SERVICE_URL || '',
+    });
+  });
+
+  app.post('/api/settings', (req, res) => {
+    try {
+      const { geminiApiKey, gpuEmbedServiceUrl } = req.body ?? {};
+
+      if (geminiApiKey !== undefined) {
+        const trimmed = String(geminiApiKey).trim();
+        if (trimmed) process.env.GEMINI_API_KEY = trimmed;
+        else delete process.env.GEMINI_API_KEY;
+      }
+      if (gpuEmbedServiceUrl !== undefined) {
+        const trimmed = String(gpuEmbedServiceUrl).trim().replace(/\/+$/, '');
+        if (trimmed && !/^https?:\/\//i.test(trimmed)) {
+          return res.status(400).json({ error: 'GPU service URL must start with http:// or https://' });
+        }
+        if (trimmed) process.env.GPU_EMBED_SERVICE_URL = trimmed;
+        else delete process.env.GPU_EMBED_SERVICE_URL;
+      }
+
+      // Persist (owner-only file perms — contains a secret)
+      const toSave = {
+        geminiApiKey: process.env.GEMINI_API_KEY || '',
+        gpuEmbedServiceUrl: process.env.GPU_EMBED_SERVICE_URL || '',
+      };
+      fs.writeFileSync(settingsPath, JSON.stringify(toSave, null, 2), { mode: 0o600 });
+
+      res.json({
+        ok: true,
+        geminiConfigured: !!process.env.GEMINI_API_KEY,
+        geminiKeyMasked: maskKey(process.env.GEMINI_API_KEY),
+        gpuEmbedServiceUrl: process.env.GPU_EMBED_SERVICE_URL || '',
+      });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message || 'Failed to save settings' });
+    }
+  });
+
+  // Test the Gemini key with a minimal models.list call
+  app.post('/api/settings/test-gemini', async (req, res) => {
+    const key = (req.body?.geminiApiKey ?? process.env.GEMINI_API_KEY ?? '').trim();
+    if (!key) return res.json({ ok: false, error: 'No API key provided' });
+    try {
+      const r = await fetch(
+        'https://generativelanguage.googleapis.com/v1beta/models?pageSize=1',
+        { headers: { 'x-goog-api-key': key } },
+      );
+      if (r.ok) return res.json({ ok: true });
+      const body = await r.text().catch(() => '');
+      return res.json({ ok: false, error: `HTTP ${r.status}: ${body.slice(0, 200)}` });
+    } catch (e: any) {
+      return res.json({ ok: false, error: e?.message || 'Network error' });
+    }
+  });
+
   // 2. Upload chunk endpoint
   app.post('/api/upload-chunk', upload.single('chunk') as any, async (req, res) => {
     try {

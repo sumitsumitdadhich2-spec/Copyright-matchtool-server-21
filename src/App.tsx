@@ -7,6 +7,7 @@ import {
   Plus, Minus
 } from 'lucide-react';
 import { processVideoFile, processVideoOnServer } from './VideoProcessor';
+import ApiSettings from './components/ApiSettings';
 import { clearVideoFingerprints } from './utils/db';
 import { saveJobSession, getJobSession, clearJobSession, saveMatchJobId, getMatchJobId, clearMatchJobId } from './utils/session';
 import type { CachedJob } from './utils/session';
@@ -1865,6 +1866,9 @@ export default function App() {
             </div>
           )}
         </section>
+
+        {/* ── API & GPU Connection ── */}
+        <ApiSettings />
 
         {/* ── Worker Accuracy Calibration ── */}
         <section className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
