@@ -351,8 +351,18 @@ export function extractFingerprints(
       // the initial pool and to replace a worker that crashes mid-run so pool
       // throughput doesn't silently shrink over a long job.
       function spawnWorker(): Worker {
+        // In dev the worker entry is a .ts file, so tsx must be active inside
+        // the worker thread. `-r tsx/cjs` only installs the CommonJS require
+        // hook — it does nothing when the worker is loaded through the ESM
+        // loader chain (which is what happens whenever the parent process has
+        // its own `--import` loader in NODE_OPTIONS, e.g. under the hosted
+        // dev runtime). In that case worker.ts is resolved as ESM and its
+        // extensionless `../src/shared/fingerprint` import throws
+        // ERR_MODULE_NOT_FOUND, killing every worker and failing 100% of
+        // frames. `--import tsx` registers BOTH the ESM resolve/load hooks
+        // and the CJS hook, so it works either way.
         const worker = new Worker(workerPath, isProd ? {} : {
-          execArgv: ['-r', 'tsx/cjs']
+          execArgv: ['--import', 'tsx']
         });
         workerTaskIds.set(worker, new Set());
 

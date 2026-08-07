@@ -1788,7 +1788,14 @@ async function startServer() {
           const bootstrapCode = isProd
             ? `require(${JSON.stringify(workerFile)})`
             : `require('tsx/cjs'); require(${JSON.stringify(workerFile)});`;
-          const worker = new Worker(bootstrapCode, { eval: true });
+          // Same reason as in pipeline.ts: `require('tsx/cjs')` alone only
+          // installs the CJS hook, which is bypassed when the worker's
+          // imports go through the ESM loader chain. Registering tsx via
+          // execArgv covers both module systems.
+          const worker = new Worker(bootstrapCode, {
+            eval: true,
+            ...(isProd ? {} : { execArgv: ['--import', 'tsx'] }),
+          });
           const results: WorkerResult[] = new Array(NUM_FRAMES).fill(null).map(() => ({
             hash: '', dhash: '', signature: undefined
           }));
