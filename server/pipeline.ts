@@ -352,7 +352,7 @@ export function extractFingerprints(
       // throughput doesn't silently shrink over a long job.
       function spawnWorker(): Worker {
         const worker = new Worker(workerPath, isProd ? {} : {
-          execArgv: ['-r', 'tsx/cjs']
+          execArgv: ['--import', 'tsx']
         });
         workerTaskIds.set(worker, new Set());
 
