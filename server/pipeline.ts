@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { fileURLToPath } from 'url';
 import { FrameSignature } from '../src/shared/fingerprint';
+import { FFMPEG_BIN, FFPROBE_BIN_QUOTED } from './ffmpeg-path';
 
 const getDirname = () => {
   if (typeof __dirname !== 'undefined') {
@@ -457,7 +458,7 @@ export function extractFingerprints(
       let height = 0;
       try {
         const ffprobeOutput = execSync(
-          `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${videoPath}"`,
+          `${FFPROBE_BIN_QUOTED} -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${videoPath}"`,
           { env: makeCleanEnv() }
         ).toString().trim();
         const [w, h] = ffprobeOutput.split('x').map(Number);
@@ -488,7 +489,7 @@ export function extractFingerprints(
         ` — queue limit ${dynamicQueueLimit} frames (~${(dynamicQueueLimit * frameBytes / 1_073_741_824).toFixed(2)} GB)`
       );
 
-      ffmpegProcess = spawn('ffmpeg', [
+      ffmpegProcess = spawn(FFMPEG_BIN, [
         '-i', videoPath,
         '-f', 'rawvideo',
         '-pix_fmt', 'rgba',

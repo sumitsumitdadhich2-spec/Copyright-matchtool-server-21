@@ -18,8 +18,12 @@
  */
 import { spawnSync } from 'child_process';
 import { createRequire } from 'module';
+import * as path from 'path';
 
-const require_ = createRequire(import.meta.url ?? `file://${process.cwd()}/`);
+// Resolve from the project root rather than `import.meta.url` so this module
+// behaves identically whether tsx loads it as ESM (server / worker threads) or
+// the compiled build loads it as CommonJS.
+const require_ = createRequire(path.join(process.cwd(), 'noop.js'));
 
 function onPath(bin: string): boolean {
   try {

@@ -8,6 +8,7 @@
  */
 import { spawn } from 'child_process';
 import { makeCleanEnv } from './pipeline';
+import { FFMPEG_BIN } from './ffmpeg-path';
 import { sscdGateCheck } from './sscd-verify-gate';
 import { geminiConfigured, geminiVerifyComposite, parseVerdictJson } from './gemini-vlm';
 import { buildSideBySideComposite } from './frame-composite';
@@ -246,7 +247,7 @@ export function extractFrameAsBase64(
   return new Promise((resolve, reject) => {
     const ts = Math.max(0, timestampSeconds).toFixed(3);
     const proc = spawn(
-      'ffmpeg',
+      FFMPEG_BIN,
       [
         '-ss', ts,
         '-i', videoPath,

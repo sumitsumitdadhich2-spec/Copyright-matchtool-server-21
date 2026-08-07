@@ -50,6 +50,7 @@
  */
 import { spawn } from 'child_process';
 import { makeCleanEnv } from './pipeline';
+import { FFMPEG_BIN, FFPROBE_BIN } from './ffmpeg-path';
 import { MatchedSegment } from './candidate-matching-engine';
 import { pickVerificationFramePairs } from './vlm-segment-resolver';
 import { embedFrameB64, cosineSimilarity } from './embedding-gate';
@@ -188,7 +189,7 @@ function legacyCropFilterFor(variant: 'left' | 'center' | 'right'): string {
 function probeDimensions(videoPath: string): Promise<{ width: number; height: number } | null> {
   return new Promise((resolve) => {
     const proc = spawn(
-      'ffprobe',
+      FFPROBE_BIN,
       ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', videoPath],
       { env: makeCleanEnv() },
     );
@@ -241,7 +242,7 @@ function extractFrameVariantAsBase64(
     if (cropFilter) args.push('-vf', cropFilter);
     args.push('-f', 'image2pipe', '-vcodec', 'mjpeg', '-q:v', '3', 'pipe:1');
 
-    const proc = spawn('ffmpeg', args, { env: makeCleanEnv() });
+    const proc = spawn(FFMPEG_BIN, args, { env: makeCleanEnv() });
     const chunks: Buffer[] = [];
     let stderr = '';
     proc.stdout.on('data', (c: Buffer) => chunks.push(c));
