@@ -60,7 +60,11 @@ import { embedFrameB64, cosineSimilarity } from './embedding-gate';
 
 /** Base URL of the GPU embedding service (ngrok link). Empty = disabled. */
 function gpuServiceUrl(): string {
-  return (process.env.GPU_EMBED_SERVICE_URL || '').replace(/\/+$/, '');
+  // Users often paste the full health-check link (".../health") instead of the
+  // base URL — strip a trailing "/health" and trailing slashes defensively.
+  return (process.env.GPU_EMBED_SERVICE_URL || '')
+    .replace(/\/+$/, '')
+    .replace(/\/health$/i, '');
 }
 
 /** Hard timeout for GPU embed/search calls. On expiry -> CPU fallback. */

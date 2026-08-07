@@ -1,3 +1,10 @@
+// Load env files BEFORE any module reads process.env. tsx/node do not load
+// .env files automatically (this is not Next.js), so without this the
+// GPU_EMBED_SERVICE_URL / GEMINI_API_KEY etc. set in .env.development.local
+// are silently invisible to the whole server.
+import * as dotenv from 'dotenv';
+dotenv.config({ path: ['.env.development.local', '.env.local', '.env'], quiet: true });
+
 import express from 'express';
 import multer from 'multer';
 import cors from 'cors';

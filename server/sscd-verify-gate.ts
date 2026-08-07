@@ -46,7 +46,11 @@ export interface SscdGateOutcome {
 // ---------------------------------------------------------------------------
 
 function gpuServiceUrl(): string {
-  return (process.env.GPU_EMBED_SERVICE_URL || '').replace(/\/+$/, '');
+  // Users often paste the full health-check link (".../health") instead of the
+  // base URL — strip a trailing "/health" and trailing slashes defensively.
+  return (process.env.GPU_EMBED_SERVICE_URL || '')
+    .replace(/\/+$/, '')
+    .replace(/\/health$/i, '');
 }
 
 /**
