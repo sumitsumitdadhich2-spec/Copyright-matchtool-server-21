@@ -1023,7 +1023,7 @@ async function startServer() {
     res.json({ deleted });
   });
 
-  // 6. Match endpoint — background job, same model as fingerprint jobs.
+  // 6. Match endpoint �� background job, same model as fingerprint jobs.
   // Kicks off matching (+ optional VLM verification) asynchronously and
   // returns a matchJobId immediately; the client polls /api/match-status/:id
   // instead of holding one long-lived SSE connection open (which mobile
@@ -1532,15 +1532,20 @@ async function startServer() {
         );
         console.log(
           `[Retry] Match ${matchJobId} segment ${segmentIndex}: ${result.outcome} ` +
-          `(mode=${result.mode}, newCandidates=${result.newCandidatesAdded}).`
+          `(mode=${result.mode}, newCandidates=${result.newCandidatesAdded}, ` +
+          `attempts=${result.attemptsUsed}, searchRounds=${result.searchRounds}).`
         );
 
-        // On acceptance, swap the active match for this short-clip range in
-        // the job's live segments + persisted result JSON. Matched by range,
-        // not array index — the deferred recovery pass can insert/reorder
-        // segments, so a candidate file's segmentIndex no longer maps 1:1 to
-        // a slot in the final segments array.
-        if (result.outcome === 'accepted' && result.acceptedCandidateIndex !== undefined) {
+        // On acceptance — genuine Gemini accept OR the best-so-far fallback
+        // after the attempt budget ran out — swap the active match for this
+        // short-clip range in the job's live segments + persisted result
+        // JSON. Matched by range, not array index — the deferred recovery
+        // pass can insert/reorder segments, so a candidate file's
+        // segmentIndex no longer maps 1:1 to a slot in the segments array.
+        if (
+          (result.outcome === 'accepted' || result.outcome === 'best_effort') &&
+          result.acceptedCandidateIndex !== undefined
+        ) {
           const refreshed = readCandidatesFile(uploadDir, matchJobId, segmentIndex);
           const newSeg = refreshed?.candidates[result.acceptedCandidateIndex]?.segment;
           const liveJob = matchJobs.get(matchJobId);
