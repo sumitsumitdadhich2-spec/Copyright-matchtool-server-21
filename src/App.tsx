@@ -398,6 +398,18 @@ export default function App() {
   } | null>(null);
   const [matchJobId, setMatchJobId] = useState<string>('');
 
+  // Gemini free-tier quota status (polled alongside match-status). When the
+  // daily quota is exhausted the server keeps auto-probing for the reset;
+  // here we just surface a persistent warning telling the user to bring a
+  // fresh API key.
+  const [geminiQuota, setGeminiQuota] = useState<{
+    configured: boolean;
+    usedToday: number;
+    rpmLimit: number;
+    dailyLimitReached: boolean;
+    rateLimitWaiting: boolean;
+  } | null>(null);
+
   // Status / error
   const [status, setStatus]     = useState<string>('');
   const [errorMsg, setErrorMsg] = useState<string>('');
@@ -778,6 +790,7 @@ export default function App() {
         }
 
         const job = await res.json();
+        if (job.gemini) setGeminiQuota(job.gemini);
         if (job.progress) {
           setMatchProgress({
             phase: job.progress.phase,
@@ -910,6 +923,7 @@ export default function App() {
         fetch(`/api/match-status/${matchJobId}`)
           .then(r => r.json())
           .then(job => {
+            if (job.gemini) setGeminiQuota(job.gemini);
             if (job.progress) {
               setMatchProgress(prev => ({
                 phase: job.progress.phase,
@@ -2004,6 +2018,33 @@ export default function App() {
           </button>
           {renderProgress(targetProgress, 'bg-indigo-500')}
         </section>
+
+        {/* ── Gemini daily-limit warning ── */}
+        {geminiQuota?.dailyLimitReached && (
+          <div className="bg-red-950/60 border border-red-500/40 rounded-xl p-3.5 text-sm text-red-200 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <p className="font-semibold text-red-300">
+                Gemini daily limit over — nayi API key lekar aao
+              </p>
+              <p className="text-xs text-red-200/80 leading-relaxed">
+                Aaj ki free-tier daily quota khatam ho gayi hai ({geminiQuota.usedToday} requests).
+                Processing rukegi nahi — server har 10 minute mein check karta rahega ki limit
+                wapas aayi ya nahi, aur tab tak Qwen fallback se kaam chalega. Nayi key
+                Settings mein daal do to Gemini turant wapas chalu ho jayega.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* ── Gemini per-minute pacing indicator ── */}
+        {!geminiQuota?.dailyLimitReached && geminiQuota?.rateLimitWaiting && isMatching && (
+          <div className="bg-amber-950/40 border border-amber-500/30 rounded-xl px-3.5 py-2.5 text-xs text-amber-200 flex items-center gap-2.5">
+            <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
+            Gemini {geminiQuota.rpmLimit} req/min limit pe hai — agli window ka wait chal raha hai,
+            kaam nahi rukega ({geminiQuota.usedToday} requests aaj tak).
+          </div>
+        )}
 
         {/* ── Status bar ── */}
         {(status || isMatching) && (

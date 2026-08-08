@@ -17,6 +17,7 @@ import { extractFingerprints, NUM_WORKERS } from './server/pipeline';
 import { matchVideosFromFiles } from './server/matching-engine';
 import { resolveSegmentsWithVLM, SegmentResolvedInfo } from './server/vlm-segment-resolver';
 import { vlmNetworkStats, resetVlmNetworkStats, isVlmAvailable } from './server/vlm-verify';
+import { getGeminiStatus } from './server/gemini-vlm';
 import {
   buildCandidateHistoryEntry,
   buildHashOnlyCandidateHistoryEntry,
@@ -1402,7 +1403,14 @@ async function startServer() {
       vlmStats: job.vlmStats,
       startedAt: job.startedAt,
       completedAt: job.completedAt,
+      gemini: getGeminiStatus(),
     });
+  });
+
+  // Standalone Gemini quota status — lets the UI poll the daily-limit flag
+  // even when no match job is running.
+  app.get('/api/gemini-status', (req, res) => {
+    res.json(getGeminiStatus());
   });
 
   // 6g. Stop a running match job — mirrors /api/jobs/:jobId/stop for fingerprint jobs.
