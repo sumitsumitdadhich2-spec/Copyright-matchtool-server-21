@@ -793,6 +793,33 @@ export async function verifySameSceneMulti(
 }
 
 /**
+ * GEMINI-FIRST entry point for the manual Retry button. Unlike routedVerify,
+ * this SKIPS the SSCD shortcut so a user-triggered Retry is always judged by
+ * Gemini itself (with the exact same rate-limit system: 10/min sliding-window
+ * pacer, wait-and-retry on per-minute 429s so the process never dies, and
+ * daily-limit detection that flags the UI warning). Only when Gemini can
+ * yield no verdict at all (not configured, or daily quota exhausted between
+ * probes) does it fall back to the normal routed path so Retry still works.
+ */
+export async function verifySameSceneGeminiFirst(
+  pairs: VlmFramePair[],
+): Promise<{ same: boolean; confidencePct: number } | null> {
+  if (geminiConfigured()) {
+    const result = await compositeMajorityVerify(pairs);
+    if (result) {
+      console.log(
+        `[Verify] (retry) gate=skipped provider=${result.provider} ` +
+        `votes=${result.votesFor}/${result.votesTotal} ` +
+        `verdict=${result.same ? 'accept' : 'reject'} conf=${result.confidencePct}`
+      );
+      return { same: result.same, confidencePct: result.confidencePct };
+    }
+    console.log('[Verify] (retry) Gemini yielded no verdict — falling back to routed path');
+  }
+  return routedVerify(pairs, () => verifySameSceneMultiLegacy(pairs));
+}
+
+/**
  * Exported entry point — same signature/contract as always. Callers
  * (vlm-segment-resolver.ts, deferred-recovery.ts) are untouched.
  * In the composite protocol the per-pair majority vote replaces the legacy

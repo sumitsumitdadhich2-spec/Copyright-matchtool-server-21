@@ -31,7 +31,7 @@ import * as readline from 'readline';
 import { MatchedSegment, matchVideosFromFiles } from './candidate-matching-engine';
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
 import { pickVerificationFramePairs } from './vlm-segment-resolver';
-import { extractFrameAsBase64, verifySameSceneMulti, VLM_CONFIDENCE_THRESHOLD } from './vlm-verify';
+import { extractFrameAsBase64, verifySameSceneGeminiFirst, VLM_CONFIDENCE_THRESHOLD } from './vlm-verify';
 import {
   StoredCandidateSet,
   CandidateCheck,
@@ -158,7 +158,10 @@ async function checkCandidate(
         return { shortFrameB64, movieFrameB64 };
       }),
     );
-    const result = await verifySameSceneMulti(extracted);
+    // Manual Retry is Gemini-first: verified by Gemini with the same
+    // rate-limit system as the main pass (10/min pacer, wait on per-minute
+    // 429s so the retry never dies mid-way, daily-limit flag for the UI).
+    const result = await verifySameSceneGeminiFirst(extracted);
     if (result === null) {
       candidate.checked = true;
       candidate.verdict = 'unverifiable';

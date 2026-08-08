@@ -1493,13 +1493,19 @@ async function startServer() {
       return res.status(409).json({ error: 'Retry already in progress for this segment' });
     }
 
-    // Retry works with ANY configured verification provider (Gemini, SSCD
-    // embedding gate, or the legacy Qwen VLM endpoint) — same rule as the
-    // main verification pass in resolveSegmentsWithVLM.
+    // Retry is Gemini-first (same rate-limit system as the main pass: 10/min
+    // pacer + wait-and-retry on per-minute 429s). SSCD gate / Qwen only serve
+    // as fallback when Gemini can't answer at all.
     const vlmAvailable = await isVlmAvailable();
     const anyProviderAvailable = vlmAvailable || sscdGateEnabled() || geminiConfigured();
     if (!anyProviderAvailable) {
       return res.status(503).json({ error: 'No verification provider available — set GEMINI_API_KEY, GPU_EMBED_SERVICE_URL, or VLM_ENDPOINT_URL.' });
+    }
+    // Gemini is the only provider and its DAILY quota is gone -> tell the
+    // user directly instead of running a retry that cannot verify anything.
+    const gStatus = getGeminiStatus();
+    if (gStatus.dailyLimitReached && !vlmAvailable && !sscdGateEnabled()) {
+      return res.status(503).json({ error: 'Gemini daily limit over — nayi API key add karo, phir Retry dabao.' });
     }
 
     const movieVideoPath = getVideoPathForJob(job.movieJobId);
