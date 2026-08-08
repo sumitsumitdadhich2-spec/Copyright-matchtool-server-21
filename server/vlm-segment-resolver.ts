@@ -6,8 +6,7 @@
 import type { MatchedSegment } from './matching-engine';
 import { getAlternateCandidatesForRange } from './matching-engine';
 import {
-  extractFrameAsBase64,
-  verifySameSceneChecked,
+  verifySameSceneVideo,
   VLM_CONFIDENCE_THRESHOLD,
   VLM_MAX_ATTEMPTS,
   VLM_CONCURRENCY,

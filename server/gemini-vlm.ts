@@ -325,19 +325,40 @@ export async function geminiVerifyComposite(
   prompt: string,
 ): Promise<{ same: boolean; confidence: number } | null> {
   if (!geminiConfigured()) return null;
+  const raw = await geminiGenerateParts(
+    [
+      { inline_data: { mime_type: 'image/jpeg', data: compositeB64 } },
+      { text: prompt },
+    ],
+    GEMINI_TIMEOUT_MS,
+    1024,
+  );
+  if (raw === null) return null;
+  const verdict = parseVerdictJson(raw);
+  if (!verdict) {
+    console.warn(`[Gemini] Malformed/unparseable response — treating as unverifiable: ${String(raw).slice(0, 200)}`);
+    return null;
+  }
+  return verdict;
+}
+
+/**
+ * Core generateContent call with the full dual-model quota-manager loop.
+ * Returns the raw concatenated text of the response, or null on any failure
+ * (never throws). Shared by the composite-image path and the video-pair path.
+ */
+async function geminiGenerateParts(
+  parts: unknown[],
+  timeoutMs: number,
+  maxOutputTokens: number,
+): Promise<string | null> {
+  if (!geminiConfigured()) return null;
 
   const body = {
-    contents: [
-      {
-        parts: [
-          { inline_data: { mime_type: 'image/jpeg', data: compositeB64 } },
-          { text: prompt },
-        ],
-      },
-    ],
+    contents: [{ parts }],
     generationConfig: {
       temperature: 0,
-      maxOutputTokens: 1024,
+      maxOutputTokens,
     },
   };
 
@@ -368,7 +389,7 @@ export async function geminiVerifyComposite(
       `${encodeURIComponent(modelName)}:generateContent`;
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       rollDayIfNeeded(m);
       m.usedToday++;
@@ -435,13 +456,7 @@ export async function geminiVerifyComposite(
       const raw: string = (json?.candidates?.[0]?.content?.parts || [])
         .map((p: any) => p?.text || '')
         .join('');
-
-      const verdict = parseVerdictJson(raw);
-      if (!verdict) {
-        console.warn(`[Gemini] Malformed/unparseable response — treating as unverifiable: ${String(raw).slice(0, 200)}`);
-        return null;
-      }
-      return verdict;
+      return raw;
     } catch (err: any) {
       const reason = err?.name === 'AbortError' ? 'timed out' : (err?.message || String(err));
       console.warn(`[Gemini] ${modelName} request failed (${reason}) — treating as unverifiable`);
@@ -453,4 +468,205 @@ export async function geminiVerifyComposite(
   }
   console.warn('[Gemini] Gave up after prolonged rate-limit waiting — treating as unverifiable');
   return null;
+}
+
+// ===========================================================================
+// VIDEO-PAIR VERIFICATION — two cut segments in ONE request via the Files API
+// ===========================================================================
+
+const GEMINI_VIDEO_TIMEOUT_MS = Number(process.env.GEMINI_VIDEO_TIMEOUT_MS) || 240_000;
+const GEMINI_FILE_ACTIVE_TIMEOUT_MS = Number(process.env.GEMINI_FILE_ACTIVE_TIMEOUT_MS) || 180_000;
+const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com';
+
+/**
+ * Brace-balanced parser for the video verdict JSON, which contains NESTED
+ * objects/arrays ("matchedTimeranges", "evidence") that the flat
+ * parseVerdictJson regex cannot handle. Scans the full model output for
+ * balanced {...} blocks containing a "same" field and returns the LAST
+ * valid one (the prompt puts the JSON after the evidence reasoning).
+ */
+export function parseVerdictJsonDeep(
+  raw: string,
+): { same: boolean; confidence: number } | null {
+  if (!raw) return null;
+  const cleaned = raw.trim().replace(/```(?:json)?/gi, '').trim();
+  let result: { same: boolean; confidence: number } | null = null;
+
+  for (let i = 0; i < cleaned.length; i++) {
+    if (cleaned[i] !== '{') continue;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let j = i; j < cleaned.length; j++) {
+      const ch = cleaned[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          const block = cleaned.slice(i, j + 1);
+          if (block.includes('"same"')) {
+            try {
+              const parsed = JSON.parse(block);
+              if (typeof parsed.same === 'boolean' && typeof parsed.confidence === 'number') {
+                result = {
+                  same: parsed.same,
+                  confidence: Math.max(0, Math.min(100, parsed.confidence)),
+                };
+              }
+            } catch { /* not valid JSON — keep scanning */ }
+          }
+          i = j; // resume outer scan after this block
+          break;
+        }
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Upload a video buffer via the Gemini Files API (resumable protocol) and
+ * wait until it is ACTIVE. Returns {uri, name} or null on any failure.
+ * Uploads do NOT consume generateContent quota, so no slot is taken here.
+ */
+async function geminiUploadVideo(
+  bytes: Buffer,
+  displayName: string,
+): Promise<{ uri: string; name: string } | null> {
+  const key = process.env.GEMINI_API_KEY as string;
+  try {
+    const startRes = await fetch(`${GEMINI_API_BASE}/upload/v1beta/files`, {
+      method: 'POST',
+      headers: {
+        'x-goog-api-key': key,
+        'X-Goog-Upload-Protocol': 'resumable',
+        'X-Goog-Upload-Command': 'start',
+        'X-Goog-Upload-Header-Content-Length': String(bytes.length),
+        'X-Goog-Upload-Header-Content-Type': 'video/mp4',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ file: { display_name: displayName } }),
+    });
+    if (!startRes.ok) {
+      console.warn(`[Gemini] File upload start failed: HTTP ${startRes.status}`);
+      return null;
+    }
+    const uploadUrl = startRes.headers.get('x-goog-upload-url');
+    if (!uploadUrl) {
+      console.warn('[Gemini] File upload start returned no upload URL');
+      return null;
+    }
+
+    const upRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        'X-Goog-Upload-Command': 'upload, finalize',
+        'X-Goog-Upload-Offset': '0',
+      },
+      body: new Uint8Array(bytes),
+    });
+    if (!upRes.ok) {
+      console.warn(`[Gemini] File upload bytes failed: HTTP ${upRes.status}`);
+      return null;
+    }
+    const json: any = await upRes.json().catch(() => null);
+    const file = json?.file;
+    if (!file?.uri || !file?.name) {
+      console.warn('[Gemini] File upload finalize returned no file uri/name');
+      return null;
+    }
+
+    // Wait for server-side processing to finish (state ACTIVE).
+    let state: string = file.state || 'PROCESSING';
+    const deadline = Date.now() + GEMINI_FILE_ACTIVE_TIMEOUT_MS;
+    while (state === 'PROCESSING' && Date.now() < deadline) {
+      await sleep(2_000);
+      const poll = await fetch(`${GEMINI_API_BASE}/v1beta/${file.name}`, {
+        headers: { 'x-goog-api-key': key },
+      });
+      if (!poll.ok) break;
+      const pollJson: any = await poll.json().catch(() => null);
+      state = pollJson?.state || 'FAILED';
+    }
+    if (state !== 'ACTIVE') {
+      console.warn(`[Gemini] Uploaded video never became ACTIVE (state=${state})`);
+      geminiDeleteFile(file.name);
+      return null;
+    }
+    return { uri: file.uri, name: file.name };
+  } catch (err: any) {
+    console.warn(`[Gemini] Video upload failed: ${err?.message || err}`);
+    return null;
+  }
+}
+
+/** Best-effort delete of an uploaded file — fire and forget. */
+function geminiDeleteFile(name: string): void {
+  const key = process.env.GEMINI_API_KEY as string;
+  fetch(`${GEMINI_API_BASE}/v1beta/${name}`, {
+    method: 'DELETE',
+    headers: { 'x-goog-api-key': key },
+  }).catch(() => { /* best-effort */ });
+}
+
+/**
+ * Verify a (movie-segment, short-segment) VIDEO pair in ONE Gemini request:
+ * both cut segments are uploaded via the Files API (no inline-size limit, no
+ * extra compression — whatever ffmpeg produced is what Gemini sees), then a
+ * single generateContent call carries both videos, each preceded by its own
+ * label text, followed by the task prompt.
+ *
+ * Uses the exact same dual-model quota manager as the composite path.
+ * Returns {same, confidence} or null (caller treats null as unverifiable).
+ */
+export async function geminiVerifyVideoPair(
+  video1Bytes: Buffer,
+  video1Label: string,
+  video2Bytes: Buffer,
+  video2Label: string,
+  prompt: string,
+): Promise<{ same: boolean; confidence: number } | null> {
+  if (!geminiConfigured()) return null;
+
+  const [file1, file2] = await Promise.all([
+    geminiUploadVideo(video1Bytes, 'reference-movie-segment'),
+    geminiUploadVideo(video2Bytes, 'target-clip-segment'),
+  ]);
+  if (!file1 || !file2) {
+    if (file1) geminiDeleteFile(file1.name);
+    if (file2) geminiDeleteFile(file2.name);
+    console.warn('[Gemini] Video-pair upload failed — treating as unverifiable');
+    return null;
+  }
+
+  try {
+    const raw = await geminiGenerateParts(
+      [
+        { text: video1Label },
+        { file_data: { mime_type: 'video/mp4', file_uri: file1.uri } },
+        { text: video2Label },
+        { file_data: { mime_type: 'video/mp4', file_uri: file2.uri } },
+        { text: prompt },
+      ],
+      GEMINI_VIDEO_TIMEOUT_MS,
+      2048,
+    );
+    if (raw === null) return null;
+    const verdict = parseVerdictJsonDeep(raw);
+    if (!verdict) {
+      console.warn(`[Gemini] Malformed/unparseable video verdict — treating as unverifiable: ${String(raw).slice(0, 300)}`);
+      return null;
+    }
+    return verdict;
+  } finally {
+    geminiDeleteFile(file1.name);
+    geminiDeleteFile(file2.name);
+  }
 }
