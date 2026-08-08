@@ -32,6 +32,8 @@ import { MatchedSegment, matchVideosFromFiles } from './candidate-matching-engin
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
 import { pickVerificationFramePairs } from './vlm-segment-resolver';
 import { extractFrameAsBase64, verifySameSceneGeminiFirst, VLM_CONFIDENCE_THRESHOLD } from './vlm-verify';
+import { geminiConfigured } from './gemini-vlm';
+import { geminiVerifyVideoClips } from './gemini-video-verify';
 import {
   StoredCandidateSet,
   CandidateCheck,
@@ -147,6 +149,24 @@ async function checkCandidate(
   shortVideoPath: string,
   movieVideoPath: string,
 ): Promise<void> {
+  // FINAL-DECISION VIDEO-CLIP CHECK (Gemini configured): the actual two
+  // segments are cut and sent as video clips with the forensic prompt —
+  // its verdict is final. Frame pairs are used ONLY without GEMINI_API_KEY.
+  if (geminiConfigured()) {
+    const vv = await geminiVerifyVideoClips(shortVideoPath, movieVideoPath, candidate.segment);
+    candidate.checked = true;
+    if (vv === null) {
+      candidate.verdict = 'unverifiable';
+    } else if (vv.same && vv.confidence >= VLM_CONFIDENCE_THRESHOLD) {
+      candidate.verdict = 'accepted';
+      candidate.confidencePct = vv.confidence;
+    } else {
+      candidate.verdict = 'rejected';
+      candidate.confidencePct = vv.confidence;
+    }
+    return;
+  }
+
   const framePairs = pickVerificationFramePairs(candidate.segment);
   try {
     const extracted = await Promise.all(

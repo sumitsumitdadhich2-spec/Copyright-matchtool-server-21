@@ -316,28 +316,28 @@ function retryAfterMs(res: Response): number {
 }
 
 /**
- * Ask Gemini whether the composite image shows the same scene.
- * Rotates between the two lite models per the quota-manager rules.
- * Returns {same, confidence} or null (caller falls back to Qwen).
+ * Core Gemini generateContent call with the full dual-model quota manager.
+ * Takes raw `parts` (text / inline_data images / inline_data VIDEO clips)
+ * and returns the model's raw TEXT response, or null on any failure —
+ * NEVER throws. All rotation/429/daily-quota rules apply identically
+ * regardless of payload type.
  */
-export async function geminiVerifyComposite(
-  compositeB64: string,
-  prompt: string,
-): Promise<{ same: boolean; confidence: number } | null> {
+export async function geminiGenerateText(
+  parts: any[],
+  opts?: { maxOutputTokens?: number; timeoutMs?: number },
+): Promise<string | null> {
   if (!geminiConfigured()) return null;
 
+  const timeoutMs = opts?.timeoutMs ?? GEMINI_TIMEOUT_MS;
   const body = {
     contents: [
       {
-        parts: [
-          { inline_data: { mime_type: 'image/jpeg', data: compositeB64 } },
-          { text: prompt },
-        ],
+        parts,
       },
     ],
     generationConfig: {
       temperature: 0,
-      maxOutputTokens: 1024,
+      maxOutputTokens: opts?.maxOutputTokens ?? 1024,
     },
   };
 
@@ -368,7 +368,7 @@ export async function geminiVerifyComposite(
       `${encodeURIComponent(modelName)}:generateContent`;
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       rollDayIfNeeded(m);
       m.usedToday++;
@@ -435,13 +435,7 @@ export async function geminiVerifyComposite(
       const raw: string = (json?.candidates?.[0]?.content?.parts || [])
         .map((p: any) => p?.text || '')
         .join('');
-
-      const verdict = parseVerdictJson(raw);
-      if (!verdict) {
-        console.warn(`[Gemini] Malformed/unparseable response — falling back to Qwen: ${String(raw).slice(0, 200)}`);
-        return null;
-      }
-      return verdict;
+      return raw || null;
     } catch (err: any) {
       const reason = err?.name === 'AbortError' ? 'timed out' : (err?.message || String(err));
       console.warn(`[Gemini] ${modelName} request failed (${reason}) — falling back to Qwen`);
@@ -453,4 +447,26 @@ export async function geminiVerifyComposite(
   }
   console.warn('[Gemini] Gave up after prolonged rate-limit waiting — falling back to Qwen');
   return null;
+}
+
+/**
+ * Ask Gemini whether the composite image shows the same scene.
+ * Rotates between the two lite models per the quota-manager rules.
+ * Returns {same, confidence} or null (caller falls back to Qwen).
+ */
+export async function geminiVerifyComposite(
+  compositeB64: string,
+  prompt: string,
+): Promise<{ same: boolean; confidence: number } | null> {
+  const raw = await geminiGenerateText([
+    { inline_data: { mime_type: 'image/jpeg', data: compositeB64 } },
+    { text: prompt },
+  ]);
+  if (raw === null) return null;
+  const verdict = parseVerdictJson(raw);
+  if (!verdict) {
+    console.warn(`[Gemini] Malformed/unparseable response — falling back to Qwen: ${String(raw).slice(0, 200)}`);
+    return null;
+  }
+  return verdict;
 }

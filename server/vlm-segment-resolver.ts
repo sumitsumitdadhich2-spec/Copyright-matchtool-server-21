@@ -17,6 +17,7 @@ import {
 import { embeddingGateCheck, EMBED_UNVERIFIABLE_KEEP_SIM } from './embedding-gate';
 import { sscdGateEnabled } from './sscd-verify-gate';
 import { geminiConfigured } from './gemini-vlm';
+import { geminiVerifyVideoClips } from './gemini-video-verify';
 
 // Fixed batch size for VLM server cache-reset points. Purely a cache-hygiene
 // boundary — does not change segment order, candidate selection, or verdicts.
@@ -190,7 +191,40 @@ export async function resolveSegmentsWithVLM(
       const framePairs = pickVerificationFramePairs(candidate);
 
       let verdict: VlmProgressInfo['verdict'] = 'unverifiable';
-      try {
+
+      // ----------------------------------------------------------------
+      // FINAL-DECISION VIDEO-CLIP CHECK (Gemini configured): the actual
+      // short segment and movie segment are cut with ffmpeg and sent as
+      // two video clips to Gemini with the forensic copyright prompt.
+      // Its verdict is FINAL for this candidate — no frame pairs, no
+      // embedding gate, no Qwen. Only when Gemini can produce NO verdict
+      // at all (quota exhausted / network / ffmpeg failure) does the
+      // candidate fall back to the conservative "keep as unverifiable"
+      // policy. The legacy frame path below runs ONLY when GEMINI_API_KEY
+      // is not set at all.
+      // ----------------------------------------------------------------
+      if (geminiConfigured()) {
+        const vv = await geminiVerifyVideoClips(shortVideoPath, movieVideoPath, candidate);
+        if (vv === null) {
+          verdict = 'unverifiable';
+          accepted = candidate;
+          triedCandidates.push({ segment: triedCandidate, verdict: 'unverifiable' });
+          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          console.log(`[VideoVerify] Segment ${i} attempt ${attempt}: no verdict obtainable — keeping as unverifiable`);
+          break;
+        }
+        if (vv.same && vv.confidence >= VLM_CONFIDENCE_THRESHOLD) {
+          verdict = 'accepted';
+          accepted = candidate;
+          triedCandidates.push({ segment: triedCandidate, verdict: 'accepted', confidencePct: vv.confidence });
+          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          break;
+        }
+        verdict = 'rejected';
+        triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: vv.confidence });
+        onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+      } else try {
+        // LEGACY FRAME PATH — only reachable without GEMINI_API_KEY.
         // Extract every needed frame in parallel (still one ffmpeg spawn per
         // frame, all concurrent), then make ONE VLM call with all pairs —
         // same request count per attempt as the old single-pair flow.
