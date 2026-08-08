@@ -324,20 +324,61 @@ export async function geminiVerifyComposite(
   compositeB64: string,
   prompt: string,
 ): Promise<{ same: boolean; confidence: number } | null> {
+  return geminiGenerateVerdict(
+    [
+      { inline_data: { mime_type: 'image/jpeg', data: compositeB64 } },
+      { text: prompt },
+    ],
+    { maxOutputTokens: 1024, timeoutMs: GEMINI_TIMEOUT_MS },
+  );
+}
+
+// Video requests carry two full clips — prompt processing takes far longer
+// than a single composite image, so they get their own (longer) timeout.
+const GEMINI_VIDEO_TIMEOUT_MS = Number(process.env.GEMINI_VIDEO_TIMEOUT_MS) || 240_000;
+
+/**
+ * VIDEO-SEGMENT verification: sends TWO full video clips (VIDEO 1 = segment
+ * cut from the reference movie, VIDEO 2 = segment cut from the target clip)
+ * plus the verification prompt in ONE request. Same dual-model quota
+ * manager, same rotation/429 handling, same null-on-failure contract.
+ */
+export async function geminiVerifySegmentClips(
+  movieClipB64: string,
+  shortClipB64: string,
+  prompt: string,
+): Promise<{ same: boolean; confidence: number } | null> {
+  return geminiGenerateVerdict(
+    [
+      { text: prompt },
+      { text: 'VIDEO 1 (segment cut from the reference movie):' },
+      { inline_data: { mime_type: 'video/mp4', data: movieClipB64 } },
+      { text: 'VIDEO 2 (segment cut from the target clip):' },
+      { inline_data: { mime_type: 'video/mp4', data: shortClipB64 } },
+    ],
+    { maxOutputTokens: 2048, timeoutMs: GEMINI_VIDEO_TIMEOUT_MS },
+  );
+}
+
+/**
+ * Generic quota-managed generateContent call. `parts` is the raw parts array
+ * (text / inline_data in any order). Returns the parsed verdict or null.
+ */
+async function geminiGenerateVerdict(
+  parts: any[],
+  opts: { maxOutputTokens: number; timeoutMs: number },
+): Promise<{ same: boolean; confidence: number } | null> {
   if (!geminiConfigured()) return null;
 
   const body = {
     contents: [
       {
-        parts: [
-          { inline_data: { mime_type: 'image/jpeg', data: compositeB64 } },
-          { text: prompt },
-        ],
+        parts,
       },
     ],
     generationConfig: {
       temperature: 0,
-      maxOutputTokens: 1024,
+      maxOutputTokens: opts.maxOutputTokens,
     },
   };
 
@@ -368,7 +409,7 @@ export async function geminiVerifyComposite(
       `${encodeURIComponent(modelName)}:generateContent`;
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
     try {
       rollDayIfNeeded(m);
       m.usedToday++;

@@ -32,6 +32,7 @@ import { MatchedSegment, matchVideosFromFiles } from './candidate-matching-engin
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
 import { pickVerificationFramePairs } from './vlm-segment-resolver';
 import { extractFrameAsBase64, verifySameSceneGeminiFirst, VLM_CONFIDENCE_THRESHOLD } from './vlm-verify';
+import { verifySegmentByVideo } from './segment-clip-verify';
 import {
   StoredCandidateSet,
   CandidateCheck,
@@ -149,19 +150,27 @@ async function checkCandidate(
 ): Promise<void> {
   const framePairs = pickVerificationFramePairs(candidate.segment);
   try {
-    const extracted = await Promise.all(
-      framePairs.map(async (p) => {
-        const [shortFrameB64, movieFrameB64] = await Promise.all([
-          extractFrameAsBase64(shortVideoPath, p.shortTime),
-          extractFrameAsBase64(movieVideoPath, p.movieTime),
-        ]);
-        return { shortFrameB64, movieFrameB64 };
-      }),
-    );
-    // Manual Retry is Gemini-first: verified by Gemini with the same
-    // rate-limit system as the main pass (10/min pacer, wait on per-minute
-    // 429s so the retry never dies mid-way, daily-limit flag for the UI).
-    const result = await verifySameSceneGeminiFirst(extracted);
+    // PRIMARY: full-video verification — the matched ranges are cut out of
+    // both videos and judged as complete clips (same Gemini rate-limit
+    // system as everywhere else). Legacy frame path only runs when no
+    // video verdict could be obtained.
+    let result = await verifySegmentByVideo(shortVideoPath, movieVideoPath, candidate.segment);
+
+    if (result === null) {
+      const extracted = await Promise.all(
+        framePairs.map(async (p) => {
+          const [shortFrameB64, movieFrameB64] = await Promise.all([
+            extractFrameAsBase64(shortVideoPath, p.shortTime),
+            extractFrameAsBase64(movieVideoPath, p.movieTime),
+          ]);
+          return { shortFrameB64, movieFrameB64 };
+        }),
+      );
+      // Manual Retry is Gemini-first: verified by Gemini with the same
+      // rate-limit system as the main pass (10/min pacer, wait on per-minute
+      // 429s so the retry never dies mid-way, daily-limit flag for the UI).
+      result = await verifySameSceneGeminiFirst(extracted);
+    }
     if (result === null) {
       candidate.checked = true;
       candidate.verdict = 'unverifiable';

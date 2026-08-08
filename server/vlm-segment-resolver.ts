@@ -17,6 +17,7 @@ import {
 import { embeddingGateCheck, EMBED_UNVERIFIABLE_KEEP_SIM } from './embedding-gate';
 import { sscdGateEnabled } from './sscd-verify-gate';
 import { geminiConfigured } from './gemini-vlm';
+import { verifySegmentByVideo } from './segment-clip-verify';
 
 // Fixed batch size for VLM server cache-reset points. Purely a cache-hygiene
 // boundary — does not change segment order, candidate selection, or verdicts.
@@ -190,10 +191,44 @@ export async function resolveSegmentsWithVLM(
       const framePairs = pickVerificationFramePairs(candidate);
 
       let verdict: VlmProgressInfo['verdict'] = 'unverifiable';
+
+      // ----------------------------------------------------------------
+      // PRIMARY: FULL-VIDEO verification. The matched time ranges are cut
+      // out of BOTH videos and sent to Gemini as two complete clips, so
+      // the verdict is judged on the whole motion/shot sequence/audio —
+      // not on isolated frames. Only when this yields no verdict at all
+      // (Gemini unconfigured / quota exhausted / cut failure) does the
+      // legacy frame-based path below run as a fallback.
+      // ----------------------------------------------------------------
+      const videoResult = await verifySegmentByVideo(shortVideoPath, movieVideoPath, candidate);
+      if (videoResult !== null) {
+        if (videoResult.same && videoResult.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
+          verdict = 'accepted';
+          accepted = candidate;
+          triedCandidates.push({ segment: triedCandidate, verdict: 'accepted', confidencePct: videoResult.confidencePct });
+          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          break;
+        }
+        verdict = 'rejected';
+        triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: videoResult.confidencePct });
+        onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+        // Rejected — fall through to the candidate-replacement logic below.
+        rejectedMovieTimestamps.push(candidate.movieStart);
+        const alternativesAfterVideo = getAlternateCandidatesForRange(
+          candidatePool,
+          original.shortStart,
+          original.shortEnd,
+          rejectedMovieTimestamps,
+        );
+        candidate = alternativesAfterVideo[0];
+        continue;
+      }
+
       try {
-        // Extract every needed frame in parallel (still one ffmpeg spawn per
-        // frame, all concurrent), then make ONE VLM call with all pairs —
-        // same request count per attempt as the old single-pair flow.
+        // FALLBACK (video verification unavailable): legacy frame-based
+        // flow. Extract every needed frame in parallel (still one ffmpeg
+        // spawn per frame, all concurrent), then make ONE VLM call with all
+        // pairs — same request count per attempt as the old single-pair flow.
         const extracted = await Promise.all(
           framePairs.map(async (p) => {
             const [shortFrameB64, movieFrameB64] = await Promise.all([
