@@ -70,10 +70,13 @@ export async function runDeferredRecoveryPass(
 
     let acceptedIdx: number | null = null;
 
-    // Only fresh, never-tried candidates need deferred verification —
-    // candidates the main pass already ran through VLM are history-only.
+    // Fresh, never-tried candidates need deferred verification. Candidates
+    // the main pass marked 'unverifiable' (Gemini quota exhausted / network
+    // failure — an infrastructure failure, NOT a content rejection) are ALSO
+    // re-checked here, since quota has often recovered by the time this
+    // deferred pass runs. Content-rejected candidates stay history-only.
     let uncheckedOrder = entry.candidates
-      .map((cand, i) => (cand.checked ? -1 : i))
+      .map((cand, i) => (!cand.checked || cand.verdict === 'unverifiable' ? i : -1))
       .filter(i => i !== -1);
 
     // Crop-robust embedding ranking (candidate system only): verify the

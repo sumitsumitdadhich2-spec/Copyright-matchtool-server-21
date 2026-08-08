@@ -147,10 +147,14 @@ def _load_models() -> None:
             urllib.request.urlretrieve(SSCD_WEIGHTS_URL, cache)
         m = torch.jit.load(cache, map_location=DEVICE)
         m.eval()
-        if USE_FP16:
-            m = m.half()
+        # BUG FIX (SSCD saturation): the SSCD TorchScript model must stay in
+        # fp32. Running it in fp16 (.half()) degrades/saturates its
+        # copy-detection features so badly that after L2 normalization EVERY
+        # image pair scores cosine ~1.000 — which made all candidate rankings
+        # degenerate (all sim=1.000, margin 0.000). fp32 on a T4 is still
+        # fast enough for this workload.
         _models["sscd"] = m
-        print("[gpu-embed] SSCD loaded")
+        print("[gpu-embed] SSCD loaded (fp32 — fp16 saturates SSCD features)")
     except Exception as e:  # noqa: BLE001
         print(f"[gpu-embed] SSCD load FAILED: {e}")
 
@@ -218,13 +222,18 @@ def _embed_images(images_b64: List[str], model_name: str) -> np.ndarray:
             raise RuntimeError("clip preprocess unavailable")
         tf = _clip_preprocess
 
+    # BUG FIX (SSCD saturation): SSCD runs in strict fp32 — no .half() inputs
+    # and no autocast — because fp16 saturates its features and every cosine
+    # similarity collapses to ~1.000 (degenerate ranking). DINO/CLIP keep fp16.
+    use_half = USE_FP16 and model_name != "sscd"
+
     outputs: List[np.ndarray] = []
     for start in range(0, len(images_b64), MAX_BATCH):
         chunk = images_b64[start : start + MAX_BATCH]
         tensors = torch.stack([tf(_decode_image(b)) for b in chunk]).to(DEVICE)
-        if USE_FP16:
+        if use_half:
             tensors = tensors.half()
-        with torch.autocast(device_type="cuda", enabled=USE_FP16):
+        with torch.autocast(device_type="cuda", enabled=use_half):
             if model_name == "clip":
                 feats = model.encode_image(tensors)
             else:

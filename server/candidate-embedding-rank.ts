@@ -510,6 +510,47 @@ async function scoreWithGpu(
 
   scored.sort((a, b) => b.score - a.score);
 
+  // ── Degenerate-saturation guard (BUG FIX) ────────────────────────────────
+  // When ALL candidates score ~identically at the ceiling (every sim >= 0.999
+  // within 1e-4 of each other) the SSCD ranking is meaningless — the top-2
+  // DINOv2 tie-break below would leave positions #3..N effectively random.
+  // Detect it loudly and re-rank the ENTIRE pool with DINOv2 instead.
+  const isDegenerate =
+    scored.length >= 2 &&
+    scored[0].score >= 0.999 &&
+    scored[0].score - scored[scored.length - 1].score < 1e-4;
+
+  if (isDegenerate) {
+    console.warn(
+      `[${label}] DEGENERATE EMBEDDING RANKING: all ${scored.length} SSCD scores saturated at ` +
+      `${scored[0].score.toFixed(6)} (spread ${(scored[0].score - scored[scored.length - 1].score).toFixed(6)}) — ` +
+      `SSCD cannot rank; re-ranking FULL pool with DINOv2. ` +
+      `(Check GPU service: SSCD embeddings may be degenerate — fp16 saturation or preprocessing bug.)`
+    );
+    const orderedPrepared = scored
+      .map((s) => prepared.find((p) => p.index === s.index))
+      .filter((p): p is PreparedCandidate => !!p);
+    const dinoAll = await gpuEmbedBatchScore(
+      orderedPrepared.map((p) => ({ short: p.shortB64, variants: p.movieVariants.map((v) => v.b64) })),
+      'dino',
+    );
+    if (dinoAll && dinoAll.length === orderedPrepared.length) {
+      const rescored: CandidateEmbedScore[] = orderedPrepared.map((p, i) => {
+        const r = dinoAll[i];
+        const bestIdx = Math.min(Math.max(0, r.best_index), p.movieVariants.length - 1);
+        return { index: p.index, score: r.max_sim, bestVariant: p.movieVariants[bestIdx].name };
+      });
+      rescored.sort((a, b) => b.score - a.score);
+      console.log(
+        `[${label}] DINOv2 full-pool re-rank: ` +
+        rescored.map((s) => `#${s.index} sim=${s.score.toFixed(4)}`).join(', '),
+      );
+      return rescored;
+    }
+    console.warn(`[${label}] DINOv2 full-pool re-rank unavailable — keeping (degenerate) SSCD order.`);
+    return scored;
+  }
+
   // ── DINOv2 tie-break when SSCD can't separate the top two ───────────────
   if (scored.length >= 2 && scored[0].score - scored[1].score < DINO_TIEBREAK_MARGIN) {
     const topTwo = [scored[0], scored[1]].map(
@@ -705,7 +746,7 @@ export async function rankCandidatesCropRobust(
   if (engine !== 'sscd-gpu') scored.sort((a, b) => b.score - a.score);
   console.log(
     `[${label}] engine=${engine} Crop-robust embedding ranking (${variants.length} variants): ` +
-    scored.map(s => `#${s.index} sim=${s.score.toFixed(3)} (${s.bestVariant})`).join(', ') +
+    scored.map(s => `#${s.index} sim=${s.score.toFixed(4)} (${s.bestVariant})`).join(', ') +
     (unscored.length ? ` | unscored kept last: ${unscored.join(', ')}` : ''),
   );
 

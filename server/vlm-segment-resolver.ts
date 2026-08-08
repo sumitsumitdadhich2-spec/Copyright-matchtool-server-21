@@ -25,6 +25,26 @@ const CANDIDATE_POOL_TARGET = Number(process.env.CANDIDATE_POOL_TARGET) || 10;
 // boundary — does not change segment order, candidate selection, or verdicts.
 const VLM_RESET_BATCH_SIZE = 48;
 
+/**
+ * Infrastructure-failure retry policy (BUG FIX): when Gemini yields no
+ * verdict (quota exhausted / network failure) or the segment cut/upload
+ * throws, the SAME candidate is retried with exponential backoff before
+ * giving up on it — and the loop then CONTINUES to the next ranked candidate
+ * instead of stopping. Infrastructure retries never consume the
+ * VLM_MAX_ATTEMPTS candidate budget (only content rejections do), and an
+ * unverified candidate is NEVER assigned as the segment's accepted answer.
+ */
+const VLM_INFRA_RETRIES = Number(process.env.VLM_INFRA_RETRIES) || 3;
+const VLM_INFRA_BACKOFF_MS: number[] = (process.env.VLM_INFRA_BACKOFF_MS || '2000,8000,30000')
+  .split(',')
+  .map((s) => Math.max(0, Number(s.trim()) || 0));
+
+function infraBackoffDelay(retry: number): number {
+  return VLM_INFRA_BACKOFF_MS[Math.min(retry, VLM_INFRA_BACKOFF_MS.length - 1)] ?? 2000;
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 export interface VlmProgressInfo {
   segmentIndex: number;
   totalSegments: number;
@@ -216,65 +236,97 @@ export async function resolveSegmentsWithVLM(
     // ------------------------------------------------------------------
     // VERIFICATION — Gemini only, in ranked order, up to VLM_MAX_ATTEMPTS.
     // ------------------------------------------------------------------
+    let sawUnverifiable = false;
+
     for (const candIdx of order) {
       if (attempt >= VLM_MAX_ATTEMPTS) break;
       const candidate = candidates[candIdx];
       attempt++;
 
-      let verdict: VlmProgressInfo['verdict'] = 'unverifiable';
-      try {
-        // Cut BOTH matched segments out of their source videos and send the
-        // two real clips to Gemini in one request — no still frames.
-        const result = await verifySegmentByVideo(
-          shortVideoPath,
-          movieVideoPath,
-          candidate,
-          `VLM seg${i}#${attempt}`,
-        );
-
-        if (result === null) {
-          // Gemini could not produce a verdict (quota exhausted / network
-          // failure) — infrastructure failure, not a content rejection.
-          // Keep the candidate as unverifiable rather than dropping it.
-          verdict = 'unverifiable';
-          accepted = candidate;
-          triedCandidates.push({ segment: candidate, verdict: 'unverifiable' });
-          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-          break;
-        } else if (result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
-          verdict = 'accepted';
-          accepted = candidate;
-          triedCandidates.push({
-            segment: candidate,
-            verdict: 'accepted',
-            confidencePct: result.confidencePct,
-            matchLikelihood: result.matchLikelihood,
-            evidence: result.evidence,
-          });
-          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-          break;
-        } else {
-          verdict = 'rejected';
-          triedCandidates.push({
-            segment: candidate,
-            verdict: 'rejected',
-            confidencePct: result.confidencePct,
-            matchLikelihood: result.matchLikelihood,
-            evidence: result.evidence,
-          });
-          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-          // Continue to the next ranked candidate.
+      // ----------------------------------------------------------------
+      // BUG FIX: infrastructure failures (Gemini no-verdict / cut-upload
+      // errors) retry the SAME candidate with backoff instead of stopping
+      // the whole loop. Retries do NOT consume the candidate budget
+      // (`attempt` is incremented once per candidate above). If all
+      // retries fail, the candidate is recorded as unverifiable and the
+      // loop CONTINUES to the next ranked candidate. An unverified
+      // candidate is never assigned to `accepted`.
+      // ----------------------------------------------------------------
+      let candidateDone = false;
+      for (let retry = 0; retry <= VLM_INFRA_RETRIES && !candidateDone; retry++) {
+        if (retry > 0) {
+          const delayMs = infraBackoffDelay(retry - 1);
+          console.log(
+            `[VLM] seg${i}#${attempt} retry ${retry}/${VLM_INFRA_RETRIES} after ${delayMs}ms backoff`
+          );
+          await sleep(delayMs);
         }
-      } catch (err: any) {
-        // Segment cut / upload failure — treat as unverifiable for this
-        // attempt rather than crashing the match.
-        console.warn(`[VLM] Segment verification failed for segment ${i}, attempt ${attempt}: ${err?.message || err}`);
-        verdict = 'unverifiable';
-        accepted = candidate;
-        triedCandidates.push({ segment: candidate, verdict: 'unverifiable' });
-        onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-        break;
+
+        let infraFailReason: string | null = null;
+        try {
+          // Cut BOTH matched segments out of their source videos and send
+          // the two real clips to Gemini in one request — no still frames.
+          const result = await verifySegmentByVideo(
+            shortVideoPath,
+            movieVideoPath,
+            candidate,
+            `VLM seg${i}#${attempt}${retry > 0 ? `r${retry}` : ''}`,
+          );
+
+          if (result === null) {
+            // Gemini could not produce a verdict (quota exhausted /
+            // network failure / malformed response) — infrastructure
+            // failure, not a content rejection.
+            infraFailReason = 'no-verdict (quota/network/malformed)';
+          } else if (result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
+            accepted = candidate;
+            triedCandidates.push({
+              segment: candidate,
+              verdict: 'accepted',
+              confidencePct: result.confidencePct,
+              matchLikelihood: result.matchLikelihood,
+              evidence: result.evidence,
+            });
+            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'accepted' });
+            candidateDone = true;
+          } else {
+            triedCandidates.push({
+              segment: candidate,
+              verdict: 'rejected',
+              confidencePct: result.confidencePct,
+              matchLikelihood: result.matchLikelihood,
+              evidence: result.evidence,
+            });
+            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'rejected' });
+            candidateDone = true; // content rejection — move to next candidate
+          }
+        } catch (err: any) {
+          // Segment cut / upload failure — infrastructure failure for this
+          // attempt, not a content rejection.
+          infraFailReason = `cut/upload failure: ${err?.message || err}`;
+        }
+
+        if (infraFailReason !== null && !candidateDone) {
+          if (retry < VLM_INFRA_RETRIES) {
+            console.warn(
+              `[VLM] seg${i}#${attempt} infrastructure failure (${infraFailReason}) — will retry same candidate`
+            );
+          } else {
+            // Retries exhausted for THIS candidate only: record it as
+            // unverifiable and continue to the next ranked candidate.
+            console.warn(
+              `[VLM] seg${i}#${attempt} unverifiable after ${VLM_INFRA_RETRIES} retries (${infraFailReason}) — ` +
+              `moving on to next candidate`
+            );
+            sawUnverifiable = true;
+            triedCandidates.push({ segment: candidate, verdict: 'unverifiable' });
+            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'unverifiable' });
+            candidateDone = true;
+          }
+        }
       }
+
+      if (accepted) break;
     }
 
     if (accepted) {
@@ -282,7 +334,10 @@ export async function resolveSegmentsWithVLM(
     } else {
       console.log(
         `[VLM] No genuine match found after ${attempt} attempt(s) for short-clip range ` +
-        `[${original.shortStart.toFixed(2)}s–${original.shortEnd.toFixed(2)}s] — dropping.`
+        `[${original.shortStart.toFixed(2)}s–${original.shortEnd.toFixed(2)}s]` +
+        (sawUnverifiable
+          ? ' (some candidates unverifiable — eligible for deferred recovery) — dropping from main pass.'
+          : ' — dropping.')
       );
       onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'dropped' });
     }
