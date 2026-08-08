@@ -30,8 +30,7 @@ import * as path from 'path';
 import * as readline from 'readline';
 import { MatchedSegment, matchVideosFromFiles } from './candidate-matching-engine';
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
-import { pickVerificationFramePairs } from './vlm-segment-resolver';
-import { extractFrameAsBase64, verifySameSceneGeminiFirst, VLM_CONFIDENCE_THRESHOLD } from './vlm-verify';
+import { verifySegmentByVideo, VLM_CONFIDENCE_THRESHOLD, VLM_MAX_ATTEMPTS } from './vlm-verify';
 import {
   StoredCandidateSet,
   CandidateCheck,
@@ -56,11 +55,51 @@ const BROADER_SEARCH_PAD_SECONDS = 1.5;
  *  treat two movie timestamps as "the same location". */
 const SAME_LOCATION_TOLERANCE = 0.5;
 
+/**
+ * Hard cap on Gemini verifications a SINGLE Retry click may spend, across as
+ * many broader-search rounds as it takes. Once spent without a genuine accept,
+ * the best-so-far candidate is accepted as a fallback; clicking Retry again
+ * starts a fresh budget and keeps hunting for NEW candidates.
+ */
+const RETRY_MAX_ATTEMPTS = Number(process.env.RETRY_MAX_ATTEMPTS) || VLM_MAX_ATTEMPTS;
+
+/**
+ * Each broader-search round widens the net a little more, so repeat Retry
+ * clicks surface genuinely new movie locations instead of rediscovering the
+ * same ones. Round 0 uses the base values above.
+ */
+function broaderSearchParamsForRound(round: number): {
+  minSimilarity: number;
+  minConsecutiveFrames: number;
+  frameDrift: number;
+  padSeconds: number;
+} {
+  const step = Math.max(0, round);
+  return {
+    // Floor at 20 — below that the engine returns mostly noise.
+    minSimilarity: Math.max(20, BROADER_SEARCH_MIN_SIMILARITY - step * 5),
+    minConsecutiveFrames: Math.max(2, BROADER_SEARCH_MIN_CONSECUTIVE_FRAMES - (step > 0 ? 1 : 0)),
+    frameDrift: Math.min(24, BROADER_SEARCH_FRAME_DRIFT + step * 4),
+    padSeconds: Math.min(6, BROADER_SEARCH_PAD_SECONDS + step * 0.75),
+  };
+}
+
 export interface RetrySegmentResult {
-  outcome: 'accepted' | 'exhausted';
+  /**
+   *  accepted    — Gemini genuinely confirmed a candidate.
+   *  best_effort — attempts ran out, so the highest-match-likelihood candidate
+   *                checked so far was accepted as a fallback.
+   *  exhausted   — nothing to accept at all (no candidate ever produced a
+   *                usable Gemini score).
+   */
+  outcome: 'accepted' | 'best_effort' | 'exhausted';
   mode: 'unchecked_pool' | 'broader_search';
   acceptedCandidateIndex?: number;
   newCandidatesAdded: number;
+  /** Gemini verifications this click actually spent (<= RETRY_MAX_ATTEMPTS). */
+  attemptsUsed: number;
+  /** Broader-search rounds this click ran. */
+  searchRounds: number;
 }
 
 /**
@@ -108,18 +147,20 @@ async function runBroaderSearch(
   entry: StoredCandidateSet,
   shortResultPath: string,
   movieResultPath: string,
+  round: number,
 ): Promise<MatchedSegment[]> {
-  const rangeStart = Math.max(0, entry.shortStart - BROADER_SEARCH_PAD_SECONDS);
-  const rangeEnd = entry.shortEnd + BROADER_SEARCH_PAD_SECONDS;
+  const params = broaderSearchParamsForRound(round);
+  const rangeStart = Math.max(0, entry.shortStart - params.padSeconds);
+  const rangeEnd = entry.shortEnd + params.padSeconds;
 
   const tempShortPath = await writeFilteredShortFingerprint(shortResultPath, rangeStart, rangeEnd);
   if (!tempShortPath) return [];
 
   try {
     const result = await matchVideosFromFiles(tempShortPath, movieResultPath, {
-      minSimilarity: BROADER_SEARCH_MIN_SIMILARITY,
-      minConsecutiveFrames: BROADER_SEARCH_MIN_CONSECUTIVE_FRAMES,
-      frameDrift: BROADER_SEARCH_FRAME_DRIFT,
+      minSimilarity: params.minSimilarity,
+      minConsecutiveFrames: params.minConsecutiveFrames,
+      frameDrift: params.frameDrift,
     });
 
     const pool = [...(result.segments || []), ...(result.candidatePool || [])];

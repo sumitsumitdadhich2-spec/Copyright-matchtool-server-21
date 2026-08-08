@@ -24,6 +24,14 @@ export interface CandidateCheck {
   checked: boolean;
   verdict?: 'accepted' | 'rejected' | 'unverifiable';
   confidencePct?: number;
+  /**
+   * 0-100 "how likely is this a real match" score derived from Gemini's own
+   * confidence (see SegmentVerifyResult.matchLikelihood). Only used to pick
+   * the best-so-far fallback when retries run out — never a verdict.
+   */
+  matchLikelihood?: number;
+  /** Concrete shared/contradictory details Gemini cited for this candidate. */
+  evidence?: string[];
 }
 
 export interface StoredCandidateSet {
@@ -46,6 +54,20 @@ export interface StoredCandidateSet {
    * `candidates` list is comparison history only, not a to-do list.
    */
   dropped: boolean;
+  /**
+   * True when `recoveredCandidateIndex` was chosen as the BEST-SO-FAR fallback
+   * (highest Gemini-derived match likelihood) after a Retry burned all its
+   * attempts without a real accept — not because Gemini said "same".
+   * Cleared the moment a genuine accept supersedes it.
+   */
+  bestEffort?: boolean;
+  /**
+   * How many broader-search rounds this segment has already run. Each Retry
+   * click that exhausts the pool escalates the search width using this count,
+   * so repeat clicks surface genuinely NEW movie locations instead of
+   * rediscovering the same ones.
+   */
+  broaderSearchRounds?: number;
 }
 
 const CANDIDATES_MAX = 10;
@@ -96,6 +118,8 @@ export function buildCandidateHistoryEntry(
     segment: MatchedSegment;
     verdict: 'accepted' | 'rejected' | 'unverifiable';
     confidencePct?: number;
+    matchLikelihood?: number;
+    evidence?: string[];
   }>,
   accepted: MatchedSegment | null,
   candidatePool: MatchedSegment[] | undefined,
@@ -116,6 +140,8 @@ export function buildCandidateHistoryEntry(
       checked: true,
       verdict: t.verdict,
       confidencePct: t.confidencePct,
+      matchLikelihood: t.matchLikelihood,
+      evidence: t.evidence,
     })),
     ...extraCandidates.map(segment => ({ segment, checked: false })),
   ];

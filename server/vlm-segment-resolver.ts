@@ -6,8 +6,7 @@
 import type { MatchedSegment } from './matching-engine';
 import { getAlternateCandidatesForRange } from './matching-engine';
 import {
-  extractFrameAsBase64,
-  verifySameSceneChecked,
+  verifySegmentByVideo,
   VLM_CONFIDENCE_THRESHOLD,
   VLM_MAX_ATTEMPTS,
   VLM_CONCURRENCY,
@@ -110,6 +109,10 @@ export interface SegmentCandidateAttempt {
   verdict: 'accepted' | 'rejected' | 'unverifiable';
   /** Present whenever the VLM call itself returned a parsed result (accepted or rejected). */
   confidencePct?: number;
+  /** Gemini-derived 0-100 "is this a real match" score (see vlm-verify.ts). */
+  matchLikelihood?: number;
+  /** Concrete shared/contradictory details Gemini cited. */
+  evidence?: string[];
 }
 
 export interface SegmentResolvedInfo {
@@ -217,23 +220,17 @@ export async function resolveSegmentsWithVLM(
       if (attempt >= VLM_MAX_ATTEMPTS) break;
       const candidate = candidates[candIdx];
       attempt++;
-      const framePairs = pickVerificationFramePairs(candidate);
 
       let verdict: VlmProgressInfo['verdict'] = 'unverifiable';
       try {
-        // Extract every needed frame in parallel (still one ffmpeg spawn per
-        // frame, all concurrent), then make ONE Gemini call with all pairs.
-        const extracted = await Promise.all(
-          framePairs.map(async (p) => {
-            const [shortFrameB64, movieFrameB64] = await Promise.all([
-              extractFrameAsBase64(shortVideoPath, p.shortTime),
-              extractFrameAsBase64(movieVideoPath, p.movieTime),
-            ]);
-            return { shortFrameB64, movieFrameB64 };
-          }),
+        // Cut BOTH matched segments out of their source videos and send the
+        // two real clips to Gemini in one request — no still frames.
+        const result = await verifySegmentByVideo(
+          shortVideoPath,
+          movieVideoPath,
+          candidate,
+          `VLM seg${i}#${attempt}`,
         );
-
-        const result = await verifySameSceneChecked(extracted);
 
         if (result === null) {
           // Gemini could not produce a verdict (quota exhausted / network
@@ -247,19 +244,31 @@ export async function resolveSegmentsWithVLM(
         } else if (result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
           verdict = 'accepted';
           accepted = candidate;
-          triedCandidates.push({ segment: candidate, verdict: 'accepted', confidencePct: result.confidencePct });
+          triedCandidates.push({
+            segment: candidate,
+            verdict: 'accepted',
+            confidencePct: result.confidencePct,
+            matchLikelihood: result.matchLikelihood,
+            evidence: result.evidence,
+          });
           onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
           break;
         } else {
           verdict = 'rejected';
-          triedCandidates.push({ segment: candidate, verdict: 'rejected', confidencePct: result.confidencePct });
+          triedCandidates.push({
+            segment: candidate,
+            verdict: 'rejected',
+            confidencePct: result.confidencePct,
+            matchLikelihood: result.matchLikelihood,
+            evidence: result.evidence,
+          });
           onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
           // Continue to the next ranked candidate.
         }
       } catch (err: any) {
-        // Frame extraction failure (e.g. bad timestamp) — treat as
-        // unverifiable for this attempt rather than crashing the match.
-        console.warn(`[VLM] Frame extraction failed for segment ${i}, attempt ${attempt}: ${err?.message || err}`);
+        // Segment cut / upload failure — treat as unverifiable for this
+        // attempt rather than crashing the match.
+        console.warn(`[VLM] Segment verification failed for segment ${i}, attempt ${attempt}: ${err?.message || err}`);
         verdict = 'unverifiable';
         accepted = candidate;
         triedCandidates.push({ segment: candidate, verdict: 'unverifiable' });

@@ -33,6 +33,9 @@
  *  - GEMINI_DAILY_PROBE_INTERVAL_MS (default 10 min)
  */
 
+import * as fs from 'fs';
+import { Readable } from 'stream';
+
 export function geminiConfigured(): boolean {
   return !!process.env.GEMINI_API_KEY;
 }
@@ -273,30 +276,88 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export interface GeminiVerdict {
+  same: boolean;
+  confidence: number;
+  /** Concrete shared/contradictory details the model cited, when it supplied them. */
+  evidence?: string[];
+  /** The aligned time windows the model reported, when it supplied them. */
+  matchedTimeranges?: { short?: string; movie?: string } | null;
+}
+
+/**
+ * Collect every BALANCED top-level `{...}` substring in a blob of text.
+ * A brace-counting scan (rather than a regex) is required because the verdict
+ * JSON now contains NESTED objects/arrays (`matchedTimeranges`, `evidence`).
+ * Strings are tracked so braces inside quoted evidence text can't unbalance
+ * the scan.
+ */
+function balancedJsonObjects(text: string): string[] {
+  const found: string[] = [];
+  let depth = 0;
+  let startIdx = -1;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{') {
+      if (depth === 0) startIdx = i;
+      depth++;
+    } else if (ch === '}') {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0 && startIdx !== -1) {
+          found.push(text.slice(startIdx, i + 1));
+          startIdx = -1;
+        }
+      }
+    }
+  }
+  return found;
+}
+
 /**
  * Extract the FINAL JSON object containing a "same" field from model text.
- * The prompt allows reasoning before the JSON, so we scan for the last
- * matching object rather than requiring the whole response to be JSON.
+ * The prompt allows reasoning/evidence before the JSON, so we scan for the
+ * last balanced object that actually carries a verdict.
  */
-export function parseVerdictJson(
-  raw: string,
-): { same: boolean; confidence: number } | null {
+export function parseVerdictJson(raw: string): GeminiVerdict | null {
   if (!raw) return null;
   const cleaned = raw
     .trim()
     .replace(/```(?:json)?/gi, '')
     .trim();
 
-  const matches = cleaned.match(/\{[^{}]*"same"[^{}]*\}/g);
-  if (!matches || matches.length === 0) return null;
+  const matches = balancedJsonObjects(cleaned);
+  if (matches.length === 0) return null;
 
   for (let i = matches.length - 1; i >= 0; i--) {
     try {
       const parsed = JSON.parse(matches[i]);
-      if (typeof parsed.same === 'boolean' && typeof parsed.confidence === 'number') {
+      if (typeof parsed?.same === 'boolean' && typeof parsed?.confidence === 'number') {
+        const evidence = Array.isArray(parsed.evidence)
+          ? parsed.evidence.filter((e: unknown) => typeof e === 'string' && e.trim()).slice(0, 8)
+          : undefined;
+        const ranges =
+          parsed.matchedTimeranges && typeof parsed.matchedTimeranges === 'object'
+            ? {
+                short: typeof parsed.matchedTimeranges.short === 'string' ? parsed.matchedTimeranges.short : undefined,
+                movie: typeof parsed.matchedTimeranges.movie === 'string' ? parsed.matchedTimeranges.movie : undefined,
+              }
+            : null;
         return {
           same: parsed.same,
           confidence: Math.max(0, Math.min(100, parsed.confidence)),
+          evidence: evidence && evidence.length ? evidence : undefined,
+          matchedTimeranges: ranges,
         };
       }
     } catch {
@@ -316,30 +377,17 @@ function retryAfterMs(res: Response): number {
 }
 
 /**
- * Ask Gemini whether the composite image shows the same scene.
- * Rotates between the two lite models per the quota-manager rules.
- * Returns {same, confidence} or null (caller treats it as unverifiable).
+ * Send ONE generateContent request through the dual-model quota rotation and
+ * return the concatenated response text (or null when no answer could be
+ * obtained). This is the single shared transport for every Gemini call —
+ * video verification, plain-text probes, everything — so all of them get the
+ * same RPM pacing, per-minute 429 rotation, daily-quota parking and probing.
  */
-export async function geminiVerifyComposite(
-  compositeB64: string,
-  prompt: string,
-): Promise<{ same: boolean; confidence: number } | null> {
+async function generateContentWithRotation(
+  body: unknown,
+  timeoutMs: number,
+): Promise<string | null> {
   if (!geminiConfigured()) return null;
-
-  const body = {
-    contents: [
-      {
-        parts: [
-          { inline_data: { mime_type: 'image/jpeg', data: compositeB64 } },
-          { text: prompt },
-        ],
-      },
-    ],
-    generationConfig: {
-      temperature: 0,
-      maxOutputTokens: 1024,
-    },
-  };
 
   for (let attempt = 1; attempt <= GEMINI_429_MAX_RETRIES + 1; attempt++) {
     // -- Pick a model: normal rotation, or a probe when both daily-parked --
@@ -368,7 +416,7 @@ export async function geminiVerifyComposite(
       `${encodeURIComponent(modelName)}:generateContent`;
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       rollDayIfNeeded(m);
       m.usedToday++;
@@ -435,13 +483,7 @@ export async function geminiVerifyComposite(
       const raw: string = (json?.candidates?.[0]?.content?.parts || [])
         .map((p: any) => p?.text || '')
         .join('');
-
-      const verdict = parseVerdictJson(raw);
-      if (!verdict) {
-        console.warn(`[Gemini] Malformed/unparseable response — treating as unverifiable: ${String(raw).slice(0, 200)}`);
-        return null;
-      }
-      return verdict;
+      return raw;
     } catch (err: any) {
       const reason = err?.name === 'AbortError' ? 'timed out' : (err?.message || String(err));
       console.warn(`[Gemini] ${modelName} request failed (${reason}) — treating as unverifiable`);
@@ -453,4 +495,243 @@ export async function geminiVerifyComposite(
   }
   console.warn('[Gemini] Gave up after prolonged rate-limit waiting — treating as unverifiable');
   return null;
+}
+
+// ===========================================================================
+// FILES API — required for VIDEO input.
+//
+// Video segments are far too large for inline base64 (the inline request cap
+// is 20 MB total and we deliberately upload at the ORIGINAL resolution), so
+// each segment goes through the resumable Files API and is referenced by URI.
+// Uploads do NOT consume generateContent RPM/RPD quota, so they happen
+// outside the model-rotation loop; only the verification call itself is paced.
+// ===========================================================================
+
+const GEMINI_UPLOAD_TIMEOUT_MS =
+  Number(process.env.GEMINI_UPLOAD_TIMEOUT_MS) || 300_000;
+const GEMINI_VIDEO_TIMEOUT_MS =
+  Number(process.env.GEMINI_VIDEO_TIMEOUT_MS) || 300_000;
+/** How long to wait for an uploaded file to finish PROCESSING. */
+const GEMINI_FILE_ACTIVE_TIMEOUT_MS =
+  Number(process.env.GEMINI_FILE_ACTIVE_TIMEOUT_MS) || 240_000;
+const FILE_POLL_INTERVAL_MS = 2_000;
+
+interface GeminiFileRef {
+  /** Resource name, e.g. "files/abc123". */
+  name: string;
+  uri: string;
+  mimeType: string;
+}
+
+function apiKeyHeader(): Record<string, string> {
+  return { 'x-goog-api-key': process.env.GEMINI_API_KEY as string };
+}
+
+/** Poll a freshly-uploaded file until it reports ACTIVE (or fails/times out). */
+async function waitForFileActive(name: string): Promise<boolean> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/${name}`;
+  const deadline = Date.now() + GEMINI_FILE_ACTIVE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url, { headers: apiKeyHeader() });
+      if (!res.ok) return false;
+      const json: any = await res.json();
+      const state = json?.state || json?.file?.state;
+      if (state === 'ACTIVE') return true;
+      if (state === 'FAILED') {
+        console.warn(`[Gemini] Uploaded file ${name} failed processing`);
+        return false;
+      }
+    } catch {
+      // Transient — keep polling until the deadline.
+    }
+    await sleep(FILE_POLL_INTERVAL_MS);
+  }
+  console.warn(`[Gemini] Uploaded file ${name} never became ACTIVE within the timeout`);
+  return false;
+}
+
+/**
+ * Upload one local file via the resumable Files API. The body is STREAMED
+ * from disk so a large original-resolution segment never has to be held in
+ * RAM as a single buffer. Returns null on any failure.
+ */
+async function uploadFileToGemini(
+  filePath: string,
+  mimeType: string,
+  displayName: string,
+): Promise<GeminiFileRef | null> {
+  let size = 0;
+  try {
+    size = fs.statSync(filePath).size;
+  } catch {
+    return null;
+  }
+  if (size === 0) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GEMINI_UPLOAD_TIMEOUT_MS);
+  try {
+    const startRes = await fetch(
+      'https://generativelanguage.googleapis.com/upload/v1beta/files',
+      {
+        method: 'POST',
+        headers: {
+          ...apiKeyHeader(),
+          'Content-Type': 'application/json',
+          'X-Goog-Upload-Protocol': 'resumable',
+          'X-Goog-Upload-Command': 'start',
+          'X-Goog-Upload-Header-Content-Length': String(size),
+          'X-Goog-Upload-Header-Content-Type': mimeType,
+        },
+        body: JSON.stringify({ file: { display_name: displayName } }),
+        signal: controller.signal,
+      },
+    );
+    if (!startRes.ok) {
+      console.warn(`[Gemini] Upload start failed for ${displayName}: HTTP ${startRes.status}`);
+      return null;
+    }
+    const uploadUrl = startRes.headers.get('x-goog-upload-url');
+    if (!uploadUrl) {
+      console.warn(`[Gemini] Upload start for ${displayName} returned no upload URL`);
+      return null;
+    }
+
+    const stream = Readable.toWeb(fs.createReadStream(filePath)) as unknown as ReadableStream;
+    const upRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Length': String(size),
+        'X-Goog-Upload-Offset': '0',
+        'X-Goog-Upload-Command': 'upload, finalize',
+      },
+      body: stream,
+      // Required by undici when the request body is a stream.
+      duplex: 'half',
+      signal: controller.signal,
+    } as RequestInit & { duplex: 'half' });
+
+    if (!upRes.ok) {
+      console.warn(`[Gemini] Upload of ${displayName} failed: HTTP ${upRes.status}`);
+      return null;
+    }
+    const json: any = await upRes.json();
+    const file = json?.file;
+    if (!file?.uri || !file?.name) {
+      console.warn(`[Gemini] Upload of ${displayName} returned no file URI`);
+      return null;
+    }
+    if (file.state !== 'ACTIVE' && !(await waitForFileActive(file.name))) {
+      await deleteGeminiFile(file.name);
+      return null;
+    }
+    console.log(
+      `[Gemini] Uploaded ${displayName} (${(size / 1_048_576).toFixed(1)} MB) -> ${file.name}`
+    );
+    return { name: file.name, uri: file.uri, mimeType: file.mimeType || mimeType };
+  } catch (err: any) {
+    const reason = err?.name === 'AbortError' ? 'timed out' : (err?.message || String(err));
+    console.warn(`[Gemini] Upload of ${displayName} errored (${reason})`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Best-effort remote cleanup so uploads don't pile up against the storage cap. */
+async function deleteGeminiFile(name: string): Promise<void> {
+  try {
+    await fetch(`https://generativelanguage.googleapis.com/v1beta/${name}`, {
+      method: 'DELETE',
+      headers: apiKeyHeader(),
+    });
+  } catch {
+    // Files expire on their own after 48h — a failed delete is harmless.
+  }
+}
+
+/**
+ * THE verification call: upload BOTH cut segments and ask for a single verdict
+ * in ONE request — reference movie segment first (labeled VIDEO 1), target
+ * clip segment second (labeled VIDEO 2), then the task prompt.
+ *
+ * Returns null (never throws) when no verdict could be obtained, so the
+ * caller's "unverifiable" policy applies.
+ */
+export async function geminiVerifyVideoPair(
+  referenceSegmentPath: string,
+  targetSegmentPath: string,
+  video1Label: string,
+  video2Label: string,
+  prompt: string,
+): Promise<GeminiVerdict | null> {
+  if (!geminiConfigured()) return null;
+  // Don't burn an upload when there is no chance of a verdict anyway.
+  if (bothDailyExhausted()) {
+    console.warn('[Gemini] Both models daily-parked — skipping video upload, treating as unverifiable');
+    return null;
+  }
+
+  const [refFile, targetFile] = await Promise.all([
+    uploadFileToGemini(referenceSegmentPath, 'video/mp4', 'reference-segment'),
+    uploadFileToGemini(targetSegmentPath, 'video/mp4', 'target-segment'),
+  ]);
+
+  try {
+    if (!refFile || !targetFile) return null;
+
+    const body = {
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: video1Label },
+            { file_data: { mime_type: refFile.mimeType, file_uri: refFile.uri } },
+            { text: video2Label },
+            { file_data: { mime_type: targetFile.mimeType, file_uri: targetFile.uri } },
+            { text: prompt },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature: 0,
+        // Larger than the old image path: the prompt requires cited evidence
+        // before the JSON verdict.
+        maxOutputTokens: Number(process.env.GEMINI_VIDEO_MAX_TOKENS) || 2048,
+      },
+    };
+
+    const raw = await generateContentWithRotation(body, GEMINI_VIDEO_TIMEOUT_MS);
+    if (raw === null) return null;
+
+    const verdict = parseVerdictJson(raw);
+    if (!verdict) {
+      console.warn(
+        `[Gemini] Malformed/unparseable video verdict — treating as unverifiable: ${String(raw).slice(0, 300)}`
+      );
+      return null;
+    }
+    return verdict;
+  } finally {
+    await Promise.all([
+      refFile ? deleteGeminiFile(refFile.name) : Promise.resolve(),
+      targetFile ? deleteGeminiFile(targetFile.name) : Promise.resolve(),
+    ]);
+  }
+}
+
+/**
+ * Text-only verdict request. Used by the quota-rotation test script so it can
+ * exercise the exact same pacing/rotation transport without needing media.
+ */
+export async function geminiVerifyText(prompt: string): Promise<GeminiVerdict | null> {
+  const raw = await generateContentWithRotation(
+    {
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0, maxOutputTokens: 256 },
+    },
+    GEMINI_TIMEOUT_MS,
+  );
+  return raw === null ? null : parseVerdictJson(raw);
 }

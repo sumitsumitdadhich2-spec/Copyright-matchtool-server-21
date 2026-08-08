@@ -15,8 +15,7 @@
  */
 import { MatchedSegment } from './candidate-matching-engine';
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
-import { pickVerificationFramePairs } from './vlm-segment-resolver';
-import { extractFrameAsBase64, verifySameSceneChecked, VLM_CONFIDENCE_THRESHOLD, VLM_CONCURRENCY } from './vlm-verify';
+import { verifySegmentByVideo, VLM_CONFIDENCE_THRESHOLD, VLM_CONCURRENCY } from './vlm-verify';
 import {
   listCandidateFilesForJob,
   readCandidatesFile,
@@ -94,22 +93,17 @@ export async function runDeferredRecoveryPass(
 
     for (const c of uncheckedOrder) {
       const candidateEntry = entry.candidates[c];
-      const framePairs = pickVerificationFramePairs(candidateEntry.segment);
 
       let verdict: DeferredRecoveryProgress['verdict'] = 'unverifiable';
       try {
-        const extracted = await Promise.all(
-          framePairs.map(async (p) => {
-            const [shortFrameB64, movieFrameB64] = await Promise.all([
-              extractFrameAsBase64(shortVideoPath, p.shortTime),
-              extractFrameAsBase64(movieVideoPath, p.movieTime),
-            ]);
-            return { shortFrameB64, movieFrameB64 };
-          }),
+        // Both matched segments are cut out of their source videos and sent to
+        // Gemini as real video clips in one request — no still frames.
+        const result = await verifySegmentByVideo(
+          shortVideoPath,
+          movieVideoPath,
+          candidateEntry.segment,
+          `DeferredRecovery seg${segmentIndex}#${c + 1}`,
         );
-        // Accept-side self-consistency re-check included: a recovered
-        // candidate is accepted only if the swapped-order re-check agrees.
-        const result = await verifySameSceneChecked(extracted);
 
         if (result === null) {
           candidateEntry.checked = true;
@@ -119,16 +113,20 @@ export async function runDeferredRecoveryPass(
           candidateEntry.checked = true;
           candidateEntry.verdict = 'accepted';
           candidateEntry.confidencePct = result.confidencePct;
+          candidateEntry.matchLikelihood = result.matchLikelihood;
+          candidateEntry.evidence = result.evidence;
           verdict = 'accepted';
           acceptedIdx = c;
         } else {
           candidateEntry.checked = true;
           candidateEntry.verdict = 'rejected';
           candidateEntry.confidencePct = result.confidencePct;
+          candidateEntry.matchLikelihood = result.matchLikelihood;
+          candidateEntry.evidence = result.evidence;
           verdict = 'rejected';
         }
       } catch (err: any) {
-        console.warn(`[DeferredRecovery] Frame extraction failed for match ${matchJobId} segment ${segmentIndex} candidate ${c}: ${err?.message || err}`);
+        console.warn(`[DeferredRecovery] Segment verification failed for match ${matchJobId} segment ${segmentIndex} candidate ${c}: ${err?.message || err}`);
         candidateEntry.checked = true;
         candidateEntry.verdict = 'unverifiable';
         verdict = 'unverifiable';
