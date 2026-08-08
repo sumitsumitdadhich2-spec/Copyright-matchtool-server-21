@@ -1,124 +1,261 @@
 /**
- * Gemini Flash provider for last-pass VLM verification (Task 2).
+ * Gemini Flash provider for last-pass VLM verification — DUAL-MODEL
+ * QUOTA MANAGER edition.
  *
- * Primary VLM when GEMINI_API_KEY is set; the Qwen endpoint
- * (VLM_ENDPOINT_URL) remains as automatic fallback. This module is
- * COMPLETELY inert when GEMINI_API_KEY is not set — geminiConfigured()
- * returns false and nothing here is ever called, so the app behaves exactly
- * as it did before this file existed.
+ * Two free-tier models, each with its OWN independent quota pool:
+ *   PRIMARY : gemini-flash-lite-latest (3.5 flash-lite) — 500 RPD, 15 RPM
+ *   FALLBACK: gemini-3.1-flash-lite                     — 500 RPD, 15 RPM
  *
- * Contracts:
- *  - Every failure path (HTTP error, timeout, 429 after retry, malformed
- *    JSON) returns null — NEVER throws. The caller then falls back to Qwen.
- *  - 429 handling: exactly ONE retry with backoff (honoring Retry-After when
- *    present, capped), then null so the Qwen fallback kicks in immediately.
- *  - Free-tier awareness: a simple in-memory per-day request counter logs a
- *    warning when usage passes GEMINI_DAILY_WARN (default 200) — it never
- *    hard-blocks requests (per spec).
+ * Rotation rules (zero-wait design):
+ *   1. Always prefer PRIMARY when its per-minute window has room.
+ *   2. PRIMARY RPM full  -> INSTANTLY switch to FALLBACK (no waiting).
+ *   3. FALLBACK RPM full -> switch back to PRIMARY the moment its window
+ *      frees up. Only when BOTH windows are full do we wait — and only for
+ *      the shortest time until either window opens (~30 req/min effective).
+ *   4. RPD hit (daily 429) on a model -> that model is parked until
+ *      midnight PACIFIC TIME; the other model keeps working alone.
+ *   5. BOTH models daily-exhausted -> dailyLimitReached flag for the UI
+ *      ("Gemini key limit over — new API key needed") + periodic re-probe
+ *      to detect the midnight-PT reset automatically.
+ *
+ * Contracts (unchanged from the single-model version):
+ *  - Every failure path returns null — NEVER throws. Caller falls back to
+ *    Qwen.
+ *  - Module is completely inert without GEMINI_API_KEY.
  *
  * Env vars:
- *  - GEMINI_API_KEY   (required for this provider to activate)
- *  - GEMINI_MODEL     (default "gemini-3.6-flash" — newest free-tier Flash
- *                      as of Aug 2026; gemini-2.5-flash retires Oct 2026.
- *                      "gemini-flash-latest" alias also works.)
- *  - GEMINI_TIMEOUT_MS   (default 60000)
- *  - GEMINI_DAILY_WARN   (default 200 — warn-only soft limit)
+ *  - GEMINI_API_KEY          (required to activate)
+ *  - GEMINI_MODEL_PRIMARY    (default "gemini-flash-lite-latest" = 3.5 lite)
+ *  - GEMINI_MODEL_FALLBACK   (default "gemini-3.1-flash-lite")
+ *  - GEMINI_RPM              (default 15  — per model)
+ *  - GEMINI_RPD              (default 500 — per model)
+ *  - GEMINI_TIMEOUT_MS       (default 60000)
+ *  - GEMINI_DAILY_PROBE_INTERVAL_MS (default 10 min)
  */
 
 export function geminiConfigured(): boolean {
   return !!process.env.GEMINI_API_KEY;
 }
 
-function geminiModel(): string {
-  return process.env.GEMINI_MODEL || 'gemini-3.6-flash';
-}
-
 const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS) || 60_000;
-const GEMINI_DAILY_WARN = Number(process.env.GEMINI_DAILY_WARN) || 200;
 const GEMINI_429_RETRY_DELAY_MS = 4_000;
 const GEMINI_429_RETRY_DELAY_MAX_MS = 65_000;
-// Free tier: ~10 requests/minute. The pacer below keeps us under this so we
-// rarely hit a 429 at all; when we do, we WAIT and retry (never abandon the
-// segment) until either the per-minute window frees up or the DAILY quota is
-// confirmed exhausted.
-const GEMINI_RPM = Number(process.env.GEMINI_RPM) || 10;
-// How often to re-probe Gemini after the daily quota looked exhausted
-// ("keep checking whether the limit came back").
+// Per model. Free tier lite models: 15 RPM / 500 RPD each.
+const GEMINI_RPM = Number(process.env.GEMINI_RPM) || 15;
+const GEMINI_RPD = Number(process.env.GEMINI_RPD) || 500;
+// How often to re-probe after BOTH daily quotas looked exhausted.
 const GEMINI_DAILY_PROBE_INTERVAL_MS =
   Number(process.env.GEMINI_DAILY_PROBE_INTERVAL_MS) || 10 * 60_000;
-// Per-minute 429s are retried indefinitely in spirit; this cap only guards
-// against a truly stuck endpoint (~30 min of waiting per request).
+// Retry cap guards against a truly stuck endpoint, not normal pacing.
 const GEMINI_429_MAX_RETRIES = Number(process.env.GEMINI_429_MAX_RETRIES) || 30;
 
-// ---------------------------------------------------------------------------
-// Sliding-window RPM pacer. Every real HTTP request must first take a slot;
-// if GEMINI_RPM requests already went out in the last 60s, the caller waits
-// (queued, FIFO) until the oldest one ages out. This keeps a big batch of
-// segments flowing at a steady 10/min instead of blasting the API and dying.
-// ---------------------------------------------------------------------------
-const requestTimestamps: number[] = [];
-let pacerChain: Promise<void> = Promise.resolve();
-
-function takeRpmSlot(): Promise<void> {
-  const waitTurn = pacerChain.then(async () => {
-    for (;;) {
-      const now = Date.now();
-      while (requestTimestamps.length && now - requestTimestamps[0] >= 60_000) {
-        requestTimestamps.shift();
-      }
-      if (requestTimestamps.length < GEMINI_RPM) {
-        requestTimestamps.push(Date.now());
-        return;
-      }
-      const waitMs = 60_000 - (now - requestTimestamps[0]) + 250;
-      await sleep(Math.max(250, waitMs));
-    }
-  });
-  // Serialize slot acquisition so queued callers proceed FIFO.
-  pacerChain = waitTurn.catch(() => {});
-  return waitTurn;
+function primaryModelName(): string {
+  return process.env.GEMINI_MODEL_PRIMARY || process.env.GEMINI_MODEL || 'gemini-flash-lite-latest';
+}
+function fallbackModelName(): string {
+  return process.env.GEMINI_MODEL_FALLBACK || 'gemini-3.1-flash-lite';
 }
 
 // ---------------------------------------------------------------------------
-// Daily-quota state — exposed to the app via getGeminiStatus() so the UI can
-// show "daily limit over — bring a new API key". After the daily quota looks
-// exhausted we stop hammering the API, but re-probe every
-// GEMINI_DAILY_PROBE_INTERVAL_MS to detect when the quota resets.
+// Pacific-time day key — free-tier daily quotas reset at midnight PT.
 // ---------------------------------------------------------------------------
-let dailyLimitReached = false;
-let dailyLimitSince = 0;
-let lastDailyProbeAt = 0;
+function pacificDay(): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date());
+}
+
+// ---------------------------------------------------------------------------
+// Per-model quota state
+// ---------------------------------------------------------------------------
+interface ModelState {
+  name: () => string;
+  /** Sliding-window timestamps of requests sent in the last 60s. */
+  window: number[];
+  /** Requests sent today (Pacific day). */
+  usedToday: number;
+  /** Pacific day the counters belong to. */
+  day: string;
+  /** Daily quota confirmed exhausted (429 PerDay) — parked till midnight PT. */
+  dailyExhausted: boolean;
+  dailyExhaustedSince: number;
+  /** Per-minute 429 server-imposed cooldown (honors retryDelay). */
+  cooldownUntil: number;
+}
+
+function freshState(name: () => string): ModelState {
+  return {
+    name,
+    window: [],
+    usedToday: 0,
+    day: pacificDay(),
+    dailyExhausted: false,
+    dailyExhaustedSince: 0,
+    cooldownUntil: 0,
+  };
+}
+
+const primary = freshState(primaryModelName);
+const fallback = freshState(fallbackModelName);
+const MODELS: ModelState[] = [primary, fallback];
+
+function rollDayIfNeeded(m: ModelState): void {
+  const today = pacificDay();
+  if (today !== m.day) {
+    m.day = today;
+    m.usedToday = 0;
+    m.dailyExhausted = false;
+    m.dailyExhaustedSince = 0;
+    m.cooldownUntil = 0;
+    m.window.length = 0;
+  }
+}
+
+function pruneWindow(m: ModelState, now: number): void {
+  while (m.window.length && now - m.window[0] >= 60_000) m.window.shift();
+}
+
+/** Model can take a request RIGHT NOW (no waiting)? */
+function slotFree(m: ModelState, now: number): boolean {
+  rollDayIfNeeded(m);
+  if (m.dailyExhausted) return false;
+  if (m.usedToday >= GEMINI_RPD) {
+    // Local counter says the daily pool is gone — park it proactively so we
+    // don't burn a request just to receive the 429.
+    m.dailyExhausted = true;
+    m.dailyExhaustedSince = m.dailyExhaustedSince || now;
+    return false;
+  }
+  if (now < m.cooldownUntil) return false;
+  pruneWindow(m, now);
+  return m.window.length < GEMINI_RPM;
+}
+
+/** ms until this model could take a request (Infinity if daily-parked). */
+function msUntilFree(m: ModelState, now: number): number {
+  rollDayIfNeeded(m);
+  if (m.dailyExhausted || m.usedToday >= GEMINI_RPD) return Infinity;
+  pruneWindow(m, now);
+  const cooldownWait = Math.max(0, m.cooldownUntil - now);
+  const rpmWait = m.window.length < GEMINI_RPM
+    ? 0
+    : 60_000 - (now - m.window[0]) + 250;
+  return Math.max(cooldownWait, rpmWait);
+}
+
+function bothDailyExhausted(): boolean {
+  MODELS.forEach(rollDayIfNeeded);
+  return MODELS.every(m => m.dailyExhausted || m.usedToday >= GEMINI_RPD);
+}
+
+// ---------------------------------------------------------------------------
+// FIFO slot acquisition — serialized so queued callers proceed in order.
+// Returns the ModelState whose slot was taken, or null when BOTH models are
+// daily-exhausted (probe handling happens in the caller).
+// ---------------------------------------------------------------------------
+let pacerChain: Promise<unknown> = Promise.resolve();
 let rateLimitWaiting = false;
+let lastUsedModel = '';
+
+function acquireSlot(): Promise<ModelState | null> {
+  const turn = pacerChain.then(async (): Promise<ModelState | null> => {
+    for (;;) {
+      const now = Date.now();
+      if (bothDailyExhausted()) return null;
+
+      // Rule 1-2: primary first, instant switch to fallback on RPM hit.
+      if (slotFree(primary, now)) {
+        primary.window.push(now);
+        return primary;
+      }
+      if (slotFree(fallback, now)) {
+        if (lastUsedModel !== fallback.name()) {
+          console.log(
+            `[Gemini] ${primary.name()} RPM window full — instantly rotating to ` +
+            `${fallback.name()} (zero wait)`
+          );
+        }
+        fallback.window.push(now);
+        return fallback;
+      }
+
+      // Rule 3: both windows full — wait only the SHORTEST time.
+      const wait = Math.min(msUntilFree(primary, now), msUntilFree(fallback, now));
+      if (!isFinite(wait)) return null; // both got daily-parked meanwhile
+      rateLimitWaiting = true;
+      await sleep(Math.max(250, Math.min(wait, 61_000)));
+      rateLimitWaiting = false;
+    }
+  });
+  pacerChain = turn.catch(() => {});
+  return turn;
+}
+
+// ---------------------------------------------------------------------------
+// Both-exhausted probing — detect the midnight-PT reset (or a fresh key).
+// ---------------------------------------------------------------------------
+let lastDailyProbeAt = 0;
+
+/** When both models are parked, occasionally un-park one to probe. */
+function takeProbeModel(): ModelState | null {
+  const now = Date.now();
+  if (now - lastDailyProbeAt < GEMINI_DAILY_PROBE_INTERVAL_MS) return null;
+  lastDailyProbeAt = now;
+  console.warn('[Gemini] Both models daily-parked — sending a probe request to check if quota is back');
+  return primary;
+}
+
+// ---------------------------------------------------------------------------
+// Status for the UI
+// ---------------------------------------------------------------------------
+export interface GeminiModelStatus {
+  model: string;
+  usedToday: number;
+  rpdLimit: number;
+  remaining: number;
+  rpmLimit: number;
+  dailyLimitReached: boolean;
+}
 
 export interface GeminiStatus {
   configured: boolean;
+  /** Model currently being used (last request sent). */
   model: string;
   rpmLimit: number;
+  /** Combined requests today across both models. */
   usedToday: number;
+  /** True only when BOTH models' daily pools are gone. */
   dailyLimitReached: boolean;
   dailyLimitSince: number | null;
-  /** True while a request is parked waiting for the per-minute window. */
+  /** True while a request is parked waiting (both RPM windows full). */
   rateLimitWaiting: boolean;
+  /** Per-model breakdown for the quota display. */
+  models: GeminiModelStatus[];
 }
 
 export function getGeminiStatus(): GeminiStatus {
-  // Roll the day counter forward if needed so usedToday is fresh.
-  const today = new Date().toISOString().slice(0, 10);
-  if (today !== usageDay) {
-    usageDay = today;
-    usageCount = 0;
-    warnedThisDay = false;
-    dailyLimitReached = false;
-    dailyLimitSince = 0;
-  }
+  MODELS.forEach(rollDayIfNeeded);
+  const allGone = bothDailyExhausted();
+  const since = allGone
+    ? Math.max(primary.dailyExhaustedSince, fallback.dailyExhaustedSince) || Date.now()
+    : null;
   return {
     configured: geminiConfigured(),
-    model: geminiModel(),
+    model: lastUsedModel || primary.name(),
     rpmLimit: GEMINI_RPM,
-    usedToday: usageCount,
-    dailyLimitReached,
-    dailyLimitSince: dailyLimitReached ? dailyLimitSince : null,
+    usedToday: primary.usedToday + fallback.usedToday,
+    dailyLimitReached: allGone,
+    dailyLimitSince: since,
     rateLimitWaiting,
+    models: MODELS.map(m => ({
+      model: m.name(),
+      usedToday: m.usedToday,
+      rpdLimit: GEMINI_RPD,
+      remaining: Math.max(0, GEMINI_RPD - m.usedToday),
+      rpmLimit: GEMINI_RPM,
+      dailyLimitReached: m.dailyExhausted || m.usedToday >= GEMINI_RPD,
+    })),
   };
 }
 
@@ -130,32 +267,6 @@ export function getGeminiStatus(): GeminiStatus {
  */
 function is429Daily(bodyText: string): boolean {
   return /PerDay|per day|daily/i.test(bodyText);
-}
-
-// ---------------------------------------------------------------------------
-// In-memory daily usage counter (warn-only, resets on UTC day change or
-// process restart — good enough for free-tier awareness, per spec).
-// ---------------------------------------------------------------------------
-let usageDay = '';
-let usageCount = 0;
-let warnedThisDay = false;
-
-function trackUsage(): void {
-  const today = new Date().toISOString().slice(0, 10);
-  if (today !== usageDay) {
-    usageDay = today;
-    usageCount = 0;
-    warnedThisDay = false;
-  }
-  usageCount++;
-  if (usageCount > GEMINI_DAILY_WARN && !warnedThisDay) {
-    warnedThisDay = true;
-    console.warn(
-      `[Gemini] ${usageCount} requests today — past the soft daily warning ` +
-      `threshold (${GEMINI_DAILY_WARN}). Free-tier daily limits may kick in soon; ` +
-      `429s will automatically fall back to Qwen.`
-    );
-  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -206,6 +317,7 @@ function retryAfterMs(res: Response): number {
 
 /**
  * Ask Gemini whether the composite image shows the same scene.
+ * Rotates between the two lite models per the quota-manager rules.
  * Returns {same, confidence} or null (caller falls back to Qwen).
  */
 export async function geminiVerifyComposite(
@@ -213,11 +325,6 @@ export async function geminiVerifyComposite(
   prompt: string,
 ): Promise<{ same: boolean; confidence: number } | null> {
   if (!geminiConfigured()) return null;
-
-  const model = geminiModel();
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/` +
-    `${encodeURIComponent(model)}:generateContent`;
 
   const body = {
     contents: [
@@ -234,32 +341,37 @@ export async function geminiVerifyComposite(
     },
   };
 
-  // Daily quota already exhausted? Don't burn time on every segment — only
-  // send a probe request every GEMINI_DAILY_PROBE_INTERVAL_MS to detect the
-  // quota reset; everything in between falls back to Qwen instantly.
-  if (dailyLimitReached) {
-    const now = Date.now();
-    if (now - lastDailyProbeAt < GEMINI_DAILY_PROBE_INTERVAL_MS) {
-      return null;
-    }
-    lastDailyProbeAt = now;
-    console.warn('[Gemini] Daily limit flag set — sending a probe request to check if quota is back');
-  }
-
-  // Wait-and-retry loop: per-minute 429s NEVER abandon the segment — we wait
-  // for the window to free up and try again, so the pipeline keeps running
-  // in 10-request bursts until every segment is checked. Only a confirmed
-  // DAILY-quota 429 (or a non-429 failure) gives up on Gemini for this call.
   for (let attempt = 1; attempt <= GEMINI_429_MAX_RETRIES + 1; attempt++) {
-    // Pace ourselves under the free-tier RPM before every real request.
-    rateLimitWaiting = true;
-    await takeRpmSlot();
-    rateLimitWaiting = false;
+    // -- Pick a model: normal rotation, or a probe when both daily-parked --
+    let m: ModelState | null = null;
+    let isProbe = false;
+    if (bothDailyExhausted()) {
+      m = takeProbeModel();
+      isProbe = true;
+      if (!m) return null; // probe not due yet — instant Qwen fallback
+    } else {
+      rateLimitWaiting = true;
+      m = await acquireSlot();
+      rateLimitWaiting = false;
+      if (!m) {
+        // Both pools drained while we were queued — try a probe or bail.
+        m = takeProbeModel();
+        isProbe = true;
+        if (!m) return null;
+      }
+    }
+
+    const modelName = m.name();
+    lastUsedModel = modelName;
+    const url =
+      `https://generativelanguage.googleapis.com/v1beta/models/` +
+      `${encodeURIComponent(modelName)}:generateContent`;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
     try {
-      trackUsage();
+      rollDayIfNeeded(m);
+      m.usedToday++;
       const res = await fetch(url, {
         method: 'POST',
         headers: {
@@ -274,38 +386,48 @@ export async function geminiVerifyComposite(
         clearTimeout(timer);
         const bodyText = await res.text().catch(() => '');
         if (is429Daily(bodyText)) {
-          dailyLimitReached = true;
-          dailyLimitSince = dailyLimitSince || Date.now();
-          lastDailyProbeAt = Date.now();
+          // RPD hit — park THIS model till midnight PT; other model carries on.
+          m.dailyExhausted = true;
+          m.dailyExhaustedSince = m.dailyExhaustedSince || Date.now();
+          if (bothDailyExhausted()) {
+            lastDailyProbeAt = Date.now();
+            console.warn(
+              '[Gemini] BOTH models\' daily quotas exhausted — flagging the UI ' +
+              '("Gemini key limit over — new API key needed"), falling back to Qwen. ' +
+              `Re-probe every ${Math.round(GEMINI_DAILY_PROBE_INTERVAL_MS / 60000)} min.`
+            );
+            return null;
+          }
           console.warn(
-            '[Gemini] DAILY quota exhausted — flagging for the app UI ' +
-            '("daily limit over — new API key needed") and falling back to Qwen. ' +
-            `Will re-probe every ${Math.round(GEMINI_DAILY_PROBE_INTERVAL_MS / 60000)} min.`
+            `[Gemini] ${modelName} DAILY quota exhausted — parked till midnight PT, ` +
+            'rotating to the other model with its own fresh pool'
           );
-          return null;
+          continue; // instantly retry on the other model
         }
-        // Per-minute throttle: wait for the window and KEEP GOING.
+        // Per-minute throttle: cooldown THIS model, instantly rotate to the
+        // other one — zero waiting unless both are throttled.
         const delay = retryAfterMs(res);
+        m.cooldownUntil = Date.now() + delay;
         console.warn(
-          `[Gemini] 429 per-minute limit — waiting ${Math.round(delay / 1000)}s ` +
-          `then continuing (attempt ${attempt}/${GEMINI_429_MAX_RETRIES + 1}, work will not stop)`
+          `[Gemini] ${modelName} 429 per-minute — cooling it ${Math.round(delay / 1000)}s ` +
+          `and rotating models instantly (attempt ${attempt}/${GEMINI_429_MAX_RETRIES + 1})`
         );
-        rateLimitWaiting = true;
-        await sleep(delay);
-        rateLimitWaiting = false;
         continue;
       }
 
-      // Any successful (or at least non-429) response proves the daily quota
-      // is back — clear the flag so the UI warning goes away.
-      if (dailyLimitReached && res.ok) {
-        dailyLimitReached = false;
-        dailyLimitSince = 0;
-        console.warn('[Gemini] Probe succeeded — daily quota is back, resuming Gemini verification');
+      // A successful probe proves the daily quota reset — un-park everything.
+      if (isProbe && res.ok) {
+        MODELS.forEach(s => {
+          s.dailyExhausted = false;
+          s.dailyExhaustedSince = 0;
+          s.usedToday = 0;
+          s.day = pacificDay();
+        });
+        console.warn('[Gemini] Probe succeeded — daily quotas are back, resuming Gemini verification');
       }
 
       if (!res.ok) {
-        console.warn(`[Gemini] HTTP ${res.status} ${res.statusText} — falling back to Qwen`);
+        console.warn(`[Gemini] ${modelName} HTTP ${res.status} ${res.statusText} — falling back to Qwen`);
         return null;
       }
 
@@ -322,7 +444,7 @@ export async function geminiVerifyComposite(
       return verdict;
     } catch (err: any) {
       const reason = err?.name === 'AbortError' ? 'timed out' : (err?.message || String(err));
-      console.warn(`[Gemini] Request failed (${reason}) — falling back to Qwen`);
+      console.warn(`[Gemini] ${modelName} request failed (${reason}) — falling back to Qwen`);
       return null;
     } finally {
       clearTimeout(timer);

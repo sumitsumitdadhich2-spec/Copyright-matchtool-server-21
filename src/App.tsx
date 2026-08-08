@@ -404,10 +404,19 @@ export default function App() {
   // fresh API key.
   const [geminiQuota, setGeminiQuota] = useState<{
     configured: boolean;
+    model?: string;
     usedToday: number;
     rpmLimit: number;
     dailyLimitReached: boolean;
     rateLimitWaiting: boolean;
+    models?: {
+      model: string;
+      usedToday: number;
+      rpdLimit: number;
+      remaining: number;
+      rpmLimit: number;
+      dailyLimitReached: boolean;
+    }[];
   } | null>(null);
 
   // Status / error
@@ -2019,30 +2028,53 @@ export default function App() {
           {renderProgress(targetProgress, 'bg-indigo-500')}
         </section>
 
-        {/* ── Gemini daily-limit warning ── */}
+        {/* ── Gemini daily-limit warning (BOTH models exhausted) ── */}
         {geminiQuota?.dailyLimitReached && (
           <div className="bg-red-950/60 border border-red-500/40 rounded-xl p-3.5 text-sm text-red-200 flex items-start gap-3">
             <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
             <div className="space-y-1">
               <p className="font-semibold text-red-300">
-                Gemini daily limit over — nayi API key lekar aao
+                Gemini key limit over (day) — nayi API key lekar aao
               </p>
               <p className="text-xs text-red-200/80 leading-relaxed">
-                Aaj ki free-tier daily quota khatam ho gayi hai ({geminiQuota.usedToday} requests).
+                Dono models ki daily quota khatam ho gayi hai ({geminiQuota.usedToday} requests aaj).
                 Processing rukegi nahi — server har 10 minute mein check karta rahega ki limit
-                wapas aayi ya nahi, aur tab tak Qwen fallback se kaam chalega. Nayi key
-                Settings mein daal do to Gemini turant wapas chalu ho jayega.
+                wapas aayi ya nahi (midnight Pacific pe reset), aur tab tak Qwen fallback se kaam
+                chalega. Nayi key (alag Cloud project wali) Settings mein daal do to Gemini turant
+                wapas chalu ho jayega.
               </p>
             </div>
           </div>
         )}
 
-        {/* ── Gemini per-minute pacing indicator ── */}
+        {/* ── Gemini per-model quota display ── */}
+        {!geminiQuota?.dailyLimitReached && geminiQuota?.configured && geminiQuota.models && isMatching && (
+          <div className="bg-slate-900/70 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-slate-300 flex flex-wrap items-center gap-x-4 gap-y-1.5">
+            <span className="text-slate-500 font-medium">Gemini quota</span>
+            {geminiQuota.models.map(mq => (
+              <span key={mq.model} className="flex items-center gap-1.5">
+                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                  mq.dailyLimitReached
+                    ? 'bg-red-500'
+                    : geminiQuota.model === mq.model
+                      ? 'bg-green-400 animate-pulse'
+                      : 'bg-slate-600'
+                }`} />
+                <span className={mq.dailyLimitReached ? 'text-red-300 line-through' : ''}>
+                  {mq.model.replace('gemini-', '').replace('-latest', '')}: {mq.remaining}/{mq.rpdLimit} left
+                </span>
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* ── Gemini per-minute pacing indicator (both RPM windows full) ── */}
         {!geminiQuota?.dailyLimitReached && geminiQuota?.rateLimitWaiting && isMatching && (
           <div className="bg-amber-950/40 border border-amber-500/30 rounded-xl px-3.5 py-2.5 text-xs text-amber-200 flex items-center gap-2.5">
             <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
-            Gemini {geminiQuota.rpmLimit} req/min limit pe hai — agli window ka wait chal raha hai,
-            kaam nahi rukega ({geminiQuota.usedToday} requests aaj tak).
+            Dono models ka {geminiQuota.rpmLimit} req/min window full hai — shortest wait chal raha
+            hai, kaam nahi rukega ({geminiQuota.usedToday} requests aaj tak). RPM hit pe model
+            auto-rotate hota hai, isliye ye rarely dikhega.
           </div>
         )}
 
