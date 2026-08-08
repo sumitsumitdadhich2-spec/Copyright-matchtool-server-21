@@ -205,6 +205,32 @@ export interface SegmentVerifyResult {
 }
 
 /**
+ * Duration-based Gemini frame-sampling tiers (confirmed by controlled API
+ * testing): Gemini samples at 1 fps by default, which yields ZERO frames —
+ * and an HTTP 400 — for clips shorter than ~0.5s. Instead of padding the
+ * cuts, we raise video_metadata.fps for short segments only:
+ *   < 0.5s      -> 7 fps
+ *   0.5s to ~2s -> 3 fps
+ *   bigger      -> 1 fps (Gemini default — request shape unchanged)
+ */
+export function fpsForDuration(durationSeconds: number): number {
+  if (durationSeconds < 0.5) return 7;
+  if (durationSeconds <= 2.0) return 3;
+  return 1;
+}
+
+/**
+ * fps for a verification PAIR: both clips MUST be sampled at the SAME fps
+ * for a fair comparison, so the tier is picked from the SHORTER of the two
+ * durations — the short clip must never be under-sampled.
+ */
+export function fpsForSegmentPair(seg: VerifiableSegmentRange): number {
+  const shortDur = Math.max(0, seg.shortEnd - seg.shortStart);
+  const movieDur = Math.max(0, seg.movieEnd - seg.movieStart);
+  return fpsForDuration(Math.min(shortDur, movieDur));
+}
+
+/**
  * Cut both sides of a candidate out of their source videos and ask Gemini —
  * in ONE request — whether the target segment was copied from the reference
  * segment. Returns null when no verdict could be obtained (Gemini off/quota
@@ -233,12 +259,21 @@ export async function verifySegmentByVideo(
       return null;
     }
 
+    // Same fps on BOTH clips, tiered by the SHORTER duration in the pair —
+    // prevents the HTTP 400 zero-frame failure on sub-0.5s segments without
+    // touching the cut bounds (no padding).
+    const pairFps = fpsForSegmentPair(seg);
+    if (pairFps > 1) {
+      console.log(`[${logLabel}] Short-segment sampling: fps=${pairFps} applied to both clips`);
+    }
+
     const verdict = await geminiVerifyVideoPair(
       moviePart,
       shortPart,
       VIDEO_1_LABEL,
       VIDEO_2_LABEL,
       VIDEO_VERIFY_PROMPT,
+      pairFps,
     );
 
     if (!verdict) {

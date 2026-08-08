@@ -377,17 +377,27 @@ function retryAfterMs(res: Response): number {
 }
 
 /**
+ * Outcome of one rotation-managed generateContent call. Callers that only
+ * care about text can treat anything but `ok` as null; the video path uses
+ * `httpError` (status 400) to drive fps-escalation retries on short clips.
+ */
+type RotationOutcome =
+  | { kind: 'ok'; text: string }
+  | { kind: 'httpError'; status: number }
+  | { kind: 'unavailable' };
+
+/**
  * Send ONE generateContent request through the dual-model quota rotation and
- * return the concatenated response text (or null when no answer could be
- * obtained). This is the single shared transport for every Gemini call —
- * video verification, plain-text probes, everything — so all of them get the
- * same RPM pacing, per-minute 429 rotation, daily-quota parking and probing.
+ * return the outcome. This is the single shared transport for every Gemini
+ * call — video verification, plain-text probes, everything — so all of them
+ * get the same RPM pacing, per-minute 429 rotation, daily-quota parking and
+ * probing.
  */
 async function generateContentWithRotation(
   body: unknown,
   timeoutMs: number,
-): Promise<string | null> {
-  if (!geminiConfigured()) return null;
+): Promise<RotationOutcome> {
+  if (!geminiConfigured()) return { kind: 'unavailable' };
 
   for (let attempt = 1; attempt <= GEMINI_429_MAX_RETRIES + 1; attempt++) {
     // -- Pick a model: normal rotation, or a probe when both daily-parked --
@@ -396,7 +406,7 @@ async function generateContentWithRotation(
     if (bothDailyExhausted()) {
       m = takeProbeModel();
       isProbe = true;
-      if (!m) return null; // probe not due yet — no verdict possible right now
+      if (!m) return { kind: 'unavailable' }; // probe not due yet — no verdict possible right now
     } else {
       rateLimitWaiting = true;
       m = await acquireSlot();
@@ -405,7 +415,7 @@ async function generateContentWithRotation(
         // Both pools drained while we were queued — try a probe or bail.
         m = takeProbeModel();
         isProbe = true;
-        if (!m) return null;
+        if (!m) return { kind: 'unavailable' };
       }
     }
 
@@ -444,7 +454,7 @@ async function generateContentWithRotation(
               '("Gemini key limit over — new API key needed"), treating as unverifiable. ' +
               `Re-probe every ${Math.round(GEMINI_DAILY_PROBE_INTERVAL_MS / 60000)} min.`
             );
-            return null;
+            return { kind: 'unavailable' };
           }
           console.warn(
             `[Gemini] ${modelName} DAILY quota exhausted — parked till midnight PT, ` +
@@ -475,26 +485,26 @@ async function generateContentWithRotation(
       }
 
       if (!res.ok) {
-        console.warn(`[Gemini] ${modelName} HTTP ${res.status} ${res.statusText} — treating as unverifiable`);
-        return null;
+        console.warn(`[Gemini] ${modelName} HTTP ${res.status} ${res.statusText}`);
+        return { kind: 'httpError', status: res.status };
       }
 
       const json: any = await res.json();
       const raw: string = (json?.candidates?.[0]?.content?.parts || [])
         .map((p: any) => p?.text || '')
         .join('');
-      return raw;
+      return { kind: 'ok', text: raw };
     } catch (err: any) {
       const reason = err?.name === 'AbortError' ? 'timed out' : (err?.message || String(err));
       console.warn(`[Gemini] ${modelName} request failed (${reason}) — treating as unverifiable`);
-      return null;
+      return { kind: 'unavailable' };
     } finally {
       clearTimeout(timer);
       rateLimitWaiting = false;
     }
   }
   console.warn('[Gemini] Gave up after prolonged rate-limit waiting — treating as unverifiable');
-  return null;
+  return { kind: 'unavailable' };
 }
 
 // ===========================================================================
@@ -651,10 +661,33 @@ async function deleteGeminiFile(name: string): Promise<void> {
   }
 }
 
+/** Gemini's hard maximum for video_metadata.fps. NEVER exceed this. */
+export const GEMINI_MAX_FPS = 24;
+
+/**
+ * Build one video file part, attaching `video_metadata.fps` ONLY when the
+ * sampling rate differs from Gemini's 1 fps default — 3s+ segments keep the
+ * exact request shape (and token usage) they had before.
+ */
+function videoFilePart(file: GeminiFileRef, fps: number): Record<string, unknown> {
+  const part: Record<string, unknown> = {
+    file_data: { mime_type: file.mimeType, file_uri: file.uri },
+  };
+  if (fps > 1) part.video_metadata = { fps: Math.min(fps, GEMINI_MAX_FPS) };
+  return part;
+}
+
 /**
  * THE verification call: upload BOTH cut segments and ask for a single verdict
  * in ONE request — reference movie segment first (labeled VIDEO 1), target
  * clip segment second (labeled VIDEO 2), then the task prompt.
+ *
+ * `fps` sets the frame-sampling rate applied IDENTICALLY to both clips
+ * (Gemini defaults to 1 fps, which yields ZERO frames — and an HTTP 400 —
+ * for clips shorter than ~0.5s). If generateContent still returns HTTP 400
+ * INVALID_ARGUMENT, the fps is automatically escalated (doubled, capped at
+ * 24 — Gemini's max) and the SAME uploaded files are retried. Escalation
+ * happens ONLY on HTTP 400; 429/5xx keep the existing rotation behavior.
  *
  * Returns null (never throws) when no verdict could be obtained, so the
  * caller's "unverifiable" policy applies.
@@ -665,6 +698,7 @@ export async function geminiVerifyVideoPair(
   video1Label: string,
   video2Label: string,
   prompt: string,
+  fps = 1,
 ): Promise<GeminiVerdict | null> {
   if (!geminiConfigured()) return null;
   // Don't burn an upload when there is no chance of a verdict anyway.
@@ -681,38 +715,63 @@ export async function geminiVerifyVideoPair(
   try {
     if (!refFile || !targetFile) return null;
 
-    const body = {
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { text: video1Label },
-            { file_data: { mime_type: refFile.mimeType, file_uri: refFile.uri } },
-            { text: video2Label },
-            { file_data: { mime_type: targetFile.mimeType, file_uri: targetFile.uri } },
-            { text: prompt },
-          ],
+    let currentFps = Math.max(1, Math.min(Math.round(fps), GEMINI_MAX_FPS));
+
+    for (;;) {
+      const body = {
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: video1Label },
+              videoFilePart(refFile, currentFps),
+              { text: video2Label },
+              videoFilePart(targetFile, currentFps),
+              { text: prompt },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0,
+          // Larger than the old image path: the prompt requires cited evidence
+          // before the JSON verdict.
+          maxOutputTokens: Number(process.env.GEMINI_VIDEO_MAX_TOKENS) || 2048,
         },
-      ],
-      generationConfig: {
-        temperature: 0,
-        // Larger than the old image path: the prompt requires cited evidence
-        // before the JSON verdict.
-        maxOutputTokens: Number(process.env.GEMINI_VIDEO_MAX_TOKENS) || 2048,
-      },
-    };
+      };
 
-    const raw = await generateContentWithRotation(body, GEMINI_VIDEO_TIMEOUT_MS);
-    if (raw === null) return null;
+      const outcome = await generateContentWithRotation(body, GEMINI_VIDEO_TIMEOUT_MS);
 
-    const verdict = parseVerdictJson(raw);
-    if (!verdict) {
-      console.warn(
-        `[Gemini] Malformed/unparseable video verdict — treating as unverifiable: ${String(raw).slice(0, 300)}`
-      );
-      return null;
+      if (outcome.kind === 'httpError') {
+        // fps-escalation ONLY for HTTP 400 INVALID_ARGUMENT (too few sampled
+        // frames on ultra-short clips). Any other HTTP error stays unverifiable.
+        if (outcome.status === 400 && currentFps < GEMINI_MAX_FPS) {
+          const nextFps = Math.min(currentFps * 2, GEMINI_MAX_FPS);
+          console.warn(
+            `[Gemini] HTTP 400 at fps=${currentFps} — escalating both clips to ` +
+            `fps=${nextFps} and retrying (max ${GEMINI_MAX_FPS})`
+          );
+          currentFps = nextFps;
+          continue;
+        }
+        if (outcome.status === 400) {
+          console.warn(
+            `[Gemini] HTTP 400 persisted even at max fps=${GEMINI_MAX_FPS} — treating as unverifiable`
+          );
+        }
+        return null;
+      }
+
+      if (outcome.kind === 'unavailable') return null;
+
+      const verdict = parseVerdictJson(outcome.text);
+      if (!verdict) {
+        console.warn(
+          `[Gemini] Malformed/unparseable video verdict — treating as unverifiable: ${String(outcome.text).slice(0, 300)}`
+        );
+        return null;
+      }
+      return verdict;
     }
-    return verdict;
   } finally {
     await Promise.all([
       refFile ? deleteGeminiFile(refFile.name) : Promise.resolve(),
@@ -726,12 +785,12 @@ export async function geminiVerifyVideoPair(
  * exercise the exact same pacing/rotation transport without needing media.
  */
 export async function geminiVerifyText(prompt: string): Promise<GeminiVerdict | null> {
-  const raw = await generateContentWithRotation(
+  const outcome = await generateContentWithRotation(
     {
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       generationConfig: { temperature: 0, maxOutputTokens: 256 },
     },
     GEMINI_TIMEOUT_MS,
   );
-  return raw === null ? null : parseVerdictJson(raw);
+  return outcome.kind === 'ok' ? parseVerdictJson(outcome.text) : null;
 }
