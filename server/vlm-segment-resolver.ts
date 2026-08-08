@@ -1,26 +1,22 @@
 /**
- * Retry/replace loop that gates matched segments through VLM scene
+ * Retry/replace loop that gates matched segments through GEMINI scene
  * verification. Runs strictly AFTER groundMatchedSegments() has already
  * produced its candidates — it never touches hash-matching speed or accuracy.
+ *
+ * Gemini is the ONLY decision-maker here. The SSCD/embedding systems are
+ * used exclusively by the candidate system (candidate discovery + crop-robust
+ * ranking of the 10-candidate pool) — they never accept or reject a segment.
  */
 import type { MatchedSegment } from './matching-engine';
 import { getAlternateCandidatesForRange } from './matching-engine';
 import {
   extractFrameAsBase64,
   verifySameSceneChecked,
-  isVlmAvailable,
-  resetVlmCache,
   VLM_CONFIDENCE_THRESHOLD,
   VLM_MAX_ATTEMPTS,
   VLM_CONCURRENCY,
 } from './vlm-verify';
-import { embeddingGateCheck, EMBED_UNVERIFIABLE_KEEP_SIM } from './embedding-gate';
-import { sscdGateEnabled } from './sscd-verify-gate';
 import { geminiConfigured } from './gemini-vlm';
-
-// Fixed batch size for VLM server cache-reset points. Purely a cache-hygiene
-// boundary — does not change segment order, candidate selection, or verdicts.
-const VLM_RESET_BATCH_SIZE = 48;
 
 export interface VlmProgressInfo {
   segmentIndex: number;
@@ -137,31 +133,17 @@ export async function resolveSegmentsWithVLM(
   if (segments.length === 0) return segments;
 
   // ------------------------------------------------------------------------
-  // Provider availability: verification must proceed if ANY configured
-  // provider can handle it — not just the legacy Qwen endpoint. The routing
-  // inside verifySameSceneChecked (SSCD gate -> Gemini composite -> legacy
-  // Qwen) already fails safe per provider, so all we must NOT do here is
-  // short-circuit before that routing ever runs. Only skip the entire pass
-  // when zero providers are configured/available at all.
+  // Provider availability: Gemini is the only verification provider. Skip
+  // the entire pass (keeping segments unchanged) only when it is not
+  // configured at all.
   // ------------------------------------------------------------------------
-  const vlmAvailable = await isVlmAvailable();
-  const sscdConfigured = sscdGateEnabled();
-  const geminiAvailable = geminiConfigured();
-  if (!vlmAvailable && !sscdConfigured && !geminiAvailable) {
+  if (!geminiConfigured()) {
     console.warn(
-      `[VLM] Skipping verification pass — no verification provider available (` +
-      `VLM_ENDPOINT_URL ${process.env.VLM_ENDPOINT_URL ? 'set but unreachable' : 'unset'}, ` +
-      `GPU_EMBED_SERVICE_URL ${process.env.GPU_EMBED_SERVICE_URL ? 'set but SSCD gate disabled' : 'unset'}, ` +
-      `GEMINI_API_KEY ${process.env.GEMINI_API_KEY ? 'set but unusable' : 'unset'})`
+      '[Verify] Skipping verification pass — GEMINI_API_KEY is not set. ' +
+      'Gemini is the only final checker; add a key to enable verification.'
     );
     return segments;
   }
-
-  // Explicit guarantee (not an incidental side effect) that each new
-  // video pair's VLM verification starts from clean server-side cache state.
-  // Only meaningful (and only attempted) when the Qwen VLM server itself is
-  // reachable — the SSCD gate and Gemini have no server-side KV cache.
-  if (vlmAvailable) await resetVlmCache('for new video pair');
 
   // Slot for each segment's final outcome, filled in whatever order segments
   // within a batch happen to finish — collected and sorted at the end, so
@@ -204,67 +186,31 @@ export async function resolveSegmentsWithVLM(
           }),
         );
         // ------------------------------------------------------------------
-        // Embedding gate: a deterministic CLIP-similarity pre-check on the
-        // exact frames that would go to the VLM. Clear-cut cases are decided
-        // here (no VLM call at all); only the ambiguous middle band falls
-        // through to the VLM. If the gate is unavailable (model failed to
-        // load), gate === null and behavior is identical to before.
+        // GEMINI is the only decision-maker. No frame-based gate decides
+        // accept/reject anymore — the SSCD/embedding systems only build and
+        // rank the candidate pool elsewhere.
         // ------------------------------------------------------------------
-        const gate = await embeddingGateCheck(extracted);
-        if (gate?.decision === 'accept') {
+        const result = await verifySameSceneChecked(extracted);
+
+        if (result === null) {
+          // Gemini could not produce a verdict (unconfigured/quota/network).
+          // Conservative policy: keep the candidate as 'unverifiable' rather
+          // than dropping it on an infrastructure failure.
+          verdict = 'unverifiable';
+          accepted = candidate;
+          triedCandidates.push({ segment: triedCandidate, verdict: 'unverifiable' });
+          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          break;
+        } else if (result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
           verdict = 'accepted';
           accepted = candidate;
-          triedCandidates.push({ segment: triedCandidate, verdict: 'accepted', confidencePct: Math.round(gate.medianSim * 100) });
+          triedCandidates.push({ segment: triedCandidate, verdict: 'accepted', confidencePct: result.confidencePct });
           onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-          console.log(`[EmbedGate] Segment ${i} attempt ${attempt}: auto-accept (median sim ${gate.medianSim.toFixed(3)})`);
           break;
-        }
-        if (gate?.decision === 'reject') {
-          verdict = 'rejected';
-          triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: Math.round(gate.medianSim * 100) });
-          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-          console.log(`[EmbedGate] Segment ${i} attempt ${attempt}: auto-reject (max sim ${gate.maxSim.toFixed(3)})`);
         } else {
-          // Ambiguous (or gate unavailable) — the VLM is the tie-breaker,
-          // with an accept-side self-consistency re-check (swapped image
-          // order): an accept stands only if both calls agree.
-          const result = await verifySameSceneChecked(extracted);
-
-          if (result === null) {
-            // VLM could not produce a verdict (timeout/overload). The old
-            // policy silently ACCEPTED here, which meant every VLM outage
-            // passed unverified segments straight through — a major source
-            // of false accepts. New policy: keep the candidate only if the
-            // embedding similarity independently supports it; otherwise
-            // treat it as rejected and try the next candidate.
-            const keep = gate !== null && gate.medianSim >= EMBED_UNVERIFIABLE_KEEP_SIM;
-            if (keep || gate === null) {
-              // gate === null: no independent signal at all — keep the old
-              // conservative "don't drop on infrastructure failure" behavior.
-              verdict = 'unverifiable';
-              accepted = candidate;
-              triedCandidates.push({ segment: triedCandidate, verdict: 'unverifiable' });
-              onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-              break;
-            }
-            verdict = 'rejected';
-            triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: Math.round(gate.medianSim * 100) });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-            console.log(
-              `[VLM] Segment ${i} attempt ${attempt}: VLM inconclusive and embedding sim ` +
-              `${gate.medianSim.toFixed(3)} < ${EMBED_UNVERIFIABLE_KEEP_SIM} — rejecting instead of blind-accepting`
-            );
-          } else if (result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
-            verdict = 'accepted';
-            accepted = candidate;
-            triedCandidates.push({ segment: triedCandidate, verdict: 'accepted', confidencePct: result.confidencePct });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-            break;
-          } else {
-            verdict = 'rejected';
-            triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: result.confidencePct });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-          }
+          verdict = 'rejected';
+          triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: result.confidencePct });
+          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
         }
       } catch (err: any) {
         // Frame extraction failure (e.g. bad timestamp) — treat as
@@ -323,16 +269,9 @@ export async function resolveSegmentsWithVLM(
     await Promise.all(workers);
   }
 
-  // Process in fixed-size batches — identical cache-reset boundaries to the
-  // previous sequential version (every VLM_RESET_BATCH_SIZE segments, plus
-  // the final partial batch), just with up to VLM_CONCURRENCY segments
-  // within each batch running at once instead of one at a time.
-  for (let batchStart = 0; batchStart < segments.length; batchStart += VLM_RESET_BATCH_SIZE) {
-    const batchEnd = Math.min(batchStart + VLM_RESET_BATCH_SIZE, segments.length);
-    const indices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
-    await runPool(indices);
-    if (vlmAvailable) await resetVlmCache(`after batch (segments ${batchStart + 1}-${batchEnd})`);
-  }
+  // Run every segment through the pool — Gemini has no server-side cache,
+  // so no batch/reset boundaries are needed anymore.
+  await runPool(Array.from({ length: segments.length }, (_, k) => k));
 
   const resolved = outcomes.filter((s): s is MatchedSegment => s !== null);
   resolved.sort((a, b) => a.shortStart - b.shortStart);
