@@ -17,7 +17,8 @@ import { extractFingerprints, NUM_WORKERS } from './server/pipeline';
 import { matchVideosFromFiles } from './server/matching-engine';
 import { resolveSegmentsWithVLM, SegmentResolvedInfo } from './server/vlm-segment-resolver';
 import { vlmNetworkStats, resetVlmNetworkStats, isVlmAvailable } from './server/vlm-verify';
-import { getGeminiStatus } from './server/gemini-vlm';
+import { getGeminiStatus, geminiConfigured } from './server/gemini-vlm';
+import { sscdGateEnabled } from './server/sscd-verify-gate';
 import {
   buildCandidateHistoryEntry,
   buildHashOnlyCandidateHistoryEntry,
@@ -1492,8 +1493,14 @@ async function startServer() {
       return res.status(409).json({ error: 'Retry already in progress for this segment' });
     }
 
-    const available = await isVlmAvailable();
-    if (!available) return res.status(503).json({ error: 'VLM verification is not available — Retry needs the VLM endpoint reachable.' });
+    // Retry works with ANY configured verification provider (Gemini, SSCD
+    // embedding gate, or the legacy Qwen VLM endpoint) — same rule as the
+    // main verification pass in resolveSegmentsWithVLM.
+    const vlmAvailable = await isVlmAvailable();
+    const anyProviderAvailable = vlmAvailable || sscdGateEnabled() || geminiConfigured();
+    if (!anyProviderAvailable) {
+      return res.status(503).json({ error: 'No verification provider available — set GEMINI_API_KEY, GPU_EMBED_SERVICE_URL, or VLM_ENDPOINT_URL.' });
+    }
 
     const movieVideoPath = getVideoPathForJob(job.movieJobId);
     const shortVideoPath = getVideoPathForJob(job.shortJobId);
