@@ -1,16 +1,18 @@
 /**
  * VLM scene-verification helpers — GEMINI-ONLY edition.
  *
- * The old Qwen2.5-VL server path has been fully removed. Verification is now:
- *   1. SSCD decision gate (sscd-verify-gate.ts) — clear-cut accept/reject
- *      decided from copy-detection similarity, no VLM call at all.
- *   2. Gemini composite protocol (gemini-vlm.ts) — each frame pair is joined
+ * Gemini is the ONE AND ONLY verdict-maker. The fast frame pre-filters
+ * (SSCD gate / embedding gate) no longer accept or reject anything here —
+ * they are used exclusively on the CANDIDATE side (candidate-embedding-rank)
+ * to build and rank the candidate pool so Gemini checks the most promising
+ * frames first.
+ *
+ *   1. Gemini composite protocol (gemini-vlm.ts) — each frame pair is joined
  *      into ONE side-by-side labeled image, judged independently, final
  *      verdict by majority vote across pairs. Gemini is the FINAL check.
- *   3. If Gemini yields no verdict (not configured, daily quota exhausted,
+ *   2. If Gemini yields no verdict (not configured, daily quota exhausted,
  *      network failure), the result is null — "could not verify". Callers
- *      treat null as unverifiable (their existing embedding-similarity-backed
- *      policy), NEVER as a silent pass or fail.
+ *      treat null as unverifiable, NEVER as a silent pass or fail.
  *
  * All network/parse failures return null so a segment falls back to being
  * handled by the caller's unverifiable policy rather than crashing the match.
@@ -18,7 +20,6 @@
 import { spawn } from 'child_process';
 import { makeCleanEnv } from './pipeline';
 import { FFMPEG_BIN } from './ffmpeg-path';
-import { sscdGateCheck } from './sscd-verify-gate';
 import { geminiConfigured, geminiVerifyComposite } from './gemini-vlm';
 import { buildSideBySideComposite } from './frame-composite';
 
@@ -179,42 +180,20 @@ async function compositeMajorityVerify(
 }
 
 /**
- * The router itself:
- *   Layer 1 — SSCD gate: clear-cut accept/reject without any VLM call.
- *   Layer 2 — Gemini composite majority vote: the FINAL check.
+ * The router itself — GEMINI ONLY:
+ *   Gemini composite majority vote is the one and only check. No embedding
+ *   or SSCD pre-verdict exists anymore (those signals only rank candidates).
  *   No verdict at all -> null (caller's unverifiable policy applies).
  */
 async function routedVerify(
   pairs: VlmFramePair[],
 ): Promise<{ same: boolean; confidencePct: number } | null> {
-  // ---- Layer 1: SSCD decision gate (fail-safe: null = pass-through) ----
-  let gateLabel = 'skipped';
-  let simLabel = '-';
-  try {
-    const gate = await sscdGateCheck(pairs);
-    if (gate) {
-      gateLabel = 'sscd';
-      simLabel = gate.medianSim.toFixed(2);
-      if (gate.verdict === 'accept') {
-        console.log(`[Verify] gate=sscd sim=${simLabel} provider=none votes=0/0 verdict=accept conf=100`);
-        return { same: true, confidencePct: 100 };
-      }
-      if (gate.verdict === 'reject') {
-        console.log(`[Verify] gate=sscd sim=${simLabel} provider=none votes=0/0 verdict=reject conf=100`);
-        return { same: false, confidencePct: 100 };
-      }
-      // 'ambiguous' -> fall through to Gemini below.
-    }
-  } catch {
-    // Gate must never break verification — proceed as if it were disabled.
-  }
-
-  // ---- Layer 2: Gemini composite protocol — the final check ----
+  // ---- Gemini composite protocol — the ONLY check ----
   if (geminiConfigured()) {
     const result = await compositeMajorityVerify(pairs);
     if (result) {
       console.log(
-        `[Verify] gate=${gateLabel} sim=${simLabel} provider=gemini ` +
+        `[Verify] provider=gemini ` +
         `votes=${result.votesFor}/${result.votesTotal} ` +
         `verdict=${result.same ? 'accept' : 'reject'} conf=${result.confidencePct}`
       );
@@ -246,28 +225,15 @@ export async function verifySameSceneMulti(
 }
 
 /**
- * GEMINI-FIRST entry point for the manual Retry button. SKIPS the SSCD
- * shortcut so a user-triggered Retry is always judged by Gemini itself
- * (with the exact same rate-limit system: sliding-window pacer,
- * wait-and-retry on per-minute 429s, and daily-limit detection that flags
- * the UI warning). If Gemini can yield no verdict at all, falls back to the
- * normal routed path (SSCD gate may still decide clear-cut cases).
+ * Entry point for the manual Retry button. Identical to the normal routed
+ * path now that Gemini is the only verdict-maker (same rate-limit system:
+ * sliding-window pacer, wait-and-retry on per-minute 429s, and daily-limit
+ * detection that flags the UI warning). Kept as a separate export so callers
+ * (candidate-retry.ts) stay untouched.
  */
 export async function verifySameSceneGeminiFirst(
   pairs: VlmFramePair[],
 ): Promise<{ same: boolean; confidencePct: number } | null> {
-  if (geminiConfigured()) {
-    const result = await compositeMajorityVerify(pairs);
-    if (result) {
-      console.log(
-        `[Verify] (retry) gate=skipped provider=gemini ` +
-        `votes=${result.votesFor}/${result.votesTotal} ` +
-        `verdict=${result.same ? 'accept' : 'reject'} conf=${result.confidencePct}`
-      );
-      return { same: result.same, confidencePct: result.confidencePct };
-    }
-    console.log('[Verify] (retry) Gemini yielded no verdict — falling back to SSCD-gated path');
-  }
   return routedVerify(pairs);
 }
 

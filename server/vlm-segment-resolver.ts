@@ -12,9 +12,15 @@ import {
   VLM_MAX_ATTEMPTS,
   VLM_CONCURRENCY,
 } from './vlm-verify';
-import { embeddingGateCheck, EMBED_UNVERIFIABLE_KEEP_SIM } from './embedding-gate';
-import { sscdGateEnabled } from './sscd-verify-gate';
+import { rankCandidatesCropRobust } from './candidate-embedding-rank';
 import { geminiConfigured } from './gemini-vlm';
+
+/**
+ * How many candidates the fast pre-filters (SSCD/CLIP embeddings) build and
+ * rank per segment BEFORE Gemini verification starts. The embeddings never
+ * accept/reject anything — they only pick WHICH frames Gemini looks at first.
+ */
+const CANDIDATE_POOL_TARGET = Number(process.env.CANDIDATE_POOL_TARGET) || 10;
 
 // Fixed batch size for VLM server cache-reset points. Purely a cache-hygiene
 // boundary — does not change segment order, candidate selection, or verdicts.
@@ -135,19 +141,14 @@ export async function resolveSegmentsWithVLM(
   if (segments.length === 0) return segments;
 
   // ------------------------------------------------------------------------
-  // Provider availability: verification proceeds if ANY configured provider
-  // can handle it — the SSCD gate or Gemini (the final check). The routing
-  // inside verifySameSceneChecked (SSCD gate -> Gemini composite) already
-  // fails safe per provider. Only skip the entire pass when zero providers
-  // are configured at all.
+  // Provider availability: Gemini is the ONLY verdict-maker now. The fast
+  // pre-filters (SSCD/CLIP embeddings) only build/rank candidates and can
+  // never verify anything on their own — so without Gemini, skip the pass.
   // ------------------------------------------------------------------------
-  const sscdConfigured = sscdGateEnabled();
-  const geminiAvailable = geminiConfigured();
-  if (!sscdConfigured && !geminiAvailable) {
+  if (!geminiConfigured()) {
     console.warn(
-      `[VLM] Skipping verification pass — no verification provider available (` +
-      `GPU_EMBED_SERVICE_URL ${process.env.GPU_EMBED_SERVICE_URL ? 'set but SSCD gate disabled' : 'unset'}, ` +
-      `GEMINI_API_KEY ${process.env.GEMINI_API_KEY ? 'set but unusable' : 'unset'})`
+      `[VLM] Skipping verification pass — Gemini not available ` +
+      `(GEMINI_API_KEY ${process.env.GEMINI_API_KEY ? 'set but unusable' : 'unset'})`
     );
     return segments;
   }
@@ -167,22 +168,61 @@ export async function resolveSegmentsWithVLM(
    */
   async function resolveOneSegment(i: number): Promise<void> {
     const original = segments[i];
-    let candidate: MatchedSegment | undefined = original;
-    const rejectedMovieTimestamps: number[] = [];
     const triedCandidates: SegmentCandidateAttempt[] = [];
     let attempt = 0;
     let accepted: MatchedSegment | null = null;
 
-    while (candidate && attempt < VLM_MAX_ATTEMPTS) {
+    // ------------------------------------------------------------------
+    // CANDIDATE GENERATION — the fast pre-filters' ONLY job now.
+    // Build up to CANDIDATE_POOL_TARGET candidates for this short-clip
+    // range upfront (the original + alternates from the pool, deduped by
+    // movie location), then rank them with the crop-robust SSCD/CLIP
+    // embedding ranker so Gemini — the one and only verdict-maker — checks
+    // the most promising frames first. Embeddings never accept/reject
+    // anything here; ranking failure just keeps the confidence order.
+    // ------------------------------------------------------------------
+    const candidates: MatchedSegment[] = [original];
+    const alternates = getAlternateCandidatesForRange(
+      candidatePool,
+      original.shortStart,
+      original.shortEnd,
+      [original.movieStart],
+    );
+    for (const alt of alternates) {
+      if (candidates.length >= CANDIDATE_POOL_TARGET) break;
+      if (candidates.some(c => Math.abs(c.movieStart - alt.movieStart) <= 0.5)) continue;
+      candidates.push(alt);
+    }
+
+    let order = candidates.map((_, k) => k);
+    if (candidates.length > 1) {
+      try {
+        const ranked = await rankCandidatesCropRobust(
+          candidates.map((segment) => ({ segment })),
+          order,
+          shortVideoPath,
+          movieVideoPath,
+          'MainPassRank',
+        );
+        if (ranked) order = ranked;
+      } catch {
+        // Ranking is best-effort only — keep hash-confidence order.
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // VERIFICATION — Gemini only, in ranked order, up to VLM_MAX_ATTEMPTS.
+    // ------------------------------------------------------------------
+    for (const candIdx of order) {
+      if (attempt >= VLM_MAX_ATTEMPTS) break;
+      const candidate = candidates[candIdx];
       attempt++;
-      const triedCandidate = candidate;
       const framePairs = pickVerificationFramePairs(candidate);
 
       let verdict: VlmProgressInfo['verdict'] = 'unverifiable';
       try {
         // Extract every needed frame in parallel (still one ffmpeg spawn per
-        // frame, all concurrent), then make ONE VLM call with all pairs —
-        // same request count per attempt as the old single-pair flow.
+        // frame, all concurrent), then make ONE Gemini call with all pairs.
         const extracted = await Promise.all(
           framePairs.map(async (p) => {
             const [shortFrameB64, movieFrameB64] = await Promise.all([
@@ -192,68 +232,29 @@ export async function resolveSegmentsWithVLM(
             return { shortFrameB64, movieFrameB64 };
           }),
         );
-        // ------------------------------------------------------------------
-        // Embedding gate: a deterministic CLIP-similarity pre-check on the
-        // exact frames that would go to the VLM. Clear-cut cases are decided
-        // here (no VLM call at all); only the ambiguous middle band falls
-        // through to the VLM. If the gate is unavailable (model failed to
-        // load), gate === null and behavior is identical to before.
-        // ------------------------------------------------------------------
-        const gate = await embeddingGateCheck(extracted);
-        if (gate?.decision === 'accept') {
+
+        const result = await verifySameSceneChecked(extracted);
+
+        if (result === null) {
+          // Gemini could not produce a verdict (quota exhausted / network
+          // failure) — infrastructure failure, not a content rejection.
+          // Keep the candidate as unverifiable rather than dropping it.
+          verdict = 'unverifiable';
+          accepted = candidate;
+          triedCandidates.push({ segment: candidate, verdict: 'unverifiable' });
+          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          break;
+        } else if (result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
           verdict = 'accepted';
           accepted = candidate;
-          triedCandidates.push({ segment: triedCandidate, verdict: 'accepted', confidencePct: Math.round(gate.medianSim * 100) });
+          triedCandidates.push({ segment: candidate, verdict: 'accepted', confidencePct: result.confidencePct });
           onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-          console.log(`[EmbedGate] Segment ${i} attempt ${attempt}: auto-accept (median sim ${gate.medianSim.toFixed(3)})`);
           break;
-        }
-        if (gate?.decision === 'reject') {
-          verdict = 'rejected';
-          triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: Math.round(gate.medianSim * 100) });
-          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-          console.log(`[EmbedGate] Segment ${i} attempt ${attempt}: auto-reject (max sim ${gate.maxSim.toFixed(3)})`);
         } else {
-          // Ambiguous (or gate unavailable) — the VLM is the tie-breaker,
-          // with an accept-side self-consistency re-check (swapped image
-          // order): an accept stands only if both calls agree.
-          const result = await verifySameSceneChecked(extracted);
-
-          if (result === null) {
-            // VLM could not produce a verdict (timeout/overload). The old
-            // policy silently ACCEPTED here, which meant every VLM outage
-            // passed unverified segments straight through — a major source
-            // of false accepts. New policy: keep the candidate only if the
-            // embedding similarity independently supports it; otherwise
-            // treat it as rejected and try the next candidate.
-            const keep = gate !== null && gate.medianSim >= EMBED_UNVERIFIABLE_KEEP_SIM;
-            if (keep || gate === null) {
-              // gate === null: no independent signal at all — keep the old
-              // conservative "don't drop on infrastructure failure" behavior.
-              verdict = 'unverifiable';
-              accepted = candidate;
-              triedCandidates.push({ segment: triedCandidate, verdict: 'unverifiable' });
-              onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-              break;
-            }
-            verdict = 'rejected';
-            triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: Math.round(gate.medianSim * 100) });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-            console.log(
-              `[VLM] Segment ${i} attempt ${attempt}: VLM inconclusive and embedding sim ` +
-              `${gate.medianSim.toFixed(3)} < ${EMBED_UNVERIFIABLE_KEEP_SIM} — rejecting instead of blind-accepting`
-            );
-          } else if (result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
-            verdict = 'accepted';
-            accepted = candidate;
-            triedCandidates.push({ segment: triedCandidate, verdict: 'accepted', confidencePct: result.confidencePct });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-            break;
-          } else {
-            verdict = 'rejected';
-            triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: result.confidencePct });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
-          }
+          verdict = 'rejected';
+          triedCandidates.push({ segment: candidate, verdict: 'rejected', confidencePct: result.confidencePct });
+          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          // Continue to the next ranked candidate.
         }
       } catch (err: any) {
         // Frame extraction failure (e.g. bad timestamp) — treat as
@@ -261,21 +262,10 @@ export async function resolveSegmentsWithVLM(
         console.warn(`[VLM] Frame extraction failed for segment ${i}, attempt ${attempt}: ${err?.message || err}`);
         verdict = 'unverifiable';
         accepted = candidate;
-        triedCandidates.push({ segment: triedCandidate, verdict: 'unverifiable' });
+        triedCandidates.push({ segment: candidate, verdict: 'unverifiable' });
         onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
         break;
       }
-
-      // Rejected — look for the next-best alternative elsewhere in the movie,
-      // never re-showing an already-rejected movie timestamp for this range.
-      rejectedMovieTimestamps.push(candidate.movieStart);
-      const alternatives = getAlternateCandidatesForRange(
-        candidatePool,
-        original.shortStart,
-        original.shortEnd,
-        rejectedMovieTimestamps,
-      );
-      candidate = alternatives[0];
     }
 
     if (accepted) {

@@ -18,7 +18,6 @@ import { matchVideosFromFiles } from './server/matching-engine';
 import { resolveSegmentsWithVLM, SegmentResolvedInfo } from './server/vlm-segment-resolver';
 import { vlmNetworkStats, resetVlmNetworkStats } from './server/vlm-verify';
 import { getGeminiStatus, geminiConfigured } from './server/gemini-vlm';
-import { sscdGateEnabled } from './server/sscd-verify-gate';
 import {
   buildCandidateHistoryEntry,
   buildHashOnlyCandidateHistoryEntry,
@@ -1493,17 +1492,17 @@ async function startServer() {
       return res.status(409).json({ error: 'Retry already in progress for this segment' });
     }
 
-    // Retry is Gemini-first (same rate-limit system as the main pass:
-    // sliding-window pacer + wait-and-retry on per-minute 429s). The SSCD
-    // gate only serves as fallback when Gemini can't answer at all.
-    const anyProviderAvailable = sscdGateEnabled() || geminiConfigured();
-    if (!anyProviderAvailable) {
-      return res.status(503).json({ error: 'No verification provider available — set GEMINI_API_KEY or GPU_EMBED_SERVICE_URL.' });
+    // Gemini is the ONE AND ONLY verdict-maker (same rate-limit system as
+    // the main pass: sliding-window pacer + wait-and-retry on per-minute
+    // 429s). The fast embedding pre-filters only rank candidates and can
+    // never verify anything on their own.
+    if (!geminiConfigured()) {
+      return res.status(503).json({ error: 'No verification provider available — set GEMINI_API_KEY.' });
     }
-    // Gemini is the only provider and its DAILY quota is gone -> tell the
-    // user directly instead of running a retry that cannot verify anything.
+    // Gemini's DAILY quota is gone -> tell the user directly instead of
+    // running a retry that cannot verify anything.
     const gStatus = getGeminiStatus();
-    if (gStatus.dailyLimitReached && !sscdGateEnabled()) {
+    if (gStatus.dailyLimitReached) {
       return res.status(503).json({ error: 'Gemini daily limit over — nayi API key add karo, phir Retry dabao.' });
     }
 
