@@ -81,7 +81,7 @@ async function main() {
   // Test 4: fallback also daily-dead → overall dailyLimitReached true.
   dailyExhaust.add('gemini-3.1-flash-lite');
   const r4 = await geminiVerifyComposite('AAAA', 'test');
-  if (r4 !== null) throw new Error('expected null (both exhausted → Qwen fallback)');
+  if (r4 !== null) throw new Error('expected null (both exhausted → unverifiable)');
   const st4 = getGeminiStatus();
   if (!st4.dailyLimitReached) throw new Error('overall dailyLimitReached should be true');
   console.log('PASS: both exhausted → dailyLimitReached flag set for UI');

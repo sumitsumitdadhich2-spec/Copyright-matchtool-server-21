@@ -2039,9 +2039,10 @@ export default function App() {
               <p className="text-xs text-red-200/80 leading-relaxed">
                 Dono models ki daily quota khatam ho gayi hai ({geminiQuota.usedToday} requests aaj).
                 Processing rukegi nahi — server har 10 minute mein check karta rahega ki limit
-                wapas aayi ya nahi (midnight Pacific pe reset), aur tab tak Qwen fallback se kaam
-                chalega. Nayi key (alag Cloud project wali) Settings mein daal do to Gemini turant
-                wapas chalu ho jayega.
+                wapas aayi ya nahi (midnight Pacific pe reset). Tab tak jin segments ko Gemini
+                verify nahi kar paya, wo unverifiable mark honge (embedding similarity se decide
+                hoga ki rakhna hai ya nahi). Nayi key (alag Cloud project wali) Settings mein daal
+                do to Gemini turant wapas chalu ho jayega.
               </p>
             </div>
           </div>

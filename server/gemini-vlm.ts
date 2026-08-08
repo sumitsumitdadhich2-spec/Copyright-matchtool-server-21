@@ -19,8 +19,8 @@
  *      to detect the midnight-PT reset automatically.
  *
  * Contracts (unchanged from the single-model version):
- *  - Every failure path returns null — NEVER throws. Caller falls back to
- *    Qwen.
+ *  - Every failure path returns null — NEVER throws. Caller treats null
+ *    as unverifiable.
  *  - Module is completely inert without GEMINI_API_KEY.
  *
  * Env vars:
@@ -318,7 +318,7 @@ function retryAfterMs(res: Response): number {
 /**
  * Ask Gemini whether the composite image shows the same scene.
  * Rotates between the two lite models per the quota-manager rules.
- * Returns {same, confidence} or null (caller falls back to Qwen).
+ * Returns {same, confidence} or null (caller treats it as unverifiable).
  */
 export async function geminiVerifyComposite(
   compositeB64: string,
@@ -348,7 +348,7 @@ export async function geminiVerifyComposite(
     if (bothDailyExhausted()) {
       m = takeProbeModel();
       isProbe = true;
-      if (!m) return null; // probe not due yet — instant Qwen fallback
+      if (!m) return null; // probe not due yet — no verdict possible right now
     } else {
       rateLimitWaiting = true;
       m = await acquireSlot();
@@ -393,7 +393,7 @@ export async function geminiVerifyComposite(
             lastDailyProbeAt = Date.now();
             console.warn(
               '[Gemini] BOTH models\' daily quotas exhausted — flagging the UI ' +
-              '("Gemini key limit over — new API key needed"), falling back to Qwen. ' +
+              '("Gemini key limit over — new API key needed"), treating as unverifiable. ' +
               `Re-probe every ${Math.round(GEMINI_DAILY_PROBE_INTERVAL_MS / 60000)} min.`
             );
             return null;
@@ -427,7 +427,7 @@ export async function geminiVerifyComposite(
       }
 
       if (!res.ok) {
-        console.warn(`[Gemini] ${modelName} HTTP ${res.status} ${res.statusText} — falling back to Qwen`);
+        console.warn(`[Gemini] ${modelName} HTTP ${res.status} ${res.statusText} — treating as unverifiable`);
         return null;
       }
 
@@ -438,19 +438,19 @@ export async function geminiVerifyComposite(
 
       const verdict = parseVerdictJson(raw);
       if (!verdict) {
-        console.warn(`[Gemini] Malformed/unparseable response — falling back to Qwen: ${String(raw).slice(0, 200)}`);
+        console.warn(`[Gemini] Malformed/unparseable response — treating as unverifiable: ${String(raw).slice(0, 200)}`);
         return null;
       }
       return verdict;
     } catch (err: any) {
       const reason = err?.name === 'AbortError' ? 'timed out' : (err?.message || String(err));
-      console.warn(`[Gemini] ${modelName} request failed (${reason}) — falling back to Qwen`);
+      console.warn(`[Gemini] ${modelName} request failed (${reason}) — treating as unverifiable`);
       return null;
     } finally {
       clearTimeout(timer);
       rateLimitWaiting = false;
     }
   }
-  console.warn('[Gemini] Gave up after prolonged rate-limit waiting — falling back to Qwen');
+  console.warn('[Gemini] Gave up after prolonged rate-limit waiting — treating as unverifiable');
   return null;
 }

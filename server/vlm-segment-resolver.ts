@@ -8,8 +8,6 @@ import { getAlternateCandidatesForRange } from './matching-engine';
 import {
   extractFrameAsBase64,
   verifySameSceneChecked,
-  isVlmAvailable,
-  resetVlmCache,
   VLM_CONFIDENCE_THRESHOLD,
   VLM_MAX_ATTEMPTS,
   VLM_CONCURRENCY,
@@ -137,31 +135,22 @@ export async function resolveSegmentsWithVLM(
   if (segments.length === 0) return segments;
 
   // ------------------------------------------------------------------------
-  // Provider availability: verification must proceed if ANY configured
-  // provider can handle it — not just the legacy Qwen endpoint. The routing
-  // inside verifySameSceneChecked (SSCD gate -> Gemini composite -> legacy
-  // Qwen) already fails safe per provider, so all we must NOT do here is
-  // short-circuit before that routing ever runs. Only skip the entire pass
-  // when zero providers are configured/available at all.
+  // Provider availability: verification proceeds if ANY configured provider
+  // can handle it — the SSCD gate or Gemini (the final check). The routing
+  // inside verifySameSceneChecked (SSCD gate -> Gemini composite) already
+  // fails safe per provider. Only skip the entire pass when zero providers
+  // are configured at all.
   // ------------------------------------------------------------------------
-  const vlmAvailable = await isVlmAvailable();
   const sscdConfigured = sscdGateEnabled();
   const geminiAvailable = geminiConfigured();
-  if (!vlmAvailable && !sscdConfigured && !geminiAvailable) {
+  if (!sscdConfigured && !geminiAvailable) {
     console.warn(
       `[VLM] Skipping verification pass — no verification provider available (` +
-      `VLM_ENDPOINT_URL ${process.env.VLM_ENDPOINT_URL ? 'set but unreachable' : 'unset'}, ` +
       `GPU_EMBED_SERVICE_URL ${process.env.GPU_EMBED_SERVICE_URL ? 'set but SSCD gate disabled' : 'unset'}, ` +
       `GEMINI_API_KEY ${process.env.GEMINI_API_KEY ? 'set but unusable' : 'unset'})`
     );
     return segments;
   }
-
-  // Explicit guarantee (not an incidental side effect) that each new
-  // video pair's VLM verification starts from clean server-side cache state.
-  // Only meaningful (and only attempted) when the Qwen VLM server itself is
-  // reachable — the SSCD gate and Gemini have no server-side KV cache.
-  if (vlmAvailable) await resetVlmCache('for new video pair');
 
   // Slot for each segment's final outcome, filled in whatever order segments
   // within a batch happen to finish — collected and sorted at the end, so
@@ -323,15 +312,14 @@ export async function resolveSegmentsWithVLM(
     await Promise.all(workers);
   }
 
-  // Process in fixed-size batches — identical cache-reset boundaries to the
-  // previous sequential version (every VLM_RESET_BATCH_SIZE segments, plus
-  // the final partial batch), just with up to VLM_CONCURRENCY segments
-  // within each batch running at once instead of one at a time.
+  // Process in fixed-size batches with up to VLM_CONCURRENCY segments within
+  // each batch running at once. (The batch boundary is a historical artifact
+  // of the removed Qwen server's cache-reset points — kept as a harmless
+  // pacing boundary, no reset calls are made anymore.)
   for (let batchStart = 0; batchStart < segments.length; batchStart += VLM_RESET_BATCH_SIZE) {
     const batchEnd = Math.min(batchStart + VLM_RESET_BATCH_SIZE, segments.length);
     const indices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
     await runPool(indices);
-    if (vlmAvailable) await resetVlmCache(`after batch (segments ${batchStart + 1}-${batchEnd})`);
   }
 
   const resolved = outcomes.filter((s): s is MatchedSegment => s !== null);
