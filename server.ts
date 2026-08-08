@@ -18,6 +18,30 @@ import { matchVideosFromFiles } from './server/matching-engine';
 import { resolveSegmentsWithVLM, SegmentResolvedInfo } from './server/vlm-segment-resolver';
 import { vlmNetworkStats, resetVlmNetworkStats, isVlmAvailable } from './server/vlm-verify';
 import { getGeminiStatus, geminiConfigured } from './server/gemini-vlm';
+import { getGeminiVideoStatus } from './server/gemini-video-verify';
+
+/**
+ * Combined Gemini quota status for the UI. The FULL-SEGMENT VIDEO chain
+ * (gemini-3.5-flash-lite -> gemini-3.1-flash-lite, 500 RPD each) is the
+ * primary consumer of quota; the legacy composite counter is folded in.
+ * dailyLimitReached flips only when EVERY model's daily pool is out —
+ * that's when the app shows "Gemini key limit over — add a new key".
+ */
+function combinedGeminiStatus() {
+  const base = getGeminiStatus();
+  const video = getGeminiVideoStatus();
+  if (!video.configured) return base;
+  return {
+    ...base,
+    model: video.activeModel || base.model,
+    rpmLimit: video.rpmLimit,
+    usedToday: base.usedToday + video.usedToday,
+    dailyLimitReached: video.dailyLimitReached,
+    dailyLimitSince: video.dailyLimitSince ?? base.dailyLimitSince,
+    rateLimitWaiting: video.rateLimitWaiting || base.rateLimitWaiting,
+    videoModels: video.models,
+  };
+}
 import { sscdGateEnabled } from './server/sscd-verify-gate';
 import {
   buildCandidateHistoryEntry,
@@ -1404,14 +1428,14 @@ async function startServer() {
       vlmStats: job.vlmStats,
       startedAt: job.startedAt,
       completedAt: job.completedAt,
-      gemini: getGeminiStatus(),
+      gemini: combinedGeminiStatus(),
     });
   });
 
   // Standalone Gemini quota status — lets the UI poll the daily-limit flag
   // even when no match job is running.
   app.get('/api/gemini-status', (req, res) => {
-    res.json(getGeminiStatus());
+    res.json(combinedGeminiStatus());
   });
 
   // 6g. Stop a running match job — mirrors /api/jobs/:jobId/stop for fingerprint jobs.
@@ -1503,7 +1527,7 @@ async function startServer() {
     }
     // Gemini is the only provider and its DAILY quota is gone -> tell the
     // user directly instead of running a retry that cannot verify anything.
-    const gStatus = getGeminiStatus();
+    const gStatus = combinedGeminiStatus();
     if (gStatus.dailyLimitReached && !vlmAvailable && !sscdGateEnabled()) {
       return res.status(503).json({ error: 'Gemini daily limit over — nayi API key add karo, phir Retry dabao.' });
     }

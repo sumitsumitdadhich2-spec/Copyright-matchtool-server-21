@@ -32,6 +32,7 @@ import { MatchedSegment, matchVideosFromFiles } from './candidate-matching-engin
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
 import { pickVerificationFramePairs } from './vlm-segment-resolver';
 import { extractFrameAsBase64, verifySameSceneGeminiFirst, VLM_CONFIDENCE_THRESHOLD } from './vlm-verify';
+import { geminiVideoAvailable, geminiVerifySegmentVideos } from './gemini-video-verify';
 import {
   StoredCandidateSet,
   CandidateCheck,
@@ -147,6 +148,32 @@ async function checkCandidate(
   shortVideoPath: string,
   movieVideoPath: string,
 ): Promise<void> {
+  // FULL-SEGMENT VIDEO check first (Gemini priority): the whole candidate
+  // segment from both videos is judged in one request. Falls back to the
+  // frame-based Gemini-first flow only when no video verdict is possible.
+  if (geminiVideoAvailable()) {
+    const seg = candidate.segment;
+    const vr = await geminiVerifySegmentVideos({
+      shortVideoPath,
+      shortStart: seg.shortStart,
+      shortEnd: seg.shortEnd,
+      movieVideoPath,
+      movieStart: seg.movieStart,
+      movieEnd: seg.movieEnd,
+      label: 'retry',
+    });
+    if (vr !== null) {
+      candidate.checked = true;
+      if (vr.same && vr.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
+        candidate.verdict = 'accepted';
+      } else {
+        candidate.verdict = 'rejected';
+      }
+      candidate.confidencePct = vr.confidencePct;
+      return;
+    }
+  }
+
   const framePairs = pickVerificationFramePairs(candidate.segment);
   try {
     const extracted = await Promise.all(

@@ -17,6 +17,7 @@ import {
 import { embeddingGateCheck, EMBED_UNVERIFIABLE_KEEP_SIM } from './embedding-gate';
 import { sscdGateEnabled } from './sscd-verify-gate';
 import { geminiConfigured } from './gemini-vlm';
+import { geminiVideoAvailable, geminiVerifySegmentVideos } from './gemini-video-verify';
 
 // Fixed batch size for VLM server cache-reset points. Purely a cache-hygiene
 // boundary — does not change segment order, candidate selection, or verdicts.
@@ -190,7 +191,46 @@ export async function resolveSegmentsWithVLM(
       const framePairs = pickVerificationFramePairs(candidate);
 
       let verdict: VlmProgressInfo['verdict'] = 'unverifiable';
-      try {
+
+      // ----------------------------------------------------------------
+      // Layer 0 — FULL-SEGMENT VIDEO verification (Gemini, always the
+      // priority provider). The ENTIRE candidate segment is cut from both
+      // videos and judged by Gemini in one request. Runs on the FIRST
+      // attempt AND on every alternate-candidate attempt, until Gemini
+      // says "same" or candidates run out. Only when it can produce no
+      // verdict at all (both models' daily quota over, upload failure,
+      // network error) does the legacy frame-based flow below take over.
+      // ----------------------------------------------------------------
+      let videoDecided = false;
+      if (geminiVideoAvailable()) {
+        const vr = await geminiVerifySegmentVideos({
+          shortVideoPath,
+          shortStart: candidate.shortStart,
+          shortEnd: candidate.shortEnd,
+          movieVideoPath,
+          movieStart: candidate.movieStart,
+          movieEnd: candidate.movieEnd,
+          label: `seg${i}-try${attempt}`,
+        });
+        if (vr !== null) {
+          videoDecided = true;
+          if (vr.same && vr.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
+            verdict = 'accepted';
+            accepted = candidate;
+            triedCandidates.push({ segment: triedCandidate, verdict: 'accepted', confidencePct: vr.confidencePct });
+            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+            break;
+          }
+          verdict = 'rejected';
+          triedCandidates.push({ segment: triedCandidate, verdict: 'rejected', confidencePct: vr.confidencePct });
+          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict });
+          // Falls through to the candidate-replacement logic below.
+        } else {
+          console.log(`[GeminiVideo] Segment ${i} attempt ${attempt}: no video verdict — using frame-based fallback`);
+        }
+      }
+
+      if (!videoDecided) try {
         // Extract every needed frame in parallel (still one ffmpeg spawn per
         // frame, all concurrent), then make ONE VLM call with all pairs —
         // same request count per attempt as the old single-pair flow.

@@ -17,6 +17,7 @@ import { MatchedSegment } from './candidate-matching-engine';
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
 import { pickVerificationFramePairs } from './vlm-segment-resolver';
 import { extractFrameAsBase64, verifySameSceneChecked, VLM_CONFIDENCE_THRESHOLD, VLM_CONCURRENCY } from './vlm-verify';
+import { geminiVideoAvailable, geminiVerifySegmentVideos } from './gemini-video-verify';
 import {
   listCandidateFilesForJob,
   readCandidatesFile,
@@ -97,7 +98,38 @@ export async function runDeferredRecoveryPass(
       const framePairs = pickVerificationFramePairs(candidateEntry.segment);
 
       let verdict: DeferredRecoveryProgress['verdict'] = 'unverifiable';
-      try {
+
+      // FULL-SEGMENT VIDEO check first (Gemini priority) — whole candidate
+      // segment from both videos in one request; frame-based flow is only
+      // the fallback when no video verdict is possible.
+      let videoDecided = false;
+      if (geminiVideoAvailable()) {
+        const seg = candidateEntry.segment;
+        const vr = await geminiVerifySegmentVideos({
+          shortVideoPath,
+          shortStart: seg.shortStart,
+          shortEnd: seg.shortEnd,
+          movieVideoPath,
+          movieStart: seg.movieStart,
+          movieEnd: seg.movieEnd,
+          label: `recover-seg${segmentIndex}-c${c}`,
+        });
+        if (vr !== null) {
+          videoDecided = true;
+          candidateEntry.checked = true;
+          candidateEntry.confidencePct = vr.confidencePct;
+          if (vr.same && vr.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
+            candidateEntry.verdict = 'accepted';
+            verdict = 'accepted';
+            acceptedIdx = c;
+          } else {
+            candidateEntry.verdict = 'rejected';
+            verdict = 'rejected';
+          }
+        }
+      }
+
+      if (!videoDecided) try {
         const extracted = await Promise.all(
           framePairs.map(async (p) => {
             const [shortFrameB64, movieFrameB64] = await Promise.all([

@@ -30,7 +30,9 @@ export function geminiConfigured(): boolean {
 }
 
 function geminiModel(): string {
-  return process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+  // gemini-3.5-flash-lite: free tier 15 RPM / 250K TPM / 500 RPD — the
+  // permanent priority model (gemini-3.6-flash's 20 RPD pool is useless).
+  return process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
 }
 
 const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS) || 60_000;
@@ -41,7 +43,7 @@ const GEMINI_429_RETRY_DELAY_MAX_MS = 65_000;
 // rarely hit a 429 at all; when we do, we WAIT and retry (never abandon the
 // segment) until either the per-minute window frees up or the DAILY quota is
 // confirmed exhausted.
-const GEMINI_RPM = Number(process.env.GEMINI_RPM) || 10;
+const GEMINI_RPM = Number(process.env.GEMINI_RPM) || 15;
 // How often to re-probe Gemini after the daily quota looked exhausted
 // ("keep checking whether the limit came back").
 const GEMINI_DAILY_PROBE_INTERVAL_MS =
