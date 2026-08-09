@@ -150,6 +150,10 @@ async function startServer() {
     vlmTotalSegments?: number;
     vlmAttempt?: number;
     vlmVerdict?: string;
+    /** 'initial' | 'deep-search' — which VLM verification phase is running (display-only). */
+    vlmPhase?: string;
+    /** Total per-segment verification budget for the current phase (10 initial / 30 deep-search). */
+    vlmTotalBudget?: number;
   }
 
   interface MatchJob {
@@ -1192,12 +1196,17 @@ async function startServer() {
                   ? 97 + Math.round(((info.segmentIndex + (info.verdict === 'rejected' ? 0 : 1)) / info.totalSegments) * 3)
                   : 97;
                 j.progress = {
-                  phase: 'vlm_verify',
+                  // Display-only phase passthrough: 'vlm_deep_search' while
+                  // the auto-extend deep search is verifying candidates
+                  // beyond the initial pool, else the existing 'vlm_verify'.
+                  phase: info.phase === 'deep-search' ? 'vlm_deep_search' : 'vlm_verify',
                   pct: Math.min(99, pct),
                   vlmSegmentIndex: info.segmentIndex,
                   vlmTotalSegments: info.totalSegments,
                   vlmAttempt: info.attempt,
                   vlmVerdict: info.verdict,
+                  vlmPhase: info.phase,
+                  vlmTotalBudget: info.totalBudget,
                 };
               },
               // Persist full candidate-comparison history for EVERY segment —
@@ -1314,8 +1323,24 @@ async function startServer() {
                 const checked = entry.candidates.filter(
                   c => c.checked && !degenerateCandidateReason(c.segment));
                 if (checked.length === 0) continue;
-                const best = checked.reduce((a, b) =>
-                  ((b.confidencePct ?? -1) > (a.confidencePct ?? -1) ? b : a));
+                // Respect an existing best-effort pick: when the auto-extend
+                // deep search already chose the highest-match-likelihood
+                // candidate (entry.bestEffort + recoveredCandidateIndex),
+                // surface THAT candidate instead of re-picking by raw
+                // confidencePct — otherwise this block would clobber the
+                // likelihood-based selection with a different candidate.
+                let best: (typeof checked)[number];
+                if (
+                  entry.bestEffort === true &&
+                  typeof entry.recoveredCandidateIndex === 'number' &&
+                  entry.candidates[entry.recoveredCandidateIndex]?.checked &&
+                  !degenerateCandidateReason(entry.candidates[entry.recoveredCandidateIndex].segment)
+                ) {
+                  best = entry.candidates[entry.recoveredCandidateIndex];
+                } else {
+                  best = checked.reduce((a, b) =>
+                    ((b.confidencePct ?? -1) > (a.confidencePct ?? -1) ? b : a));
+                }
                 const bestIdx = entry.candidates.indexOf(best);
                 // Tag it so the UI can show a "Rejected — Retry needed" badge
                 // instead of a normal confidence badge: every candidate for

@@ -165,6 +165,32 @@ export async function retrySegmentCandidates(
 
   const persist = () => writeCandidatesFileSync(uploadDir, matchJobId, segmentIndex, entry);
 
+  // ------------------------------------------------------------------
+  // DEEP-SEARCH DESCRIPTION REFRESH — every Retry click asks Gemini for a
+  // progressively FINER description of the target clip (depth+1 vs the last
+  // profile) and re-selects the most reliable ranking signal for it. The
+  // refreshed profile only affects which candidates get verified FIRST —
+  // Gemini video verification remains the sole verdict-maker. On any
+  // failure (Gemini off, quota parked) the previous profile/mode is kept
+  // and the search still runs, exactly as before.
+  // ------------------------------------------------------------------
+  const depth = (entry.deepSearchDepth ?? 0) + 1;
+  try {
+    const profile = await describeTargetClip(
+      shortVideoPath,
+      entry.shortStart,
+      entry.shortEnd,
+      depth,
+      `CandidateRetry seg${segmentIndex} ClipProfile`,
+    );
+    if (profile) {
+      entry.clipDescription = profile.description;
+      entry.recommendedMode = profile.recommendedMode;
+      entry.deepSearchDepth = depth;
+      writeCandidatesFileSync(uploadDir, matchJobId, segmentIndex, entry);
+    }
+  } catch { /* profiling is best-effort only — search proceeds regardless */ }
+
   /** Already-checked candidates are NEVER re-verified — only fresh ones. */
   const uncheckedIdxsNow = () =>
     entry.candidates.map((c, i) => (c.checked ? -1 : i)).filter(i => i !== -1);

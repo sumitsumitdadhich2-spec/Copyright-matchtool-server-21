@@ -76,10 +76,20 @@ function infraBackoffDelay(retry: number): number {
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export interface VlmProgressInfo {
-  segmentIndex: number;
-  totalSegments: number;
-  attempt: number;
-  verdict: 'accepted' | 'rejected' | 'unverifiable' | 'dropped';
+segmentIndex: number;
+totalSegments: number;
+attempt: number;
+verdict: 'accepted' | 'rejected' | 'unverifiable' | 'dropped';
+/**
+ * Which verification phase emitted this event (additive, optional):
+ *  - 'initial'     — the untouched first-10 loop (budget VLM_MAX_ATTEMPTS).
+ *  - 'deep-search' — the auto-extend loop after every initial candidate was
+ *                    rejected (budget VLM_TOTAL_MAX_ATTEMPTS).
+ * Display-only; never consulted by any accept/reject decision.
+ */
+phase?: 'initial' | 'deep-search';
+/** Total per-segment verification budget for the current phase. */
+totalBudget?: number;
 }
 
 /**
@@ -350,7 +360,7 @@ export async function resolveSegmentsWithVLM(
           matchLikelihood: 0,
           evidence: [`Auto-rejected without VLM: ${degenerateReason}`],
         });
-        onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'rejected' });
+        onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'rejected', phase: 'initial', totalBudget: VLM_MAX_ATTEMPTS });
         continue;
       }
 
@@ -400,7 +410,7 @@ export async function resolveSegmentsWithVLM(
               matchLikelihood: result.matchLikelihood,
               evidence: result.evidence,
             });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'accepted' });
+            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'accepted', phase: 'initial', totalBudget: VLM_MAX_ATTEMPTS });
             candidateDone = true;
           } else {
             triedCandidates.push({
@@ -410,7 +420,7 @@ export async function resolveSegmentsWithVLM(
               matchLikelihood: result.matchLikelihood,
               evidence: result.evidence,
             });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'rejected' });
+            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'rejected', phase: 'initial', totalBudget: VLM_MAX_ATTEMPTS });
             candidateDone = true; // content rejection — move to next candidate
           }
         } catch (err: any) {
@@ -433,7 +443,7 @@ export async function resolveSegmentsWithVLM(
             );
             sawUnverifiable = true;
             triedCandidates.push({ segment: candidate, verdict: 'unverifiable' });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'unverifiable' });
+            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'unverifiable', phase: 'initial', totalBudget: VLM_MAX_ATTEMPTS });
             candidateDone = true;
           }
         }
@@ -488,7 +498,7 @@ export async function resolveSegmentsWithVLM(
             matchLikelihood: 0,
             evidence: [`Auto-rejected without VLM: ${degenerateReason}`],
           });
-          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'rejected' });
+          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'rejected', phase: 'deep-search', totalBudget: VLM_TOTAL_MAX_ATTEMPTS });
           return false;
         }
         attempt++;
@@ -503,7 +513,7 @@ export async function resolveSegmentsWithVLM(
               if (retry < VLM_INFRA_RETRIES) continue;
               sawUnverifiable = true;
               triedCandidates.push({ segment: candidate, verdict: 'unverifiable' });
-              onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'unverifiable' });
+              onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'unverifiable', phase: 'deep-search', totalBudget: VLM_TOTAL_MAX_ATTEMPTS });
               return false;
             }
             if (result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
@@ -514,7 +524,7 @@ export async function resolveSegmentsWithVLM(
                 matchLikelihood: result.matchLikelihood,
                 evidence: result.evidence,
               });
-              onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'accepted' });
+              onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'accepted', phase: 'deep-search', totalBudget: VLM_TOTAL_MAX_ATTEMPTS });
               return true;
             }
             triedCandidates.push({
@@ -523,13 +533,13 @@ export async function resolveSegmentsWithVLM(
               matchLikelihood: result.matchLikelihood,
               evidence: result.evidence,
             });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'rejected' });
+            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'rejected', phase: 'deep-search', totalBudget: VLM_TOTAL_MAX_ATTEMPTS });
             return false;
           } catch (err: any) {
             if (retry < VLM_INFRA_RETRIES) continue;
             sawUnverifiable = true;
             triedCandidates.push({ segment: candidate, verdict: 'unverifiable' });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'unverifiable' });
+            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'unverifiable', phase: 'deep-search', totalBudget: VLM_TOTAL_MAX_ATTEMPTS });
             return false;
           }
         }
