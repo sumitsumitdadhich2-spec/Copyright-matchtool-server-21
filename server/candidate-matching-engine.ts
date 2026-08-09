@@ -28,6 +28,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as readline from 'readline';
 import { FrameSignature, VariantHashes } from '../src/shared/fingerprint';
+import { getOrLoadMovieAsset, hasMovieAsset } from './movie-asset-cache';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -2971,9 +2972,20 @@ export async function matchVideosFromFiles(
   // ── Decide: full load vs chunked ──────────────────────────────────────────
   // Peek at movie frame count via line index (fast: one sequential pass).
   // This also gives us byte offsets ready for the chunked path if needed.
+  // PERFORMANCE FIX: the line index for the SAME movie file is cached
+  // process-wide (keyed by path + mtime + size), so auto-extend / broader
+  // search rounds never re-scan the movie NDJSON just to rebuild it.
   onProgress?.({ phase: 'indexing', pct: 10 });
-  console.log('[Match] Building movie line index…');
-  const { byteOffsets, totalFrames: movieFrames, meta } = await buildMovieLineIndex(movieResultPath);
+  const { value: lineIndex, cacheHit: indexCacheHit } = await getOrLoadMovieAsset(
+    movieResultPath,
+    'cand:lineIndex',
+    () => {
+      console.log('[Match] Building movie line index…');
+      return buildMovieLineIndex(movieResultPath);
+    },
+  );
+  if (indexCacheHit) console.log('[Match] Movie line index cache HIT — reusing.');
+  const { byteOffsets, totalFrames: movieFrames, meta } = lineIndex;
 
   const estimatedBytes = estimateMoviePresetBytes(
     movieFrames, meta.numVariants || 13, meta.aWords || 8, meta.dWords || 0, meta.pWords || 0
@@ -2986,7 +2998,12 @@ export async function matchVideosFromFiles(
   // exactly on an 8 GB machine (4 / 8 = 0.5), e.g. ~8 GB on a 16 GB machine.
   const RAM_MATCH_LIMIT = os.totalmem() * 0.5;
   const freeRam         = os.freemem();
-  const useChunked      = estimatedBytes > RAM_MATCH_LIMIT || estimatedBytes > freeRam - 500_000_000;
+  // When a full PreSet for this exact movie file is ALREADY cached, always
+  // take the full-load path: reusing it costs no new RAM, whereas a flipped
+  // free-RAM heuristic would pointlessly re-stream the file chunk by chunk.
+  const presetCached    = hasMovieAsset(movieResultPath, 'cand:preset');
+  const useChunked      = !presetCached &&
+    (estimatedBytes > RAM_MATCH_LIMIT || estimatedBytes > freeRam - 500_000_000);
 
   console.log(
     `[Match] Movie: ${movieFrames} frames — estimated PreSet ${(estimatedBytes / 1e9).toFixed(2)} GB` +
@@ -2995,21 +3012,30 @@ export async function matchVideosFromFiles(
 
   if (useChunked) {
     // ── Chunked path ─────────────────────────────────────────────────────────
-    // Load movie metadata (timestamps only; no hashes) for acceptSegment
+    // Load movie metadata (timestamps only; no hashes) for acceptSegment.
+    // Cached per movie file version — cheap to keep (no hashes) and saves a
+    // full NDJSON pass on every repeat call for the same movie.
     onProgress?.({ phase: 'loading_movie', pct: 18 });
-    console.log('[Match] Loading movie metadata (timestamps)…');
-    const movieMetaFps: FPData[] = [];
-    const rl = readline.createInterface({
-      input: fs.createReadStream(movieResultPath, { encoding: 'utf8' }),
-      crlfDelay: Infinity,
-    });
-    for await (const line of rl) {
-      if (!line.trim()) continue;
-      try {
-        const f = JSON.parse(line);
-        movieMetaFps.push({ frameIndex: f.frameIndex, timestamp: f.timestamp, variants: {}, signature: undefined });
-      } catch { /* skip */ }
-    }
+    const { value: movieMetaFps } = await getOrLoadMovieAsset(
+      movieResultPath,
+      'cand:metaFps',
+      async () => {
+        console.log('[Match] Loading movie metadata (timestamps)…');
+        const metaFps: FPData[] = [];
+        const rl = readline.createInterface({
+          input: fs.createReadStream(movieResultPath, { encoding: 'utf8' }),
+          crlfDelay: Infinity,
+        });
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          try {
+            const f = JSON.parse(line);
+            metaFps.push({ frameIndex: f.frameIndex, timestamp: f.timestamp, variants: {}, signature: undefined });
+          } catch { /* skip */ }
+        }
+        return metaFps;
+      },
+    );
 
     onProgress?.({ phase: 'scanning', pct: 20 });
     const result = await groundMatchedSegmentsChunked(
@@ -3026,10 +3052,23 @@ export async function matchVideosFromFiles(
     };
   }
 
-  // ── Full-load path (unchanged) ────────────────────────────────────────────
+  // ── Full-load path ────────────────────────────────────────────────────────
+  // PERFORMANCE FIX (bottleneck 1): the movie PreSet — the single most
+  // expensive precompute in the pipeline — is cached per movie file version.
+  // "Streaming precompute: movie fingerprints…" now logs at most ONCE per
+  // uploaded movie; every auto-extend / broader-search round reuses it.
+  // The PreSet is read-only during matching, so sharing it across concurrent
+  // calls is safe.
   onProgress?.({ phase: 'loading_movie', pct: 18 });
-  console.log('[Match] Streaming precompute: movie fingerprints…');
-  const moviePreSet = await streamPrecomputeFromFile(movieResultPath);
+  const { value: moviePreSet, cacheHit: presetCacheHit } = await getOrLoadMovieAsset(
+    movieResultPath,
+    'cand:preset',
+    () => {
+      console.log('[Match] Streaming precompute: movie fingerprints…');
+      return streamPrecomputeFromFile(movieResultPath);
+    },
+  );
+  if (presetCacheHit) console.log('[Match] Movie fingerprint cache HIT — reusing precomputed PreSet.');
 
   onProgress?.({ phase: 'matching', pct: 25 });
   console.log(`[Match] Loaded ${movieFrames} movie frames, ${shortFrames} short frames. Running matching…`);

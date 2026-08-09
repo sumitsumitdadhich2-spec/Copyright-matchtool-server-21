@@ -18,6 +18,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
 import { MatchedSegment, matchVideosFromFiles } from './candidate-matching-engine';
+import { degenerateCandidateReason } from './degenerate-guard';
 
 /** Cap on how many freshly-discovered candidates a single broader search returns. */
 export const BROADER_SEARCH_MAX_NEW = 10;
