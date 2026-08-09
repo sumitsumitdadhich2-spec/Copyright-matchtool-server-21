@@ -1604,6 +1604,10 @@ async function startServer() {
               // and never recovered) — add it now.
               liveJob.segments = [...liveJob.segments, newSeg].sort((a: any, b: any) => a.shortStart - b.shortStart);
             }
+            // Recompute the display-only timeline flags — swapping in a new
+            // match can create OR resolve a backwards jump against the
+            // neighbouring segments, so the badges must not stay stale.
+            try { liveJob.segments = flagTimelineOutliers(liveJob.segments); } catch { /* display-only */ }
             await fs.promises.writeFile(matchResultPath(matchJobId), JSON.stringify({
               segments: liveJob.segments,
               unmatchedRanges: liveJob.unmatchedRanges,
@@ -1672,6 +1676,11 @@ async function startServer() {
       // Range had no active segment (previously dropped) — add it now.
       job.segments = [...segsArr, newSeg].sort((a: any, b: any) => a.shortStart - b.shortStart);
     }
+
+    // Recompute the display-only timeline flags — the promoted candidate can
+    // sit at a different movie position than the segment it replaces, which
+    // can create OR resolve a backwards jump against neighbouring segments.
+    try { job.segments = flagTimelineOutliers(job.segments!); } catch { /* display-only */ }
 
     try {
       await fs.promises.writeFile(matchResultPath(matchJobId), JSON.stringify({
@@ -1772,6 +1781,9 @@ async function startServer() {
         segsArr[arrIdx] = { ...segsArr[arrIdx], movieStart: newStart, movieEnd: newEnd };
         job.segments = segsArr;
         segmentsUpdated = true;
+        // Recompute the display-only timeline flags — nudging movieStart can
+        // move this segment onto or off the dominant forward movie timeline.
+        try { job.segments = flagTimelineOutliers(job.segments); } catch { /* display-only */ }
         try {
           await fs.promises.writeFile(matchResultPath(matchJobId), JSON.stringify({
             segments: job.segments,
