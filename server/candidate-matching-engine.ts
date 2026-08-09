@@ -2254,9 +2254,10 @@ async function countFileLines(filePath: string): Promise<number> {
   return new Promise((resolve, reject) => {
     let count = 0;
     const stream = fs.createReadStream(filePath, { encoding: 'utf8', highWaterMark: 64 * 1024 });
-    stream.on('data', (chunk: string) => {
-      for (let i = 0; i < chunk.length; i++) {
-        if (chunk.charCodeAt(i) === 10 /* '\n' */) count++;
+    stream.on('data', (chunk: string | Buffer) => {
+      const s = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      for (let i = 0; i < s.length; i++) {
+        if (s.charCodeAt(i) === 10 /* '\n' */) count++;
       }
     });
     stream.on('end', () => resolve(count));
@@ -2349,7 +2350,7 @@ async function streamPrecomputeFromNDJSON(filePath: string): Promise<PreSet> {
         }
       }
 
-      // ── Temporal colour-delta ─────────────────────────────────────────
+      // ── Temporal colour-delta ───────────────────────��─────────────────
       const sig = frame.signature as FrameSignature | undefined;
       if (sig?.colorGrid?.length === 48 && prevColorGrid && fi > 0) {
         let mag = 0;
@@ -2895,7 +2896,7 @@ async function groundMatchedSegmentsChunked(
     }
   }
 
-  // ── 5. Post-process (same as full path) ───────────────────────────────────
+  // ── 5. Post-process (same as full path) ────────────────────���──────────────
   const merged = mergeAdjacentSegments(segments);
   console.log(`[MatchChunked] After merge: ${merged.length} segment(s) (was ${segments.length}).`);
 
@@ -3020,7 +3021,7 @@ export async function matchVideosFromFiles(
     return {
       ...result,
       segments: correctSegmentEndTimestamps(result.segments, shortFrameDuration, movieFrameDuration),
-      candidatePool: correctSegmentEndTimestamps(result.candidatePool, shortFrameDuration, movieFrameDuration),
+      candidatePool: correctSegmentEndTimestamps(result.candidatePool ?? [], shortFrameDuration, movieFrameDuration),
       movieFrames, shortFrames,
     };
   }
@@ -3050,7 +3051,7 @@ export async function matchVideosFromFiles(
   return {
     ...result,
     segments: correctSegmentEndTimestamps(result.segments, shortFrameDuration, movieFrameDuration),
-    candidatePool: correctSegmentEndTimestamps(result.candidatePool, shortFrameDuration, movieFrameDuration),
+    candidatePool: correctSegmentEndTimestamps(result.candidatePool ?? [], shortFrameDuration, movieFrameDuration),
     movieFrames, shortFrames,
   };
 }

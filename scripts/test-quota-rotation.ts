@@ -32,14 +32,14 @@ const dailyExhaust: Set<string> = new Set();
 };
 
 async function main() {
-  const { geminiVerifyComposite, getGeminiStatus } = await import('../server/gemini-vlm');
+  const { geminiVerifyText, getGeminiStatus } = await import('../server/gemini-vlm');
 
   // Test 1: 6 rapid requests with RPM=3 → first 3 on primary, next 3 on
   // fallback (instant rotation) — no waiting at all.
   console.log('--- Test 1: RPM rotation ---');
   const t0 = Date.now();
   for (let i = 0; i < 6; i++) {
-    const r = await geminiVerifyComposite('AAAA', 'test');
+    const r = await geminiVerifyText('test');
     if (!r?.same) throw new Error('expected verdict');
   }
   const elapsed = Date.now() - t0;
@@ -58,7 +58,7 @@ async function main() {
   await new Promise(r => setTimeout(r, 61_000));
   calls.length = 0;
   dailyExhaust.add('gemini-flash-lite-latest');
-  const r2 = await geminiVerifyComposite('AAAA', 'test');
+  const r2 = await geminiVerifyText('test');
   console.log('call sequence:', calls.join(', '));
   if (!r2?.same) throw new Error('expected verdict via fallback');
   if (calls[0] !== 'gemini-flash-lite-latest' || calls[1] !== 'gemini-3.1-flash-lite') {
@@ -72,15 +72,16 @@ async function main() {
 
   // Test 3: next call goes straight to fallback (primary skipped, no request burned).
   calls.length = 0;
-  const r3 = await geminiVerifyComposite('AAAA', 'test');
-  if (!r3?.same || calls.length !== 1 || calls[0] !== 'gemini-3.1-flash-lite') {
+  const r3 = await geminiVerifyText('test');
+  const firstCall: string | undefined = calls[0];
+  if (!r3?.same || calls.length !== 1 || firstCall !== 'gemini-3.1-flash-lite') {
     throw new Error(`expected single fallback call, got: ${calls.join(', ')}`);
   }
   console.log('PASS: parked model skipped without burning a request');
 
   // Test 4: fallback also daily-dead → overall dailyLimitReached true.
   dailyExhaust.add('gemini-3.1-flash-lite');
-  const r4 = await geminiVerifyComposite('AAAA', 'test');
+  const r4 = await geminiVerifyText('test');
   if (r4 !== null) throw new Error('expected null (both exhausted → unverifiable)');
   const st4 = getGeminiStatus();
   if (!st4.dailyLimitReached) throw new Error('overall dailyLimitReached should be true');

@@ -1829,9 +1829,10 @@ async function countFileLines(filePath: string): Promise<number> {
   return new Promise((resolve, reject) => {
     let count = 0;
     const stream = fs.createReadStream(filePath, { encoding: 'utf8', highWaterMark: 64 * 1024 });
-    stream.on('data', (chunk: string) => {
-      for (let i = 0; i < chunk.length; i++) {
-        if (chunk.charCodeAt(i) === 10 /* '\n' */) count++;
+    stream.on('data', (chunk: string | Buffer) => {
+      const s = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      for (let i = 0; i < s.length; i++) {
+        if (s.charCodeAt(i) === 10 /* '\n' */) count++;
       }
     });
     stream.on('end', () => resolve(count));
@@ -2598,7 +2599,7 @@ export async function matchVideosFromFiles(
     return {
       ...result,
       segments: correctSegmentEndTimestamps(result.segments, shortFrameDuration, movieFrameDuration),
-      candidatePool: correctSegmentEndTimestamps(result.candidatePool, shortFrameDuration, movieFrameDuration),
+      candidatePool: correctSegmentEndTimestamps(result.candidatePool ?? [], shortFrameDuration, movieFrameDuration),
       movieFrames, shortFrames,
     };
   }
@@ -2628,7 +2629,7 @@ export async function matchVideosFromFiles(
   return {
     ...result,
     segments: correctSegmentEndTimestamps(result.segments, shortFrameDuration, movieFrameDuration),
-    candidatePool: correctSegmentEndTimestamps(result.candidatePool, shortFrameDuration, movieFrameDuration),
+    candidatePool: correctSegmentEndTimestamps(result.candidatePool ?? [], shortFrameDuration, movieFrameDuration),
     movieFrames, shortFrames,
   };
 }
