@@ -68,6 +68,23 @@ export interface StoredCandidateSet {
    * rediscovering the same ones.
    */
   broaderSearchRounds?: number;
+  /**
+   * AI-written detailed description of the target clip segment (from the
+   * auto-extend / deep-search flow). Guides candidate ORDERING only — it is
+   * never a verdict. Refreshed with a finer version at each deep-search depth.
+   */
+  clipDescription?: string;
+  /**
+   * Ranking signal the AI auto-selected for this clip: 'hash' (clean clip),
+   * 'embedding' (cropped/zoomed/filtered clip), or 'combined'.
+   */
+  recommendedMode?: 'hash' | 'embedding' | 'combined';
+  /**
+   * How many DEEP-SEARCH description rounds have run for this segment (each
+   * manual Retry click that reaches broader search increments it, asking
+   * Gemini for a progressively finer clip description).
+   */
+  deepSearchDepth?: number;
 }
 
 const CANDIDATES_MAX = 10;

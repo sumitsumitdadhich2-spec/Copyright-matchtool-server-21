@@ -781,6 +781,71 @@ export async function geminiVerifyVideoPair(
 }
 
 /**
+ * Free-form single-video request: upload ONE cut segment and return Gemini's
+ * raw text answer to `prompt` (no verdict-JSON parsing). Used by the
+ * clip-description step of the candidate auto-extend / deep-search flow —
+ * it NEVER accepts or rejects anything; the text only guides which
+ * candidates get checked first. Same upload / pacing / rotation / cleanup
+ * transport as geminiVerifyVideoPair, including the fps escalation on
+ * HTTP 400 for ultra-short clips. Returns null (never throws) on any
+ * failure so callers simply skip the description step.
+ */
+export async function geminiDescribeVideo(
+  videoPath: string,
+  prompt: string,
+  fps = 1,
+): Promise<string | null> {
+  if (!geminiConfigured()) return null;
+  if (bothDailyExhausted()) {
+    console.warn('[Gemini] Both models daily-parked — skipping describe-video upload');
+    return null;
+  }
+
+  const file = await uploadFileToGemini(videoPath, 'video/mp4', 'describe-segment');
+  try {
+    if (!file) return null;
+
+    let currentFps = Math.max(1, Math.min(Math.round(fps), GEMINI_MAX_FPS));
+
+    for (;;) {
+      const body = {
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              videoFilePart(file, currentFps),
+              { text: prompt },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0,
+          maxOutputTokens: Number(process.env.GEMINI_DESCRIBE_MAX_TOKENS) || 1024,
+        },
+      };
+
+      const outcome = await generateContentWithRotation(body, GEMINI_VIDEO_TIMEOUT_MS);
+
+      if (outcome.kind === 'httpError') {
+        if (outcome.status === 400 && currentFps < GEMINI_MAX_FPS) {
+          const nextFps = Math.min(currentFps * 2, GEMINI_MAX_FPS);
+          console.warn(
+            `[Gemini] describe-video HTTP 400 at fps=${currentFps} — escalating to fps=${nextFps}`
+          );
+          currentFps = nextFps;
+          continue;
+        }
+        return null;
+      }
+      if (outcome.kind === 'unavailable') return null;
+      return outcome.text || null;
+    }
+  } finally {
+    if (file) await deleteGeminiFile(file.name);
+  }
+}
+
+/**
  * Text-only verdict request. Used by the quota-rotation test script so it can
  * exercise the exact same pacing/rotation transport without needing media.
  */

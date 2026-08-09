@@ -1214,7 +1214,22 @@ async function startServer() {
                   info.accepted,
                   result.candidatePool,
                 );
-                if (entry) writeCandidatesFileAsync(uploadDir, matchJobId, info.segmentIndex, entry);
+                if (entry) {
+                  // Auto-extend metadata (strictly additive): the AI's target-
+                  // clip description + auto-selected ranking mode, and — when
+                  // the full 30-verification budget ran out with no genuine
+                  // accept — the single best-effort candidate to surface
+                  // ("★ Used" + bestEffort badge). dropped stays true and every
+                  // rejected verdict stays visible, exactly like Retry's
+                  // best-effort fallback.
+                  if (info.clipDescription) entry.clipDescription = info.clipDescription;
+                  if (info.recommendedMode) entry.recommendedMode = info.recommendedMode;
+                  if (!info.accepted && info.bestEffortIndex !== undefined) {
+                    entry.recoveredCandidateIndex = info.bestEffortIndex;
+                    entry.bestEffort = true;
+                  }
+                  writeCandidatesFileAsync(uploadDir, matchJobId, info.segmentIndex, entry);
+                }
               },
               // Fingerprint paths enable the first-pass broader search: when
               // a segment's initial candidate pool is weak (top hash

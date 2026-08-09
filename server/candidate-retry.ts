@@ -26,7 +26,9 @@
  */
 import { MatchedSegment } from './candidate-matching-engine';
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
-import { verifySegmentByVideo, VLM_CONFIDENCE_THRESHOLD, VLM_MAX_ATTEMPTS } from './vlm-verify';
+import { verifySegmentByVideo, VLM_CONFIDENCE_THRESHOLD } from './vlm-verify';
+import { VLM_TOTAL_MAX_ATTEMPTS } from './vlm-segment-resolver';
+import { describeTargetClip, orderCandidatesByMode, RankMode } from './clip-description';
 import {
   broaderSearchForRange,
   BROADER_SEARCH_MAX_NEW,
@@ -45,8 +47,12 @@ import {
  * many broader-search rounds as it takes. Once spent without a genuine accept,
  * the best-so-far candidate is accepted as a fallback; clicking Retry again
  * starts a fresh budget and keeps hunting for NEW candidates.
+ *
+ * DEEP-SEARCH upgrade: a Retry click is the user explicitly saying "search
+ * harder", so it gets a fresh 30-verification budget (same hard total the
+ * main pass's auto-extend uses) instead of the old 10.
  */
-const RETRY_MAX_ATTEMPTS = Number(process.env.RETRY_MAX_ATTEMPTS) || VLM_MAX_ATTEMPTS;
+const RETRY_MAX_ATTEMPTS = Number(process.env.RETRY_MAX_ATTEMPTS) || VLM_TOTAL_MAX_ATTEMPTS;
 
 export interface RetrySegmentResult {
   /**
@@ -171,21 +177,32 @@ export async function retrySegmentCandidates(
    */
   async function verifyBatch(idxs: number[]): Promise<void> {
     if (idxs.length === 0) return;
-    // Crop-robust embedding ranking (candidate system only): try the
-    // candidates whose movie frame — full OR any left/center/right 9:16
-    // window of it — looks most like the short frame FIRST, so a vertically
-    // cropped short doesn't burn Gemini attempts on wrong locations.
+    // Mode-aware ranking (deep-search upgrade): when the AI clip profile has
+    // auto-selected a ranking signal for this clip (hash / embedding /
+    // combined), candidates are ordered by THAT signal. Without a profile,
+    // the original crop-robust embedding ranking applies unchanged.
     // Reorders only; on failure (model unavailable etc.) the order is kept.
     let order = idxs;
     try {
-      const ranked = await rankCandidatesCropRobust(
-        entry.candidates,
-        idxs,
-        shortVideoPath,
-        movieVideoPath,
-        'CandidateRetry',
-      );
-      if (ranked) order = ranked;
+      if (entry.recommendedMode) {
+        order = await orderCandidatesByMode(
+          entry.recommendedMode,
+          entry.candidates,
+          idxs,
+          shortVideoPath,
+          movieVideoPath,
+          'CandidateRetry',
+        );
+      } else {
+        const ranked = await rankCandidatesCropRobust(
+          entry.candidates,
+          idxs,
+          shortVideoPath,
+          movieVideoPath,
+          'CandidateRetry',
+        );
+        if (ranked) order = ranked;
+      }
     } catch { /* ranking is best-effort only */ }
 
     for (const idx of order) {
