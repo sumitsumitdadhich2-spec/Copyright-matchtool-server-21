@@ -30,8 +30,23 @@ interface JobEntry {
   segmentCount?: number;
   movieJobId?: string;
   shortJobId?: string;
-  // Fingerprint-job-only: original uploaded video still saved on the server
+  // Original uploaded video still saved on the server. For match jobs this is
+  // true only when BOTH source videos survive.
   hasVideo?: boolean;
+  /** Bytes the saved video(s) for this job occupy on the server. */
+  videoSize?: number;
+  /** Match-job-only: per-source availability of the two saved videos. */
+  movieHasVideo?: boolean;
+  shortHasVideo?: boolean;
+}
+
+function fmtBytes(bytes?: number) {
+  if (!bytes || bytes <= 0) return null;
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = bytes;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
 }
 
 const MATCH_PHASE_LABEL: Record<string, string> = {
@@ -122,11 +137,13 @@ const JobCard = React.memo(function JobCard({
   onDeleteVideo?: (id: string) => void;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [confirmDeleteVideo, setConfirmDeleteVideo] = useState(false);
   const [pickOpenRole, setPickOpenRole] = useState(false);
   const [stopping, setStopping] = useState(false);
-  // Inline player for the server-saved copy of this job's video.
-  const [watching, setWatching] = useState(false);
+  // Id of the video job currently previewed inline (this job for a fingerprint
+  // job, or one of the two source jobs for a match job). null = player closed.
+  const [watchId, setWatchId] = useState<string | null>(null);
+  // Which saved video the per-source "remove" confirmation is armed for.
+  const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null);
 
   const isMatch = job.type === 'match';
   const isRunning = job.status === 'processing' || job.status === 'pending' || job.status === 'uploading';
@@ -148,6 +165,16 @@ const JobCard = React.memo(function JobCard({
       etaStr = m > 0 ? `~${m}m ${s}s left` : `~${s}s left`;
     }
   }
+
+  // Every saved video this card can play / remove. A fingerprint job owns one
+  // video; a match job points at the two fingerprint jobs it was built from,
+  // so both stay watchable (and individually removable) from history.
+  const videoSources: { id: string; label: string }[] = isMatch
+    ? [
+        ...(job.movieHasVideo && job.movieJobId ? [{ id: job.movieJobId, label: 'movie' }] : []),
+        ...(job.shortHasVideo && job.shortJobId ? [{ id: job.shortJobId, label: 'clip' }] : []),
+      ]
+    : job.hasVideo ? [{ id: job.id, label: '' }] : [];
 
   const handleStop = async () => {
     setStopping(true);
@@ -236,7 +263,7 @@ const JobCard = React.memo(function JobCard({
           <span>{job.totalFrames.toLocaleString()} frames fingerprinted</span>
           {job.hasVideo && (
             <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-sky-500/25 bg-sky-500/10 text-sky-400 text-[10px] font-semibold">
-              <HardDrive className="w-3 h-3" /> Video saved
+              <HardDrive className="w-3 h-3" /> Video saved{fmtBytes(job.videoSize) ? ` · ${fmtBytes(job.videoSize)}` : ''}
             </span>
           )}
         </p>
@@ -246,7 +273,12 @@ const JobCard = React.memo(function JobCard({
           <span>{job.segmentCount?.toLocaleString() ?? 0} segment{job.segmentCount === 1 ? '' : 's'} found</span>
           {job.hasVideo ? (
             <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-sky-500/25 bg-sky-500/10 text-sky-400 text-[10px] font-semibold">
-              <HardDrive className="w-3 h-3" /> Videos saved — preview ready
+              <HardDrive className="w-3 h-3" /> Videos saved — preview ready{fmtBytes(job.videoSize) ? ` · ${fmtBytes(job.videoSize)}` : ''}
+            </span>
+          ) : job.movieHasVideo || job.shortHasVideo ? (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-amber-500/25 bg-amber-500/10 text-amber-400 text-[10px] font-semibold">
+              <AlertCircle className="w-3 h-3" />
+              Only the {job.movieHasVideo ? 'movie' : 'clip'} video is still saved
             </span>
           ) : (
             <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-amber-500/25 bg-amber-500/10 text-amber-400 text-[10px] font-semibold">
@@ -335,45 +367,55 @@ const JobCard = React.memo(function JobCard({
           )
         )}
 
-        {/* Watch the server-saved copy right here, without loading it into a slot */}
-        {!isRunning && !isMatch && job.hasVideo && (
+        {/* Watch the server-saved copy right here, without loading it into a
+            slot. Match jobs expose BOTH of their saved source videos. */}
+        {!isRunning && videoSources.map(src => (
           <button
-            onClick={() => setWatching(v => !v)}
+            key={`watch-${src.id}`}
+            onClick={() => setWatchId(prev => (prev === src.id ? null : src.id))}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-teal-500/30 text-teal-400 bg-teal-500/10 hover:bg-teal-500/20 transition cursor-pointer"
           >
             <PlayCircle className="w-3 h-3" />
-            {watching ? 'Hide video' : 'Watch'}
+            {watchId === src.id ? 'Hide' : 'Watch'}{src.label ? ` ${src.label}` : ''}
           </button>
-        )}
+        ))}
 
-        {/* Remove saved video — frees server disk space, keeps fingerprints */}
-        {!isRunning && !isMatch && job.hasVideo && onDeleteVideo && (
-          !confirmDeleteVideo ? (
+        {/* Remove a saved video — frees server disk space, keeps fingerprints
+            and results so matching and "Open" still work. */}
+        {!isRunning && onDeleteVideo && videoSources.map(src => (
+          confirmRemoveId !== src.id ? (
             <button
-              onClick={() => setConfirmDeleteVideo(true)}
+              key={`rm-${src.id}`}
+              onClick={() => setConfirmRemoveId(src.id)}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-sky-500/25 text-sky-400 bg-sky-500/10 hover:bg-sky-500/20 transition cursor-pointer"
             >
               <HardDrive className="w-3 h-3" />
-              Remove video
+              Remove{src.label ? ` ${src.label}` : ' video'}
             </button>
           ) : (
-            <div className="flex items-center gap-2">
-              <span className="text-[11px] text-slate-400">Remove saved video?</span>
+            <div key={`rm-${src.id}`} className="flex items-center gap-2">
+              <span className="text-[11px] text-slate-400">
+                Remove saved {src.label || 'video'}? Previews will stop working.
+              </span>
               <button
-                onClick={() => { setConfirmDeleteVideo(false); onDeleteVideo(job.id); }}
+                onClick={() => {
+                  setConfirmRemoveId(null);
+                  if (watchId === src.id) setWatchId(null);
+                  onDeleteVideo(src.id);
+                }}
                 className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-sky-600 hover:bg-sky-500 text-white transition cursor-pointer"
               >
                 Yes, remove
               </button>
               <button
-                onClick={() => setConfirmDeleteVideo(false)}
+                onClick={() => setConfirmRemoveId(null)}
                 className="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-300 transition cursor-pointer"
               >
                 Cancel
               </button>
             </div>
           )
-        )}
+        ))}
 
         {/* Delete button */}
         {!confirmDelete ? (
@@ -404,13 +446,15 @@ const JobCard = React.memo(function JobCard({
       </div>
 
       {/* Inline preview of the copy kept on the server */}
-      {watching && job.hasVideo && (
+      {watchId && videoSources.some(s => s.id === watchId) && (
         <div className="bg-black rounded-lg overflow-hidden border border-slate-700/60">
           <video
-            src={`/api/video/${job.id}`}
+            key={watchId}
+            src={`/api/video/${watchId}`}
             controls
             preload="metadata"
             className="w-full max-h-56 object-contain"
+            onError={() => setWatchId(null)}
           />
         </div>
       )}
@@ -429,11 +473,19 @@ interface JobHistoryProps {
   /** Open a completed fingerprint job's saved video back into the main panel
    *  as the reference movie or the target clip. */
   onOpenFingerprint?: (jobId: string, role: 'reference' | 'target') => void;
+  /** A job was deleted here — lets the main panel drop it if it was loaded. */
+  onJobDeleted?: (jobId: string, type: 'fingerprint' | 'match') => void;
+  /** A saved video was removed — lets the main panel drop its dead preview. */
+  onVideoRemoved?: (jobId: string) => void;
 }
 
-export function JobHistory({ onClose, onReattach, onOpenMatch, onOpenFingerprint }: JobHistoryProps) {
+export function JobHistory({
+  onClose, onReattach, onOpenMatch, onOpenFingerprint, onJobDeleted, onVideoRemoved,
+}: JobHistoryProps) {
   const [jobs, setJobs] = useState<JobEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState<'all' | 'match' | 'fingerprint' | 'saved'>('all');
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Serialized snapshot of the last applied jobs payload — lets us skip
   // setState entirely when nothing changed, so the panel doesn't visibly
@@ -520,20 +572,48 @@ export function JobHistory({ onClose, onReattach, onOpenMatch, onOpenFingerprint
   const handleDelete = useCallback(async (jobId: string, type: 'fingerprint' | 'match') => {
     try {
       const url = type === 'match' ? `/api/match/${jobId}` : `/api/job/${jobId}`;
-      await fetch(url, { method: 'DELETE' });
+      const res = await fetch(url, { method: 'DELETE' });
+      if (!res.ok) {
+        setActionError('Could not delete that job — the server refused the request.');
+        return;
+      }
+      setActionError('');
       lastPayloadRef.current = ''; // force next poll to re-apply fresh data
       setJobs(prev => prev.filter(j => j.id !== jobId));
-    } catch { /* ignore */ }
+      handlersRef.current.onJobDeleted?.(jobId, type);
+    } catch {
+      setActionError('Could not delete that job — the server is unreachable.');
+    }
   }, []);
 
   // Delete ONLY the saved video file from the server — fingerprints and job
   // history remain, so matching still works; only the video preview is gone.
   const handleDeleteVideo = useCallback(async (jobId: string) => {
     try {
-      await fetch(`/api/video/${jobId}`, { method: 'DELETE' });
+      const res = await fetch(`/api/video/${jobId}`, { method: 'DELETE' });
+      if (!res.ok) {
+        setActionError('Could not remove that saved video.');
+        return;
+      }
+      setActionError('');
       lastPayloadRef.current = '';
-      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, hasVideo: false } : j));
-    } catch { /* ignore */ }
+      // Reflect the removal on the video's own job AND on every match job that
+      // was built from it, so their Watch buttons disappear immediately.
+      setJobs(prev => prev.map(j => {
+        if (j.id === jobId) return { ...j, hasVideo: false, videoSize: 0 };
+        if (j.type !== 'match') return j;
+        if (j.movieJobId !== jobId && j.shortJobId !== jobId) return j;
+        return {
+          ...j,
+          hasVideo: false,
+          movieHasVideo: j.movieJobId === jobId ? false : j.movieHasVideo,
+          shortHasVideo: j.shortJobId === jobId ? false : j.shortHasVideo,
+        };
+      }));
+      handlersRef.current.onVideoRemoved?.(jobId);
+    } catch {
+      setActionError('Could not remove that saved video — the server is unreachable.');
+    }
   }, []);
 
   const runningJobs  = jobs.filter(j => j.status === 'processing' || j.status === 'pending' || j.status === 'uploading');

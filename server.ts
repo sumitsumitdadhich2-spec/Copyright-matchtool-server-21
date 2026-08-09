@@ -328,6 +328,16 @@ async function startServer() {
       return undefined;
     }
   }
+  /**
+   * Size in bytes of the saved original video for a job, or 0 when no video is
+   * kept on disk. Drives the "video saved (size)" chip and the total disk-usage
+   * readout in the Job History panel.
+   */
+  function getVideoSizeForJob(jobId: string): number {
+    const p = getVideoPathForJob(jobId);
+    if (!p) return 0;
+    try { return fs.statSync(p).size; } catch { return 0; }
+  }
   const videoRegistry = new Map<string, string>();
 
   function metaPath(jobId: string) {
@@ -1034,6 +1044,9 @@ async function startServer() {
       // Whether the original uploaded video is still saved on the server's disk
       // (drives the "video saved" chip + preview restore + remove-video action).
       hasVideo: !!getVideoPathForJob(j.id),
+      // Bytes the saved copy occupies (0 when no video is kept) — lets the UI
+      // show per-job size and a total "video storage used" figure.
+      videoSize: getVideoSizeForJob(j.id),
     }));
     const matchEntries = Array.from(matchJobs.values()).map(j => ({
       id: j.id,
@@ -1058,6 +1071,13 @@ async function startServer() {
       // what decides whether opening this match can actually show previews.
       hasVideo: !!(j.movieJobId && j.shortJobId
         && getVideoPathForJob(j.movieJobId) && getVideoPathForJob(j.shortJobId)),
+      // Per-source availability so the UI can watch/remove each saved video
+      // individually and explain exactly which one is missing (instead of an
+      // all-or-nothing "videos removed" message).
+      movieHasVideo: !!(j.movieJobId && getVideoPathForJob(j.movieJobId)),
+      shortHasVideo: !!(j.shortJobId && getVideoPathForJob(j.shortJobId)),
+      videoSize: (j.movieJobId ? getVideoSizeForJob(j.movieJobId) : 0)
+        + (j.shortJobId ? getVideoSizeForJob(j.shortJobId) : 0),
     }));
 
     const list = [...fingerprintEntries, ...matchEntries].sort((a, b) => {

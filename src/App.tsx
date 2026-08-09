@@ -563,6 +563,11 @@ export default function App() {
   // Id of the match job whose progress poll loop is currently running — stops a
   // second loop from being started for the same job (see pollMatchUntilDone).
   const matchPollRef = useRef<string | null>(null);
+  // Monotonic counter that invalidates older poll loops. Opening / starting a
+  // DIFFERENT match job bumps it, so a previously running loop exits on its
+  // next tick instead of racing the new job and overwriting its results (which
+  // is what made "Open" sometimes spin forever or show the wrong segments).
+  const matchPollEpochRef = useRef(0);
 
   // Look up the StoredCandidateSet (if any) recorded for an arbitrary
   // segment's short-clip range — matched by range, not array index, since a
@@ -940,6 +945,8 @@ export default function App() {
     // same job, doubling requests and fighting over the same state (this is
     // what made the spinner stick and the tab get killed on mobile).
     if (matchPollRef.current === jobId) return;
+    // Any loop started earlier (for a different job) is now stale.
+    const epoch = ++matchPollEpochRef.current;
     matchPollRef.current = jobId;
 
     const pollStartTime = performance.now();
@@ -953,11 +960,17 @@ export default function App() {
         : Math.min(1500 * Math.pow(2, consecutiveErrors - 1), 15_000);
       await new Promise(r => setTimeout(r, delay));
 
+      // Superseded by a newer job (user opened/started another match) — exit
+      // silently WITHOUT touching shared state, so the new job stays in charge.
+      if (matchPollEpochRef.current !== epoch) break;
+
       try {
         // Hard 15s timeout per poll — a single hung request can otherwise
         // freeze the spinner forever (the loop would never advance).
         const res = await fetch(`/api/match-status/${jobId}`, { signal: AbortSignal.timeout(15_000) });
         consecutiveErrors = 0;
+        // The request itself can outlive the loop's relevance — re-check.
+        if (matchPollEpochRef.current !== epoch) break;
 
         if (!res.ok) {
           clearMatchJobId();
@@ -1042,6 +1055,15 @@ export default function App() {
     setShowHistory(false);
     setErrorMsg('');
     setStatus('Opening match job…');
+    // Retire any poll loop belonging to a different match job before we swap in
+    // this one's data — otherwise the old loop keeps writing progress/segments
+    // over the job the user just opened (endless spinner / wrong results).
+    if (matchPollRef.current && matchPollRef.current !== jobId) {
+      matchPollEpochRef.current++;
+      matchPollRef.current = null;
+      setMatchProgress(null);
+      setIsMatching(false);
+    }
     let job: any = null;
     try {
       // Hard 20s timeout — if the server is busy/unreachable the spinner can
@@ -1140,6 +1162,66 @@ export default function App() {
 
     applyRestoredSession(role, session, session.totalFrames);
     setStatus(`Opened "${session.fileName}" as ${role === 'reference' ? 'reference movie' : 'target clip'}.`);
+  }
+
+  // Keep the main panel honest when a job is deleted from Job History: if the
+  // deleted job is the one currently loaded, wipe its state/session instead of
+  // leaving dead video URLs and stale results behind.
+  function handleJobDeleted(jobId: string, type: 'fingerprint' | 'match') {
+    if (type === 'match') {
+      if (matchJobId !== jobId) return;
+      if (matchPollRef.current === jobId) {
+        matchPollEpochRef.current++;
+        matchPollRef.current = null;
+      }
+      clearMatchJobId();
+      setMatchJobId('');
+      setIsMatching(false);
+      setMatchProgress(null);
+      setSegments([]);
+      setUnmatched([]);
+      setMatchStats(null);
+      setPreviewSegment(null);
+      setCandidateSets([]);
+      setViewAllCandidatesForKey(null);
+      setStatus('That match job was deleted from history.');
+      return;
+    }
+
+    for (const role of ['reference', 'target'] as const) {
+      const currentId = role === 'reference' ? refJobId : targetJobId;
+      if (currentId !== jobId) continue;
+      clearJobSession(role);
+      if (role === 'reference') {
+        revokeIfBlobUrl(refFileUrl);
+        setRefFile(null);
+        setRefFileUrl('');
+        setRefJobId('');
+        setRefDone(false);
+        setRefCached(false);
+        setRefCachedMeta(null);
+        setIsProcessingRef(false);
+      } else {
+        revokeIfBlobUrl(targetFileUrl);
+        setTargetFile(null);
+        setTargetFileUrl('');
+        setTargetJobId('');
+        setTargetDone(false);
+        setTargetCached(false);
+        setTargetCachedMeta(null);
+        setIsProcessingTarget(false);
+      }
+      setStatus(`Deleted job was loaded in Step ${role === 'reference' ? '1' : '2'} — that slot has been cleared.`);
+    }
+  }
+
+  // The saved copy of a video was removed from the server. Any preview still
+  // pointing at /api/video/<jobId> is now a dead URL, so drop it and let the
+  // "not available for preview" placeholder explain what happened.
+  function handleVideoRemoved(jobId: string) {
+    const deadUrl = `/api/video/${jobId}`;
+    setRefFileUrl(prev => (prev === deadUrl ? '' : prev));
+    setTargetFileUrl(prev => (prev === deadUrl ? '' : prev));
   }
 
   async function handleReattach(jobId: string, type: 'fingerprint' | 'match' = 'fingerprint') {
@@ -2017,7 +2099,14 @@ export default function App() {
 
         {/* ── Job History panel ── */}
         {showHistory && (
-          <JobHistory onClose={() => setShowHistory(false)} onReattach={handleReattach} onOpenMatch={openMatchJob} onOpenFingerprint={openFingerprintJob} />
+          <JobHistory
+            onClose={() => setShowHistory(false)}
+            onReattach={handleReattach}
+            onOpenMatch={openMatchJob}
+            onOpenFingerprint={openFingerprintJob}
+            onJobDeleted={handleJobDeleted}
+            onVideoRemoved={handleVideoRemoved}
+          />
         )}
 
         {/* ── Saved Sessions panel ── */}
