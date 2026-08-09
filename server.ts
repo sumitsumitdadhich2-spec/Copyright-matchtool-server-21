@@ -927,6 +927,85 @@ async function startServer() {
     res.json({ jobId, totalFrames: job.totalFrames });
   });
 
+  // 6a-2. Stream the original uploaded video for a job (kept on disk after
+  // fingerprinting). Supports HTTP Range requests so <video> seeking works.
+  // This lets the frontend restore video previews after a page refresh —
+  // the browser's local File object is gone, but the server copy survives.
+  app.get('/api/video/:jobId', (req, res) => {
+    const { jobId } = req.params;
+    if (!/^[\w-]+$/.test(jobId)) return res.status(400).json({ error: 'Invalid jobId' });
+
+    const videoPath = getVideoPathForJob(jobId);
+    if (!videoPath) return res.status(404).json({ error: 'No saved video for this job' });
+
+    let stat: fs.Stats;
+    try { stat = fs.statSync(videoPath); } catch {
+      return res.status(404).json({ error: 'Video file missing' });
+    }
+
+    const ext = path.extname(videoPath).toLowerCase();
+    const mime: Record<string, string> = {
+      '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime',
+      '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo', '.m4v': 'video/x-m4v',
+    };
+    const contentType = mime[ext] ?? 'video/mp4';
+
+    const range = req.headers.range;
+    if (range) {
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      let start = m && m[1] ? parseInt(m[1], 10) : 0;
+      let end = m && m[2] ? parseInt(m[2], 10) : stat.size - 1;
+      if (isNaN(start) || start < 0) start = 0;
+      if (isNaN(end) || end >= stat.size) end = stat.size - 1;
+      if (start > end) {
+        return res.status(416).set('Content-Range', `bytes */${stat.size}`).end();
+      }
+      res.status(206).set({
+        'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': String(end - start + 1),
+        'Content-Type': contentType,
+      });
+      fs.createReadStream(videoPath, { start, end }).pipe(res);
+    } else {
+      res.status(200).set({
+        'Content-Length': String(stat.size),
+        'Content-Type': contentType,
+        'Accept-Ranges': 'bytes',
+      });
+      fs.createReadStream(videoPath).pipe(res);
+    }
+  });
+
+  // 6a-3. Delete ONLY the saved video file for a job — fingerprints, results
+  // and job history stay intact. Lets the user free disk space from the UI.
+  app.delete('/api/video/:jobId', (req, res) => {
+    const { jobId } = req.params;
+    if (!/^[\w-]+$/.test(jobId)) return res.status(400).json({ error: 'Invalid jobId' });
+
+    const videoPath = getVideoPathForJob(jobId);
+    if (!videoPath) return res.status(404).json({ error: 'No saved video for this job' });
+
+    try {
+      fs.unlinkSync(videoPath);
+    } catch (e: any) {
+      return res.status(500).json({ error: e?.message || 'Failed to delete video' });
+    }
+
+    // Clear videoPath from meta so hasVideo reports false going forward
+    try {
+      const mp = metaPath(jobId);
+      if (fs.existsSync(mp)) {
+        const meta: JobMeta = JSON.parse(fs.readFileSync(mp, 'utf-8'));
+        delete meta.videoPath;
+        fs.writeFileSync(mp, JSON.stringify(meta));
+      }
+    } catch { /* non-fatal */ }
+
+    console.log(`[Delete] Saved video for job ${jobId} removed (${videoPath})`);
+    res.json({ deleted: true });
+  });
+
   // 6b. List all jobs — for the Job History panel. Merges fingerprint jobs and
   // match jobs into one list, each tagged with `type` so the UI can render and
   // route stop/delete actions correctly.
@@ -949,11 +1028,21 @@ async function startServer() {
       uploading: 0, processing: 1, pending: 2, completed: 3, stopped: 4, failed: 5
     };
 
-    const fingerprintEntries = Array.from(jobs.values()).map(j => ({ ...j, type: 'fingerprint' as const }));
+    const fingerprintEntries = Array.from(jobs.values()).map(j => ({
+      ...j,
+      type: 'fingerprint' as const,
+      // Whether the original uploaded video is still saved on the server's disk
+      // (drives the "video saved" chip + preview restore + remove-video action).
+      hasVideo: !!getVideoPathForJob(j.id),
+    }));
     const matchEntries = Array.from(matchJobs.values()).map(j => ({
       id: j.id,
       type: 'match' as const,
       status: j.status,
+      // Source job ids so the frontend can restore video previews when
+      // (re)opening a completed match job after a page refresh.
+      movieJobId: j.movieJobId,
+      shortJobId: j.shortJobId,
       // Reuse the fingerprint JobEntry shape for the frontend: totalFrames=100 /
       // processedFrames=pct lets the existing percentage math work unchanged;
       // `progress` carries the richer phase/segment detail for match-aware UI.
@@ -1465,6 +1554,9 @@ async function startServer() {
     res.json({
       matchJobId: job.id,
       status: job.status,
+      movieJobId: job.movieJobId,
+      shortJobId: job.shortJobId,
+      originalName: job.originalName,
       progress: job.progress,
       error: job.error,
       segments: job.segments,

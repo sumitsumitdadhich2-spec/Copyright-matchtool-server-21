@@ -107,6 +107,27 @@ interface SanityResult {
 // Helper utilities
 // ---------------------------------------------------------------------------
 
+/**
+ * Check whether the server still has the original uploaded video saved on
+ * disk for a fingerprint job. Returns a streamable URL (with Range support)
+ * or null. Used to restore video previews after a page refresh, when the
+ * browser's local File object no longer exists.
+ */
+async function fetchServerVideoUrl(jobId: string): Promise<string | null> {
+  if (!jobId) return null;
+  try {
+    const res = await fetch(`/api/video/${jobId}`, { method: 'HEAD' });
+    return res.ok ? `/api/video/${jobId}` : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Revoke only real blob: URLs — server /api/video URLs must not be revoked. */
+function revokeIfBlobUrl(url: string) {
+  if (url && url.startsWith('blob:')) URL.revokeObjectURL(url);
+}
+
 function fmt(secs: number) {
   const m = Math.floor(secs / 60);
   const s = (secs % 60).toFixed(2).padStart(5, '0');
@@ -665,8 +686,8 @@ export default function App() {
   // Clean up blob URLs on unmount
   useEffect(() => {
     return () => {
-      if (refFileUrl)    URL.revokeObjectURL(refFileUrl);
-      if (targetFileUrl) URL.revokeObjectURL(targetFileUrl);
+      revokeIfBlobUrl(refFileUrl);
+      revokeIfBlobUrl(targetFileUrl);
     };
   }, []);
 
@@ -694,6 +715,18 @@ export default function App() {
             setSegments(job.segments || []);
             setUnmatched(job.unmatchedRanges || []);
             setMatchStats({ movieFrames: job.movieFrames, shortFrames: job.shortFrames });
+            // Restore video previews from the server's saved copies — the local
+            // File objects are gone after a refresh, but /api/video/:jobId survives.
+            if (job.movieJobId) {
+              fetchServerVideoUrl(job.movieJobId).then(url => {
+                if (url) setRefFileUrl(prev => prev || url);
+              });
+            }
+            if (job.shortJobId) {
+              fetchServerVideoUrl(job.shortJobId).then(url => {
+                if (url) setTargetFileUrl(prev => prev || url);
+              });
+            }
             clearMatchJobId();
           } else {
             clearMatchJobId();
@@ -752,6 +785,13 @@ export default function App() {
       setTargetCached(true);
       setTargetCachedMeta({ fileName: session.fileName, totalFrames });
     }
+    // Restore the video preview from the server's saved copy if the user
+    // hasn't already picked a local file (local blob URL takes priority).
+    fetchServerVideoUrl(session.jobId).then(url => {
+      if (!url) return;
+      if (role === 'reference') setRefFileUrl(prev => prev || url);
+      else setTargetFileUrl(prev => prev || url);
+    });
   }
 
   async function pollUntilDone(
@@ -913,18 +953,75 @@ export default function App() {
   // ---------------------------------------------------------------------------
   // Reattach to a running job from the Job History panel
   // ---------------------------------------------------------------------------
-  async function handleReattach(jobId: string, type: 'fingerprint' | 'match' = 'fingerprint') {
-    if (type === 'match') {
-      setShowHistory(false);
+  // Open a match job from Job History. Checks the job's real status FIRST so a
+  // finished/failed job never puts the UI into an endless "matching…" spinner:
+  //  - processing → reconnect + live progress polling
+  //  - completed  → load the saved results + restore video previews instantly
+  //  - failed/stopped → show the reason, no spinner
+  async function openMatchJob(jobId: string) {
+    setShowHistory(false);
+    setErrorMsg('');
+    setStatus('Opening match job…');
+    let job: any = null;
+    try {
+      const res = await fetch(`/api/match-status/${jobId}`);
+      if (res.ok) job = await res.json();
+    } catch { /* handled below */ }
+
+    if (!job) {
+      setStatus('');
+      setErrorMsg('Match job could not be opened — it may have been deleted or the server is unreachable.');
+      return;
+    }
+
+    if (job.status === 'processing') {
       setMatchJobId(jobId);
       saveMatchJobId(jobId);
       setIsMatching(true);
       setSegments([]);
       setUnmatched([]);
       setMatchStats(null);
-      setErrorMsg('');
       setStatus('Reconnecting to match processing…');
       pollMatchUntilDone(jobId);
+      return;
+    }
+
+    if (job.status === 'completed') {
+      setMatchJobId(jobId);
+      setIsMatching(false);
+      setMatchProgress(null);
+      setPreviewSegment(null);
+      setSegments(job.segments || []);
+      setUnmatched(job.unmatchedRanges || []);
+      setMatchStats({ movieFrames: job.movieFrames, shortFrames: job.shortFrames });
+      const segCount = (job.segments || []).length;
+      setStatus(`Opened saved match: ${segCount} segment${segCount === 1 ? '' : 's'} found.`);
+      // Restore both video previews from the server's saved copies.
+      if (job.movieJobId) {
+        fetchServerVideoUrl(job.movieJobId).then(url => {
+          if (url) setRefFileUrl(prev => prev || url);
+        });
+      }
+      if (job.shortJobId) {
+        fetchServerVideoUrl(job.shortJobId).then(url => {
+          if (url) setTargetFileUrl(prev => prev || url);
+        });
+      }
+      return;
+    }
+
+    // failed / stopped — surface the reason instead of spinning forever
+    setStatus('');
+    setErrorMsg(
+      job.status === 'failed'
+        ? `Match job failed${job.error ? `: ${job.error}` : ''}.`
+        : 'Match job was stopped before finishing.'
+    );
+  }
+
+  async function handleReattach(jobId: string, type: 'fingerprint' | 'match' = 'fingerprint') {
+    if (type === 'match') {
+      await openMatchJob(jobId);
       return;
     }
     // Determine which role this job belongs to by checking stored sessions.
@@ -1050,7 +1147,7 @@ export default function App() {
     setMatchStats(null);
     setPreviewSegment(null);
     setStatus('');
-    if (refFileUrl) URL.revokeObjectURL(refFileUrl);
+    revokeIfBlobUrl(refFileUrl);
     setRefFileUrl(file ? URL.createObjectURL(file) : '');
 
     if (file && processMode === 'server') {
@@ -1081,7 +1178,7 @@ export default function App() {
     setSegments([]);
     setMatchStats(null);
     setPreviewSegment(null);
-    if (targetFileUrl) URL.revokeObjectURL(targetFileUrl);
+    revokeIfBlobUrl(targetFileUrl);
     setTargetFileUrl(file ? URL.createObjectURL(file) : '');
 
     if (file && processMode === 'server') {
@@ -1797,7 +1894,7 @@ export default function App() {
 
         {/* ── Job History panel ── */}
         {showHistory && (
-          <JobHistory onClose={() => setShowHistory(false)} onReattach={handleReattach} />
+          <JobHistory onClose={() => setShowHistory(false)} onReattach={handleReattach} onOpenMatch={openMatchJob} />
         )}
 
         {/* ── Saved Sessions panel ── */}

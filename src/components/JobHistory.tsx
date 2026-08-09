@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { X, Trash2, Square, CheckCircle2, AlertCircle, Clock, RefreshCw, Film } from 'lucide-react';
+import { X, Trash2, Square, CheckCircle2, AlertCircle, Clock, RefreshCw, Film, FolderOpen, HardDrive } from 'lucide-react';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,6 +28,10 @@ interface JobEntry {
   // Match-job-only extras
   progress?: MatchJobProgress;
   segmentCount?: number;
+  movieJobId?: string;
+  shortJobId?: string;
+  // Fingerprint-job-only: original uploaded video still saved on the server
+  hasVideo?: boolean;
 }
 
 const MATCH_PHASE_LABEL: Record<string, string> = {
@@ -105,13 +109,18 @@ function JobCard({
   onStop,
   onDelete,
   onReattach,
+  onOpenMatch,
+  onDeleteVideo,
 }: {
   job: JobEntry;
   onStop: (id: string, type: 'fingerprint' | 'match') => void;
   onDelete: (id: string, type: 'fingerprint' | 'match') => void;
   onReattach?: (id: string, type: 'fingerprint' | 'match') => void;
+  onOpenMatch?: (id: string) => void;
+  onDeleteVideo?: (id: string) => void;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmDeleteVideo, setConfirmDeleteVideo] = useState(false);
   const [stopping, setStopping] = useState(false);
 
   const isMatch = job.type === 'match';
@@ -218,8 +227,13 @@ function JobCard({
 
       {/* Frame count / segment count (completed) */}
       {job.status === 'completed' && !isMatch && job.totalFrames > 0 && (
-        <p className="text-[11px] font-mono text-slate-500">
-          {job.totalFrames.toLocaleString()} frames fingerprinted
+        <p className="text-[11px] font-mono text-slate-500 flex items-center gap-2 flex-wrap">
+          <span>{job.totalFrames.toLocaleString()} frames fingerprinted</span>
+          {job.hasVideo && (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-sky-500/25 bg-sky-500/10 text-sky-400 text-[10px] font-semibold">
+              <HardDrive className="w-3 h-3" /> Video saved
+            </span>
+          )}
         </p>
       )}
       {job.status === 'completed' && isMatch && (
@@ -261,6 +275,46 @@ function JobCard({
           </>
         )}
 
+        {/* Open — reload a completed match job's results into the main panel */}
+        {!isRunning && isMatch && job.status === 'completed' && onOpenMatch && (
+          <button
+            onClick={() => onOpenMatch(job.id)}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-indigo-500/30 text-indigo-400 bg-indigo-500/10 hover:bg-indigo-500/20 transition cursor-pointer"
+          >
+            <FolderOpen className="w-3 h-3" />
+            Open
+          </button>
+        )}
+
+        {/* Remove saved video — frees server disk space, keeps fingerprints */}
+        {!isRunning && !isMatch && job.hasVideo && onDeleteVideo && (
+          !confirmDeleteVideo ? (
+            <button
+              onClick={() => setConfirmDeleteVideo(true)}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-sky-500/25 text-sky-400 bg-sky-500/10 hover:bg-sky-500/20 transition cursor-pointer"
+            >
+              <HardDrive className="w-3 h-3" />
+              Remove video
+            </button>
+          ) : (
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-slate-400">Remove saved video?</span>
+              <button
+                onClick={() => { setConfirmDeleteVideo(false); onDeleteVideo(job.id); }}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-sky-600 hover:bg-sky-500 text-white transition cursor-pointer"
+              >
+                Yes, remove
+              </button>
+              <button
+                onClick={() => setConfirmDeleteVideo(false)}
+                className="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-300 transition cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+          )
+        )}
+
         {/* Delete button */}
         {!confirmDelete ? (
           <button
@@ -299,19 +353,28 @@ function JobCard({
 interface JobHistoryProps {
   onClose: () => void;
   onReattach?: (jobId: string, type: 'fingerprint' | 'match') => void;
+  onOpenMatch?: (jobId: string) => void;
 }
 
-export function JobHistory({ onClose, onReattach }: JobHistoryProps) {
+export function JobHistory({ onClose, onReattach, onOpenMatch }: JobHistoryProps) {
   const [jobs, setJobs] = useState<JobEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Serialized snapshot of the last applied jobs payload — lets us skip
+  // setState entirely when nothing changed, so the panel doesn't visibly
+  // "refresh" (re-render/flicker) on every poll tick.
+  const lastPayloadRef = useRef<string>('');
 
   const fetchJobs = useCallback(async () => {
     try {
       const res = await fetch('/api/jobs');
       if (!res.ok) return;
       const data: JobEntry[] = await res.json();
-      setJobs(data);
+      const payload = JSON.stringify(data);
+      if (payload !== lastPayloadRef.current) {
+        lastPayloadRef.current = payload;
+        setJobs(data);
+      }
     } catch {
       /* network error — keep old state */
     } finally {
@@ -319,14 +382,17 @@ export function JobHistory({ onClose, onReattach }: JobHistoryProps) {
     }
   }, []);
 
+  // Adaptive polling: 2s while something is running, 6s when everything is
+  // finished (history rarely changes on its own — no need to hammer the API).
+  const hasRunning = jobs.some(j => j.status === 'processing' || j.status === 'pending' || j.status === 'uploading');
+
   useEffect(() => {
     fetchJobs();
-    // Poll every 2 seconds while the panel is open
-    intervalRef.current = setInterval(fetchJobs, 2000);
+    intervalRef.current = setInterval(fetchJobs, hasRunning ? 2000 : 6000);
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [fetchJobs]);
+  }, [fetchJobs, hasRunning]);
 
   const handleStop = useCallback(async (jobId: string, type: 'fingerprint' | 'match') => {
     try {
@@ -343,7 +409,18 @@ export function JobHistory({ onClose, onReattach }: JobHistoryProps) {
     try {
       const url = type === 'match' ? `/api/match/${jobId}` : `/api/job/${jobId}`;
       await fetch(url, { method: 'DELETE' });
+      lastPayloadRef.current = ''; // force next poll to re-apply fresh data
       setJobs(prev => prev.filter(j => j.id !== jobId));
+    } catch { /* ignore */ }
+  }, []);
+
+  // Delete ONLY the saved video file from the server — fingerprints and job
+  // history remain, so matching still works; only the video preview is gone.
+  const handleDeleteVideo = useCallback(async (jobId: string) => {
+    try {
+      await fetch(`/api/video/${jobId}`, { method: 'DELETE' });
+      lastPayloadRef.current = '';
+      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, hasVideo: false } : j));
     } catch { /* ignore */ }
   }, []);
 
