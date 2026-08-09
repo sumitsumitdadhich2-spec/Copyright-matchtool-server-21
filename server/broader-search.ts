@@ -123,8 +123,25 @@ export async function broaderSearchForRange(
       Math.min(seg.shortEnd, shortEnd) - Math.max(seg.shortStart, shortStart) > 0.15,
     );
 
+    // PERFORMANCE FIX (bottleneck 2): structurally degenerate candidates
+    // (frozen/implausible speedRatio — computable from the time spans alone,
+    // no VLM needed) are excluded HERE, before they can consume any of the
+    // BROADER_SEARCH_MAX_NEW result slots or downstream embedding-ranking
+    // cost. Previously they were surfaced, ranked, and only then
+    // auto-rejected one by one — burning whole auto-extend rounds (observed:
+    // seg18 spent 25+ auto-rejections across 4 rounds) while the plausible
+    // locations they displaced were never returned at all.
+    const plausible = overlapping.filter(seg => degenerateCandidateReason(seg) === null);
+    const excluded = overlapping.length - plausible.length;
+    if (excluded > 0) {
+      console.log(
+        `[BroaderSearch] round ${round}: excluded ${excluded} degenerate candidate(s) ` +
+        `before ranking/verification (kept ${plausible.length})`,
+      );
+    }
+
     const deduped: MatchedSegment[] = [];
-    for (const seg of overlapping) {
+    for (const seg of plausible) {
       if (!deduped.some(d => Math.abs(d.movieStart - seg.movieStart) <= SAME_LOCATION_TOLERANCE)) {
         deduped.push(seg);
       }
