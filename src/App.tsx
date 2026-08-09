@@ -560,6 +560,9 @@ export default function App() {
   const refVideoRef  = useRef<HTMLVideoElement>(null);
   const clipVideoRef = useRef<HTMLVideoElement>(null);
   const loopRef      = useRef({ loop: true, seg: null as MatchedSegment | null });
+  // Id of the match job whose progress poll loop is currently running — stops a
+  // second loop from being started for the same job (see pollMatchUntilDone).
+  const matchPollRef = useRef<string | null>(null);
 
   // Look up the StoredCandidateSet (if any) recorded for an arbitrary
   // segment's short-clip range — matched by range, not array index, since a
@@ -872,24 +875,78 @@ export default function App() {
   // Restore both video previews from the server's saved video copies (used on
   // reconnect/refresh when the local File objects are gone). Never overwrites
   // an existing preview URL — a locally-selected file always wins.
-  function restoreVideoPreviews(movieJobId?: string, shortJobId?: string) {
-    if (movieJobId) {
-      fetchServerVideoUrl(movieJobId).then(url => {
-        if (url) setRefFileUrl(prev => prev || url);
-      });
+  function restoreVideoPreviews(
+    movieJobId?: string,
+    shortJobId?: string,
+    opts: { force?: boolean } = {}
+  ) {
+    void attachSourceSlot(movieJobId, 'reference', opts);
+    void attachSourceSlot(shortJobId, 'target', opts);
+  }
+
+  // Re-link one of a match job's source fingerprint jobs back into its slot
+  // (Step 1 = reference movie, Step 2 = target clip). This restores BOTH the
+  // saved video preview AND the slot metadata (job id, file name, frame count),
+  // so after a refresh / "Open" the user can see which videos are loaded and
+  // can re-run matching or retry single segments — not just watch the preview.
+  async function attachSourceSlot(
+    jobId: string | undefined,
+    role: 'reference' | 'target',
+    opts: { force?: boolean } = {}
+  ) {
+    if (!jobId) return;
+
+    let job: any = null;
+    try {
+      const res = await fetch(`/api/jobs/${jobId}`, { signal: AbortSignal.timeout(15_000) });
+      if (res.ok) job = await res.json();
+    } catch { /* fall through to preview-only restore below */ }
+
+    if (opts.force) {
+      // Explicit user action (opening a saved job) replaces whatever is loaded.
+      if (role === 'reference') {
+        setRefFile(null);
+        setRefFileUrl(prev => { revokeIfBlobUrl(prev); return ''; });
+      } else {
+        setTargetFile(null);
+        setTargetFileUrl(prev => { revokeIfBlobUrl(prev); return ''; });
+      }
     }
-    if (shortJobId) {
-      fetchServerVideoUrl(shortJobId).then(url => {
-        if (url) setTargetFileUrl(prev => prev || url);
-      });
+
+    if (job && job.status === 'completed') {
+      const session: CachedJob = {
+        jobId,
+        fileName: job.originalName ?? jobId,
+        fileSize: job.fileSize ?? 0,
+        totalFrames: job.totalFrames ?? 0,
+        savedAt: Date.now(),
+      };
+      saveJobSession(role, session);
+      applyRestoredSession(role, session, session.totalFrames);
+      return;
     }
+
+    // Fingerprint job is gone (deleted from history) — still show the video if
+    // the file itself survived, so the results stay watchable.
+    const url = await fetchServerVideoUrl(jobId);
+    if (!url) return;
+    if (role === 'reference') setRefFileUrl(prev => prev || url);
+    else                      setTargetFileUrl(prev => prev || url);
   }
 
   async function pollMatchUntilDone(jobId: string) {
+    // Only ONE poll loop per match job may run at a time. Without this guard a
+    // refresh-restore plus a manual "Reconnect" would start two loops for the
+    // same job, doubling requests and fighting over the same state (this is
+    // what made the spinner stick and the tab get killed on mobile).
+    if (matchPollRef.current === jobId) return;
+    matchPollRef.current = jobId;
+
     const pollStartTime = performance.now();
     let consecutiveErrors = 0;
     const MAX_CONSECUTIVE_ERRORS = 8;
 
+    try {
     while (true) {
       const delay = consecutiveErrors === 0
         ? 1500
@@ -968,6 +1025,9 @@ export default function App() {
         }
       }
     }
+    } finally {
+      if (matchPollRef.current === jobId) matchPollRef.current = null;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1006,7 +1066,7 @@ export default function App() {
       setStatus('Reconnecting to match processing…');
       // Bring back both video previews from the server's saved copies so the
       // panel isn't empty while the job keeps running after a reconnect.
-      restoreVideoPreviews(job.movieJobId, job.shortJobId);
+      restoreVideoPreviews(job.movieJobId, job.shortJobId, { force: true });
       pollMatchUntilDone(jobId);
       return;
     }
@@ -1025,7 +1085,7 @@ export default function App() {
       const segCount = (job.segments || []).length;
       setStatus(`Opened saved match: ${segCount} segment${segCount === 1 ? '' : 's'} found.`);
       // Restore both video previews from the server's saved copies.
-      restoreVideoPreviews(job.movieJobId, job.shortJobId);
+      restoreVideoPreviews(job.movieJobId, job.shortJobId, { force: true });
       return;
     }
 
@@ -2392,6 +2452,11 @@ export default function App() {
               );
             })()}
 
+            {/* On narrow screens the Compare column scrolls out of view, so make
+                it explicit that the row itself opens the comparison. */}
+            <p className="px-5 py-2 text-[11px] text-slate-500 border-b border-slate-800 bg-slate-950/40">
+              Tap any row to compare it — swipe the table sideways for confidence and candidate controls.
+            </p>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead className="bg-slate-950 text-slate-500 text-xs font-medium uppercase tracking-wider border-b border-slate-800">
@@ -2415,7 +2480,9 @@ export default function App() {
                     return (
                       <React.Fragment key={i}>
                       <tr
-                        className={`transition-colors hover:bg-slate-800/40 ${
+                        onClick={() => handlePreviewSegment(seg)}
+                        title="Tap this row to compare the clip and the movie side by side"
+                        className={`transition-colors hover:bg-slate-800/40 cursor-pointer ${
                           isActive
                             ? 'bg-indigo-900/20 ring-1 ring-inset ring-indigo-500/30'
                             : seg.vlmRejectedKept
@@ -2494,7 +2561,7 @@ export default function App() {
                                 for this segment right below the row */}
                             {rowCs && (
                               <button
-                                onClick={() => toggleCandidateExpansion(rowCs.segmentIndex)}
+                                onClick={e => { e.stopPropagation(); toggleCandidateExpansion(rowCs.segmentIndex); }}
                                 title={isExpanded ? 'Hide candidates' : `Show all ${rowCs.candidates.length} candidate(s) below this row`}
                                 className={`inline-flex items-center gap-1 px-2 py-1.5 border rounded-lg text-xs font-medium transition cursor-pointer ${isExpanded ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300' : 'bg-emerald-500/10 hover:bg-emerald-500/20 border-emerald-500/20 text-emerald-400'}`}>
                                 {isExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
@@ -2508,7 +2575,7 @@ export default function App() {
                               const isOpen = viewAllCandidatesForKey === cs.segmentIndex;
                               return (
                                 <button
-                                  onClick={() => setViewAllCandidatesForKey(isOpen ? null : cs.segmentIndex)}
+                                  onClick={e => { e.stopPropagation(); setViewAllCandidatesForKey(isOpen ? null : cs.segmentIndex); }}
                                   title={`View all ${cs.candidates.length} candidate(s) for this segment`}
                                   className={`inline-flex items-center gap-1 px-2 py-1.5 border rounded-lg text-xs font-medium transition cursor-pointer ${isOpen ? 'bg-purple-500/20 border-purple-500/40 text-purple-300' : 'bg-purple-500/10 hover:bg-purple-500/20 border-purple-500/20 text-purple-400'}`}>
                                   <ListChecks className="w-3 h-3" />
@@ -2750,8 +2817,11 @@ export default function App() {
                       onPause={() => setIsPlaying(false)}
                     />
                   ) : (
-                    <div className="flex items-center justify-center h-40 text-slate-600 text-sm">
-                      Reference video not available for preview
+                    <div className="flex flex-col items-center justify-center gap-1 h-40 px-4 text-center text-slate-500 text-sm">
+                      <span>Reference video not available for preview</span>
+                      <span className="text-[11px] text-slate-600">
+                        Its saved copy was removed from the server. Re-open the movie from Job History, or pick the file again in Step 1.
+                      </span>
                     </div>
                   )}
                 </div>
@@ -2771,8 +2841,11 @@ export default function App() {
                       onPause={() => setIsPlaying(false)}
                     />
                   ) : (
-                    <div className="flex items-center justify-center h-40 text-slate-600 text-sm">
-                      Target clip not available for preview
+                    <div className="flex flex-col items-center justify-center gap-1 h-40 px-4 text-center text-slate-500 text-sm">
+                      <span>Target clip not available for preview</span>
+                      <span className="text-[11px] text-slate-600">
+                        Its saved copy was removed from the server. Re-open the clip from Job History, or pick the file again in Step 2.
+                      </span>
                     </div>
                   )}
                 </div>

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { X, Trash2, Square, CheckCircle2, AlertCircle, Clock, RefreshCw, Film, FolderOpen, HardDrive } from 'lucide-react';
+import { X, Trash2, Square, CheckCircle2, AlertCircle, Clock, RefreshCw, Film, FolderOpen, HardDrive, PlayCircle } from 'lucide-react';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -125,6 +125,8 @@ const JobCard = React.memo(function JobCard({
   const [confirmDeleteVideo, setConfirmDeleteVideo] = useState(false);
   const [pickOpenRole, setPickOpenRole] = useState(false);
   const [stopping, setStopping] = useState(false);
+  // Inline player for the server-saved copy of this job's video.
+  const [watching, setWatching] = useState(false);
 
   const isMatch = job.type === 'match';
   const isRunning = job.status === 'processing' || job.status === 'pending' || job.status === 'uploading';
@@ -240,8 +242,17 @@ const JobCard = React.memo(function JobCard({
         </p>
       )}
       {job.status === 'completed' && isMatch && (
-        <p className="text-[11px] font-mono text-slate-500">
-          {job.segmentCount?.toLocaleString() ?? 0} segment{job.segmentCount === 1 ? '' : 's'} found
+        <p className="text-[11px] font-mono text-slate-500 flex items-center gap-2 flex-wrap">
+          <span>{job.segmentCount?.toLocaleString() ?? 0} segment{job.segmentCount === 1 ? '' : 's'} found</span>
+          {job.hasVideo ? (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-sky-500/25 bg-sky-500/10 text-sky-400 text-[10px] font-semibold">
+              <HardDrive className="w-3 h-3" /> Videos saved — preview ready
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-amber-500/25 bg-amber-500/10 text-amber-400 text-[10px] font-semibold">
+              <AlertCircle className="w-3 h-3" /> Videos removed — results only
+            </span>
+          )}
         </p>
       )}
 
@@ -324,6 +335,17 @@ const JobCard = React.memo(function JobCard({
           )
         )}
 
+        {/* Watch the server-saved copy right here, without loading it into a slot */}
+        {!isRunning && !isMatch && job.hasVideo && (
+          <button
+            onClick={() => setWatching(v => !v)}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-teal-500/30 text-teal-400 bg-teal-500/10 hover:bg-teal-500/20 transition cursor-pointer"
+          >
+            <PlayCircle className="w-3 h-3" />
+            {watching ? 'Hide video' : 'Watch'}
+          </button>
+        )}
+
         {/* Remove saved video — frees server disk space, keeps fingerprints */}
         {!isRunning && !isMatch && job.hasVideo && onDeleteVideo && (
           !confirmDeleteVideo ? (
@@ -380,6 +402,18 @@ const JobCard = React.memo(function JobCard({
           </div>
         )}
       </div>
+
+      {/* Inline preview of the copy kept on the server */}
+      {watching && job.hasVideo && (
+        <div className="bg-black rounded-lg overflow-hidden border border-slate-700/60">
+          <video
+            src={`/api/video/${job.id}`}
+            controls
+            preload="metadata"
+            className="w-full max-h-56 object-contain"
+          />
+        </div>
+      )}
     </div>
   );
 });

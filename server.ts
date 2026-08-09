@@ -1054,6 +1054,10 @@ async function startServer() {
       completedAt: j.completedAt,
       progress: j.progress,
       segmentCount: j.segments?.length,
+      // True only when BOTH source videos are still saved on disk — that is
+      // what decides whether opening this match can actually show previews.
+      hasVideo: !!(j.movieJobId && j.shortJobId
+        && getVideoPathForJob(j.movieJobId) && getVideoPathForJob(j.shortJobId)),
     }));
 
     const list = [...fingerprintEntries, ...matchEntries].sort((a, b) => {
