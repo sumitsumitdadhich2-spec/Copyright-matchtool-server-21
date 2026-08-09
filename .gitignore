@@ -7,3 +7,6 @@ coverage/
 .env*
 !.env.example
 runtime-settings.json
+
+# Runtime upload artifacts (large files, not for git)
+uploads/

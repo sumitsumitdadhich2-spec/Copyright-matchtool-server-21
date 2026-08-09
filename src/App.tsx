@@ -1315,6 +1315,14 @@ export default function App() {
   // ---------------------------------------------------------------------------
   // Preview: seek + auto-play
   // ---------------------------------------------------------------------------
+  // play() returns a promise that rejects with AbortError if a pause() (or a
+  // new load/seek) interrupts it before playback starts — e.g. when the user
+  // quickly steps to another segment/candidate. Swallow that rejection so it
+  // never surfaces as an unhandled runtime error.
+  const safePlay = (video: HTMLVideoElement | null) => {
+    video?.play().catch(() => { /* interrupted by pause/seek — safe to ignore */ });
+  };
+
   // `movieSeekOverride` lets callers (e.g. jumping to a specific candidate
   // from the "View all candidates" panel) land the reference video on a
   // different movie timestamp than this segment's own accepted match,
@@ -1334,8 +1342,8 @@ export default function App() {
       }
       // Auto-play after seeking
       setTimeout(() => {
-        refVideoRef.current?.play();
-        clipVideoRef.current?.play();
+        safePlay(refVideoRef.current);
+        safePlay(clipVideoRef.current);
         setIsPlaying(true);
       }, 200);
     }, 100);
@@ -1350,8 +1358,8 @@ export default function App() {
     } else {
       refVideoRef.current.playbackRate  = playbackSpeed;
       clipVideoRef.current.playbackRate = playbackSpeed;
-      refVideoRef.current.play();
-      clipVideoRef.current.play();
+      safePlay(refVideoRef.current);
+      safePlay(clipVideoRef.current);
       setIsPlaying(true);
     }
   };
@@ -1361,8 +1369,8 @@ export default function App() {
     const movieSeg = activeCandidateSet?.candidates[candidateIndex]?.segment ?? previewSegment;
     if (refVideoRef.current)  refVideoRef.current.currentTime  = movieSeg.movieStart;
     if (clipVideoRef.current) clipVideoRef.current.currentTime = previewSegment.shortStart;
-    refVideoRef.current?.play();
-    clipVideoRef.current?.play();
+    safePlay(refVideoRef.current);
+    safePlay(clipVideoRef.current);
     setIsPlaying(true);
   };
 
