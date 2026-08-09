@@ -705,10 +705,14 @@ export default function App() {
         const res = await fetch(`/api/match-status/${savedMatchJobId}`);
         if (res.ok) {
           const job = await res.json();
-          if (job.status === 'processing') {
+          if (job.status === 'processing' || job.status === 'pending') {
             setMatchJobId(savedMatchJobId);
             setIsMatching(true);
             setStatus('Reconnecting to match processing…');
+            // Restore video previews immediately — the local File objects are
+            // gone after a refresh, so without this the panel stays empty for
+            // the whole run even though the videos are saved on the server.
+            restoreVideoPreviews(job.movieJobId, job.shortJobId);
             pollMatchUntilDone(savedMatchJobId);
           } else if (job.status === 'completed') {
             setMatchJobId(savedMatchJobId);
@@ -717,16 +721,7 @@ export default function App() {
             setMatchStats({ movieFrames: job.movieFrames, shortFrames: job.shortFrames });
             // Restore video previews from the server's saved copies — the local
             // File objects are gone after a refresh, but /api/video/:jobId survives.
-            if (job.movieJobId) {
-              fetchServerVideoUrl(job.movieJobId).then(url => {
-                if (url) setRefFileUrl(prev => prev || url);
-              });
-            }
-            if (job.shortJobId) {
-              fetchServerVideoUrl(job.shortJobId).then(url => {
-                if (url) setTargetFileUrl(prev => prev || url);
-              });
-            }
+            restoreVideoPreviews(job.movieJobId, job.shortJobId);
             // Keep the saved id — the results (and video previews) must come
             // back after EVERY refresh, not just the first one.
           } else {
@@ -814,7 +809,9 @@ export default function App() {
       await new Promise(r => setTimeout(r, delay));
 
       try {
-        const res = await fetch(`/api/status/${jobId}`);
+        // Hard 15s timeout per poll — a hung request must never freeze the
+        // progress loop (it would otherwise spin forever with no error).
+        const res = await fetch(`/api/status/${jobId}`, { signal: AbortSignal.timeout(15_000) });
         consecutiveErrors = 0; // reset back-off on any successful HTTP response
 
         if (!res.ok) {
@@ -872,6 +869,22 @@ export default function App() {
   // above exactly (same interval, same backoff, same error threshold) so a
   // background tab or brief network drop behaves identically to fingerprinting.
   // ---------------------------------------------------------------------------
+  // Restore both video previews from the server's saved video copies (used on
+  // reconnect/refresh when the local File objects are gone). Never overwrites
+  // an existing preview URL — a locally-selected file always wins.
+  function restoreVideoPreviews(movieJobId?: string, shortJobId?: string) {
+    if (movieJobId) {
+      fetchServerVideoUrl(movieJobId).then(url => {
+        if (url) setRefFileUrl(prev => prev || url);
+      });
+    }
+    if (shortJobId) {
+      fetchServerVideoUrl(shortJobId).then(url => {
+        if (url) setTargetFileUrl(prev => prev || url);
+      });
+    }
+  }
+
   async function pollMatchUntilDone(jobId: string) {
     const pollStartTime = performance.now();
     let consecutiveErrors = 0;
@@ -884,7 +897,9 @@ export default function App() {
       await new Promise(r => setTimeout(r, delay));
 
       try {
-        const res = await fetch(`/api/match-status/${jobId}`);
+        // Hard 15s timeout per poll — a single hung request can otherwise
+        // freeze the spinner forever (the loop would never advance).
+        const res = await fetch(`/api/match-status/${jobId}`, { signal: AbortSignal.timeout(15_000) });
         consecutiveErrors = 0;
 
         if (!res.ok) {
@@ -923,6 +938,9 @@ export default function App() {
           setUnmatched(job.unmatchedRanges || []);
           setMatchStats({ movieFrames: job.movieFrames, shortFrames: job.shortFrames });
           setIsMatching(false);
+          // If previews are empty (reconnected after a refresh), restore them
+          // from the server's saved videos so results are actually watchable.
+          restoreVideoPreviews(job.movieJobId, job.shortJobId);
           const segs = job.segments || [];
           const unmatched = job.unmatchedRanges || [];
           setStatus(`Matching complete. ${segs.length} segment(s) found${unmatched.length > 0 ? `, ${unmatched.length} unmatched range(s)` : ' — full clip covered'}.`);
@@ -978,7 +996,7 @@ export default function App() {
       return;
     }
 
-    if (job.status === 'processing') {
+    if (job.status === 'processing' || job.status === 'pending') {
       setMatchJobId(jobId);
       saveMatchJobId(jobId);
       setIsMatching(true);
@@ -986,6 +1004,9 @@ export default function App() {
       setUnmatched([]);
       setMatchStats(null);
       setStatus('Reconnecting to match processing…');
+      // Bring back both video previews from the server's saved copies so the
+      // panel isn't empty while the job keeps running after a reconnect.
+      restoreVideoPreviews(job.movieJobId, job.shortJobId);
       pollMatchUntilDone(jobId);
       return;
     }
@@ -1004,16 +1025,7 @@ export default function App() {
       const segCount = (job.segments || []).length;
       setStatus(`Opened saved match: ${segCount} segment${segCount === 1 ? '' : 's'} found.`);
       // Restore both video previews from the server's saved copies.
-      if (job.movieJobId) {
-        fetchServerVideoUrl(job.movieJobId).then(url => {
-          if (url) setRefFileUrl(prev => prev || url);
-        });
-      }
-      if (job.shortJobId) {
-        fetchServerVideoUrl(job.shortJobId).then(url => {
-          if (url) setTargetFileUrl(prev => prev || url);
-        });
-      }
+      restoreVideoPreviews(job.movieJobId, job.shortJobId);
       return;
     }
 

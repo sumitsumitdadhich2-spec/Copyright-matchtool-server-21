@@ -405,8 +405,34 @@ export function JobHistory({ onClose, onReattach, onOpenMatch, onOpenFingerprint
   // setState entirely when nothing changed, so the panel doesn't visibly
   // "refresh" (re-render/flicker) on every poll tick.
   const lastPayloadRef = useRef<string>('');
+  // In-flight guard — with a 2s interval and a 15s request timeout, a slow
+  // server would otherwise pile up overlapping /api/jobs requests, which
+  // makes the panel feel like it is constantly refreshing (or hangs it).
+  const inFlightRef = useRef(false);
+
+  // The parent (App) re-renders every 1-2s while anything is processing, and
+  // it passes plain (non-memoized) functions as these props. Routing them
+  // through refs gives every JobCard STABLE callback props, so React.memo
+  // actually prevents the whole list from re-rendering on each App render —
+  // this is what stops the visible "refresh" flicker of the history panel.
+  const handlersRef = useRef({ onReattach, onOpenMatch, onOpenFingerprint });
+  useEffect(() => {
+    handlersRef.current = { onReattach, onOpenMatch, onOpenFingerprint };
+  }, [onReattach, onOpenMatch, onOpenFingerprint]);
+
+  const stableReattach = useCallback((id: string, type: 'fingerprint' | 'match') => {
+    handlersRef.current.onReattach?.(id, type);
+  }, []);
+  const stableOpenMatch = useCallback((id: string) => {
+    handlersRef.current.onOpenMatch?.(id);
+  }, []);
+  const stableOpenFingerprint = useCallback((id: string, role: 'reference' | 'target') => {
+    handlersRef.current.onOpenFingerprint?.(id, role);
+  }, []);
 
   const fetchJobs = useCallback(async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     try {
       const res = await fetch('/api/jobs', { signal: AbortSignal.timeout(15_000) });
       if (!res.ok) return;
@@ -429,6 +455,7 @@ export function JobHistory({ onClose, onReattach, onOpenMatch, onOpenFingerprint
     } catch {
       /* network error — keep old state */
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
     }
   }, []);
@@ -535,7 +562,7 @@ export function JobHistory({ onClose, onReattach, onOpenMatch, onOpenFingerprint
                   job={job}
                   onStop={handleStop}
                   onDelete={handleDelete}
-                  onReattach={onReattach}
+                  onReattach={stableReattach}
                 />
               </React.Fragment>
             ))}
