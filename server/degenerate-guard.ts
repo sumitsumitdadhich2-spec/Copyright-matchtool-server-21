@@ -38,6 +38,17 @@ export interface DegenerateCheckableSegment {
 export const DEGENERATE_MIN_SPEED_RATIO =
   Number(process.env.DEGENERATE_MIN_SPEED_RATIO) || 0.35;
 
+/**
+ * Upper bound of a plausible speed ratio. A real copied segment cannot play
+ * the movie forward MUCH faster than the short clip either: 2.0× is already
+ * the extreme legitimate fast-forward the engine models. Ratios far above
+ * that (observed bug: 7.35× / 5.68× — a handful of short frames "skipping"
+ * across a huge movie span) are hash-collision artifacts landing on visually
+ * similar duplicate scenes, which the VLM then wrongly confirms as "same".
+ */
+export const DEGENERATE_MAX_SPEED_RATIO =
+  Number(process.env.DEGENERATE_MAX_SPEED_RATIO) || 2.5;
+
 /** matchSequence spans below which the movie side counts as "frozen" when
  *  the short side spans at least DEGENERATE_MIN_SHORT_SPAN_S. */
 const DEGENERATE_FROZEN_MOVIE_SPAN_S = 0.25;
@@ -60,7 +71,18 @@ export function degenerateCandidateReason(
     );
   }
 
-  // 2. Frozen matchSequence — every matched short frame points at (almost)
+  // 2. Implausibly high speed ratio — the movie timeline races forward far
+  //    faster than any legitimate fast-forward edit. These mappings are
+  //    hash collisions across duplicate-looking scenes; the VLM cannot be
+  //    trusted on them ("same" at high confidence), so reject structurally.
+  if (Number.isFinite(seg.speedRatio) && seg.speedRatio > DEGENERATE_MAX_SPEED_RATIO) {
+    return (
+      `speedRatio ${seg.speedRatio.toFixed(2)} > ${DEGENERATE_MAX_SPEED_RATIO} ` +
+      `(movie timeline advances implausibly fast relative to short clip)`
+    );
+  }
+
+  // 3. Frozen matchSequence — every matched short frame points at (almost)
   //    the same movie instant even though the short side spans real time.
   //    Catches degenerate mappings even when the regression slope is noisy.
   if (seg.matchSequence.length >= 3) {

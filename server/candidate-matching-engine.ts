@@ -84,6 +84,13 @@ export interface MatchedSegment {
   }>;
   /** Per-channel similarity breakdown for the best-matching frame in this segment */
   bestFrameDetail?: FrameDetail;
+  /** True when every candidate for this range was VLM-rejected and this is
+   *  merely the highest-confidence rejected candidate kept visible so the
+   *  user can review it and hit Retry. NOT a verified match. */
+  vlmRejectedKept?: boolean;
+  /** Display-only: this segment jumps off the dominant forward movie
+   *  timeline established by the other segments (see timeline-outliers.ts). */
+  timelineOutlier?: boolean;
 }
 
 export interface MatchResult {
@@ -2356,7 +2363,7 @@ async function streamPrecomputeFromNDJSON(filePath: string): Promise<PreSet> {
       prevColorGrid = sig?.colorGrid ?? null;
       if (!sig || sig.colorGrid?.length !== 48) allHaveSig = false;
 
-      // ── Compact fps entry (no variant hash strings) ───────────────────
+      // ── Compact fps entry (no variant hash strings) ─────────────��─────
       compactFps.push({
         frameIndex: frame.frameIndex,
         timestamp:  frame.timestamp,

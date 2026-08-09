@@ -4,7 +4,7 @@ import {
   Film, ScanLine, Activity, X, AlertCircle, CheckCircle2, Layers,
   Sliders, RotateCcw, RefreshCw, ChevronDown, ChevronUp, Repeat,
   ShieldCheck, Cpu, Zap, Trash2, Database, History, ChevronLeft, ChevronRight, ListChecks,
-  Plus, Minus
+  Plus, Minus, XCircle
 } from 'lucide-react';
 import { processVideoFile, processVideoOnServer } from './VideoProcessor';
 import ApiSettings from './components/ApiSettings';
@@ -44,6 +44,11 @@ interface MatchedSegment {
   speedRatio?: number;
   matchSequence: Array<{ shortTime: number; movieTime: number; similarity: number }>;
   bestFrameDetail?: FrameDetail;
+  /** Server-set: every candidate for this range was VLM-rejected; this is the
+   *  highest-confidence rejected candidate kept visible for manual Retry. */
+  vlmRejectedKept?: boolean;
+  /** Server-set (display-only): segment jumps off the dominant forward movie timeline. */
+  timelineOutlier?: boolean;
 }
 
 interface UnmatchedRange {
@@ -109,6 +114,31 @@ function fmtDur(secs: number) {
 // ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
+
+/** Red badge for segments where every candidate was VLM-rejected and only the
+ *  best rejected candidate is kept visible — NOT a verified match. */
+function RejectedKeptBadge() {
+  return (
+    <span
+      title="Every candidate for this range was rejected by scene verification — this is only the highest-confidence rejected candidate, kept visible so you can review it and hit Retry."
+      className="inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-xs font-semibold bg-red-500/10 text-red-400 border border-red-500/30"
+    >
+      <XCircle className="w-3 h-3" /> Rejected — Retry needed
+    </span>
+  );
+}
+
+/** Amber badge for segments that jump off the dominant forward movie timeline. */
+function TimelineJumpBadge() {
+  return (
+    <span
+      title="This segment jumps backwards against the forward movie timeline established by the surrounding segments — it may be a false match onto a similar-looking scene. Display-only flag; the segment is kept."
+      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[10px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/30"
+    >
+      <AlertCircle className="w-3 h-3" /> Timeline jump
+    </span>
+  );
+}
 
 function ConfidenceBadge({ confidence, isApproximate }: { confidence: number; isApproximate: boolean }) {
   if (!isApproximate && confidence >= 80) {
@@ -2195,7 +2225,13 @@ export default function App() {
                     return (
                       <React.Fragment key={i}>
                       <tr
-                        className={`transition-colors hover:bg-slate-800/40 ${isActive ? 'bg-indigo-900/20 ring-1 ring-inset ring-indigo-500/30' : ''}`}>
+                        className={`transition-colors hover:bg-slate-800/40 ${
+                          isActive
+                            ? 'bg-indigo-900/20 ring-1 ring-inset ring-indigo-500/30'
+                            : seg.vlmRejectedKept
+                              ? 'bg-red-950/30 ring-1 ring-inset ring-red-500/20'
+                              : ''
+                        }`}>
                         <td className="px-4 py-3 font-mono text-slate-500 text-xs">{i + 1}</td>
 
                         {/* Clip time */}
@@ -2226,7 +2262,7 @@ export default function App() {
                                 title={
                                   seg.speedRatio < 1
                                     ? `Clip was slowed ~${(1 / seg.speedRatio).toFixed(2)}× — movie section is shorter than clip`
-                                    : `Clip was sped up ~${seg.speedRatio.toFixed(2)}× — movie section is longer than clip`
+                                    : `Clip was sped up ~${seg.speedRatio.toFixed(2)}�� — movie section is longer than clip`
                                 }
                                 className={`mt-0.5 font-semibold ${
                                   seg.speedRatio < 0.92
@@ -2252,7 +2288,12 @@ export default function App() {
 
                         {/* Confidence */}
                         <td className="px-4 py-3">
-                          <ConfidenceBadge confidence={seg.confidence} isApproximate={seg.isApproximate} />
+                          <div className="flex flex-col items-start gap-1">
+                            {seg.vlmRejectedKept
+                              ? <RejectedKeptBadge />
+                              : <ConfidenceBadge confidence={seg.confidence} isApproximate={seg.isApproximate} />}
+                            {seg.timelineOutlier && <TimelineJumpBadge />}
+                          </div>
                         </td>
 
                         {/* Compare + View all candidates buttons */}
@@ -2418,7 +2459,10 @@ export default function App() {
                 <div>
                   <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                     Side-by-Side Comparison
-                    <ConfidenceBadge confidence={previewSegment.confidence} isApproximate={previewSegment.isApproximate} />
+                    {previewSegment.vlmRejectedKept
+                      ? <RejectedKeptBadge />
+                      : <ConfidenceBadge confidence={previewSegment.confidence} isApproximate={previewSegment.isApproximate} />}
+                    {previewSegment.timelineOutlier && <TimelineJumpBadge />}
                   </h3>
                   <p className="text-xs text-slate-500 font-mono">
                     Clip {fmt(previewSegment.shortStart)}–{fmt(previewSegment.shortEnd)} ({fmtDur(previewSegment.shortEnd - previewSegment.shortStart)}) ·

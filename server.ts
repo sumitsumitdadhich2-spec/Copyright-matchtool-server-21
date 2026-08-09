@@ -30,6 +30,7 @@ import {
 import { runDeferredRecoveryPass } from './server/deferred-recovery';
 import { retrySegmentCandidates } from './server/candidate-retry';
 import { degenerateCandidateReason } from './server/degenerate-guard';
+import { flagTimelineOutliers } from './server/timeline-outliers';
 
 // ── Process-level safety net ────────────────────────────────────────────────
 // Long background jobs (2-hour-movie fingerprinting/matching) touch a huge
@@ -1301,7 +1302,11 @@ async function startServer() {
                 const best = checked.reduce((a, b) =>
                   ((b.confidencePct ?? -1) > (a.confidencePct ?? -1) ? b : a));
                 const bestIdx = entry.candidates.indexOf(best);
-                finalSegments = [...finalSegments, best.segment].sort((a, b) => a.shortStart - b.shortStart);
+                // Tag it so the UI can show a "Rejected — Retry needed" badge
+                // instead of a normal confidence badge: every candidate for
+                // this range was VLM-rejected; this is NOT a verified match.
+                finalSegments = [...finalSegments, { ...best.segment, vlmRejectedKept: true }]
+                  .sort((a, b) => a.shortStart - b.shortStart);
                 // Mark it as the candidate currently shown ("★ Used") —
                 // without clearing dropped/verdicts, so history still shows
                 // every candidate was checked and rejected.
@@ -1349,6 +1354,23 @@ async function startServer() {
 
         // If stopped while VLM ran, discard the result.
         if (matchJobs.get(matchJobId)?.status !== 'processing') return;
+
+        // ── Timeline monotonicity check (display-only) ──────────────────
+        // Flags segments that jump off the dominant forward movie timeline
+        // (e.g. Seg N at 90.88s followed by Seg N+1 back at 84.28s) with
+        // `timelineOutlier: true` so the UI can show a "Timeline jump"
+        // badge. Never removes or re-orders segments, and flags nothing
+        // when the short looks genuinely re-ordered (see timeline-outliers.ts).
+        try {
+          finalSegments = flagTimelineOutliers(finalSegments);
+          const outliers = finalSegments.filter(s => s.timelineOutlier).length;
+          if (outliers > 0) {
+            console.log(`[Match ${matchJobId}] Timeline check: flagged ${outliers} segment(s) off the dominant forward movie timeline.`);
+          }
+        } catch (tlErr: any) {
+          // Display-only — a failure here must never affect the result.
+          console.error(`[Match ${matchJobId}] Timeline outlier check failed:`, tlErr?.message || tlErr);
+        }
 
         const completedAt = Date.now();
         const finalJob = matchJobs.get(matchJobId);
