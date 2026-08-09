@@ -555,6 +555,21 @@ export async function resolveSegmentsWithVLM(
 
       // 2. Leftover discovered-but-unverified candidates first (the initial
       //    pool can be larger than the first-10 budget), in mode order.
+      //    IMPORTANT: the capped `candidates` array (CANDIDATE_POOL_TARGET)
+      //    may have LEFT OUT alternates the matching engine already
+      //    discovered — pull those from the full candidatePool too, so the
+      //    deep-search phase spends its budget on every known location
+      //    before paying for broader-search re-scans.
+      const poolLeftovers = getAlternateCandidatesForRange(
+        candidatePool,
+        original.shortStart,
+        original.shortEnd,
+        candidates.map(c => c.movieStart),
+      );
+      for (const alt of poolLeftovers) {
+        if (candidates.some(c => Math.abs(c.movieStart - alt.movieStart) <= SAME_LOCATION_TOLERANCE)) continue;
+        candidates.push(alt);
+      }
       const verifiedStarts = new Set(triedCandidates.map(t => t.segment.movieStart));
       const leftoverIdxs = candidates
         .map((c, k) => (verifiedStarts.has(c.movieStart) ? -1 : k))

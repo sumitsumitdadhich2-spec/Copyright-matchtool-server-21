@@ -213,6 +213,13 @@ function CandidateVerdictBadge({ candidate, isUsed, isBestEffort }: { candidate:
           ★ Used
         </span>
       )}
+      {isUsed && isBestEffort && (
+        <span
+          title="Highest-scoring candidate after the full verification budget ran out — NOT confirmed by AI video verification. Click Retry to search deeper."
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-[11px] font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/25">
+          <AlertCircle className="w-3 h-3" /> Best effort — not AI-confirmed
+        </span>
+      )}
     </div>
   );
 }
@@ -2398,7 +2405,7 @@ export default function App() {
                                             </div>
                                           )}
                                         </div>
-                                        <CandidateVerdictBadge candidate={c} isUsed={isUsed} />
+                                        <CandidateVerdictBadge candidate={c} isUsed={isUsed} isBestEffort={rowCs.bestEffort === true} />
                                         {renderTrimControls(rowCs, cIdx, isSelecting || !!selectingCandidateKey || segmentBusy || isMatching)}
                                         <div className="flex items-center gap-1.5 ml-auto">
                                           <button
@@ -2686,7 +2693,7 @@ export default function App() {
                         Next Candidate <ChevronRight className="w-3 h-3" />
                       </button>
                     </div>
-                    {currentCandidate && <CandidateVerdictBadge candidate={currentCandidate} isUsed={isUsed} />}
+                    {currentCandidate && <CandidateVerdictBadge candidate={currentCandidate} isUsed={isUsed} isBestEffort={activeCandidateSet.bestEffort === true} />}
                     {/* ±1 s boundary trim for the currently-stepped candidate */}
                     {currentCandidate && renderTrimControls(
                       activeCandidateSet, candidateIndex,
@@ -2930,7 +2937,7 @@ export default function App() {
                           </div>
                         )}
                       </div>
-                      <CandidateVerdictBadge candidate={c} isUsed={isUsed} />
+                      <CandidateVerdictBadge candidate={c} isUsed={isUsed} isBestEffort={viewAllCandidatesFor.bestEffort === true} />
                     </button>
                   );
                 })
