@@ -583,8 +583,8 @@ export function JobHistory({ onClose, onReattach, onOpenMatch, onOpenFingerprint
                   job={job}
                   onStop={handleStop}
                   onDelete={handleDelete}
-                  onOpenMatch={onOpenMatch}
-                  onOpenFingerprint={onOpenFingerprint}
+                  onOpenMatch={stableOpenMatch}
+                  onOpenFingerprint={stableOpenFingerprint}
                   onDeleteVideo={handleDeleteVideo}
                 />
               </React.Fragment>

@@ -1100,6 +1100,12 @@ async function startServer() {
     const mp = metaPath(jobId);
     const cp = checkpointFilePath(jobId);
 
+    // Delete the saved original video too (must happen BEFORE the meta file is
+    // removed — the video path lives inside the meta). Without this, deleting
+    // a job leaves the multi-GB video orphaned on disk forever.
+    const vp = getVideoPathForJob(jobId);
+    if (vp) { try { fs.unlinkSync(vp); } catch { /* ignore */ } }
+
     let deleted = false;
     if (fs.existsSync(rp)) { try { fs.unlinkSync(rp); deleted = true; } catch { /* ignore */ } }
     if (fs.existsSync(mp)) { try { fs.unlinkSync(mp); } catch { /* ignore */ } }
@@ -1204,7 +1210,7 @@ async function startServer() {
 
     res.json({ matchJobId });
 
-    // ── Run the match in the background ─────────────────────────────────────
+    // ���─ Run the match in the background ─────────────────────────────────────
     console.log(`[Match ${matchJobId}] Starting: movie=${movieJobId} short=${shortJobId} drift=${resolvedDrift}`);
 
     (async () => {
