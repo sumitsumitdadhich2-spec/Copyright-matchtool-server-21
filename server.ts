@@ -29,7 +29,7 @@ import {
 } from './server/candidate-recovery';
 import { runDeferredRecoveryPass } from './server/deferred-recovery';
 import { retrySegmentCandidates } from './server/candidate-retry';
-import { degenerateCandidateReason } from './server/degenerate-guard';
+import { degenerateCandidateReason, flagTimelineOutliers } from './server/degenerate-guard';
 
 // ── Process-level safety net ────────────────────────────────────────────────
 // Long background jobs (2-hour-movie fingerprinting/matching) touch a huge
@@ -1301,7 +1301,10 @@ async function startServer() {
                 const best = checked.reduce((a, b) =>
                   ((b.confidencePct ?? -1) > (a.confidencePct ?? -1) ? b : a));
                 const bestIdx = entry.candidates.indexOf(best);
-                finalSegments = [...finalSegments, best.segment].sort((a, b) => a.shortStart - b.shortStart);
+                // Tag it so the UI renders it as "VLM rejected — kept for
+                // Retry" instead of looking like a normal verified match.
+                const keptSegment = { ...best.segment, vlmRejectedKept: true };
+                finalSegments = [...finalSegments, keptSegment].sort((a, b) => a.shortStart - b.shortStart);
                 // Mark it as the candidate currently shown ("★ Used") —
                 // without clearing dropped/verdicts, so history still shows
                 // every candidate was checked and rejected.
@@ -1319,6 +1322,20 @@ async function startServer() {
               // what the main + deferred passes already produced.
               console.error(`[Match ${matchJobId}] Keep-best-candidate step failed:`, keepErr?.message || keepErr);
             }
+          }
+
+          // ── Timeline monotonicity check (display-only) ──────────────────
+          // Flags segments whose movie position jumps backwards relative to
+          // the dominant forward movie timeline (e.g. seg 8 → 90.88s
+          // followed by seg 9 → 84.28s). Never removes a segment — only
+          // sets timelineOutlier: true so the UI can warn the user.
+          try {
+            const outliers = flagTimelineOutliers(finalSegments);
+            if (outliers > 0) {
+              console.log(`[Match ${matchJobId}] Timeline check: flagged ${outliers} segment(s) as non-monotonic outlier(s) (movie timeline jumps backwards).`);
+            }
+          } catch (timelineErr: any) {
+            console.error(`[Match ${matchJobId}] Timeline monotonicity check failed:`, timelineErr?.message || timelineErr);
           }
 
           // Outcome breakdown (point 3): how many "unmatched" outcomes were

@@ -84,6 +84,18 @@ export interface MatchedSegment {
   }>;
   /** Per-channel similarity breakdown for the best-matching frame in this segment */
   bestFrameDetail?: FrameDetail;
+  /**
+   * True when every candidate for this range was VLM-rejected and this is
+   * merely the best-confidence rejected candidate kept visible so the user
+   * can review it and hit Retry. NOT a verified match.
+   */
+  vlmRejectedKept?: boolean;
+  /**
+   * True (display-only) when this segment's movie position jumps backwards
+   * relative to the dominant forward movie timeline of its neighbours —
+   * a strong signal of a false accept on repeated visuals.
+   */
+  timelineOutlier?: boolean;
 }
 
 export interface MatchResult {

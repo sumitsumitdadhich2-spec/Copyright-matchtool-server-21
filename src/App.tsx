@@ -4,7 +4,7 @@ import {
   Film, ScanLine, Activity, X, AlertCircle, CheckCircle2, Layers,
   Sliders, RotateCcw, RefreshCw, ChevronDown, ChevronUp, Repeat,
   ShieldCheck, Cpu, Zap, Trash2, Database, History, ChevronLeft, ChevronRight, ListChecks,
-  Plus, Minus
+  Plus, Minus, AlertTriangle
 } from 'lucide-react';
 import { processVideoFile, processVideoOnServer } from './VideoProcessor';
 import ApiSettings from './components/ApiSettings';
@@ -44,7 +44,11 @@ interface MatchedSegment {
   speedRatio?: number;
   matchSequence: Array<{ shortTime: number; movieTime: number; similarity: number }>;
   bestFrameDetail?: FrameDetail;
-}
+  /** Every candidate was VLM-rejected — this is only the best rejected candidate kept visible for Retry. */
+  vlmRejectedKept?: boolean;
+  /** Movie position jumps backwards vs the dominant forward timeline — likely false accept on repeated visuals. */
+  timelineOutlier?: boolean;
+  }
 
 interface UnmatchedRange {
   shortStart: number;
@@ -2195,7 +2199,7 @@ export default function App() {
                     return (
                       <React.Fragment key={i}>
                       <tr
-                        className={`transition-colors hover:bg-slate-800/40 ${isActive ? 'bg-indigo-900/20 ring-1 ring-inset ring-indigo-500/30' : ''}`}>
+                        className={`transition-colors hover:bg-slate-800/40 ${isActive ? 'bg-indigo-900/20 ring-1 ring-inset ring-indigo-500/30' : seg.vlmRejectedKept ? 'bg-red-950/25' : ''}`}>
                         <td className="px-4 py-3 font-mono text-slate-500 text-xs">{i + 1}</td>
 
                         {/* Clip time */}
@@ -2252,7 +2256,26 @@ export default function App() {
 
                         {/* Confidence */}
                         <td className="px-4 py-3">
-                          <ConfidenceBadge confidence={seg.confidence} isApproximate={seg.isApproximate} />
+                          <div className="flex flex-col items-start gap-1">
+                            {seg.vlmRejectedKept ? (
+                              <span
+                                title="Every candidate for this range was rejected by AI verification. This is only the best rejected candidate, kept visible so you can review it and use Retry — it is NOT a verified match."
+                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-red-500/40 bg-red-500/15 text-red-300 text-[11px] font-semibold">
+                                <AlertTriangle className="w-3 h-3" />
+                                Rejected — Retry needed
+                              </span>
+                            ) : (
+                              <ConfidenceBadge confidence={seg.confidence} isApproximate={seg.isApproximate} />
+                            )}
+                            {seg.timelineOutlier && (
+                              <span
+                                title="This segment's movie position jumps backwards relative to the surrounding segments' forward timeline — likely a false match on repeated visuals (same actor/costume/location). Consider using Retry."
+                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-amber-500/40 bg-amber-500/15 text-amber-300 text-[11px] font-semibold">
+                                <AlertTriangle className="w-3 h-3" />
+                                Timeline jump
+                              </span>
+                            )}
+                          </div>
                         </td>
 
                         {/* Compare + View all candidates buttons */}
