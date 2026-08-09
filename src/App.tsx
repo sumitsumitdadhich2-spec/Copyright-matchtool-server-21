@@ -727,7 +727,8 @@ export default function App() {
                 if (url) setTargetFileUrl(prev => prev || url);
               });
             }
-            clearMatchJobId();
+            // Keep the saved id — the results (and video previews) must come
+            // back after EVERY refresh, not just the first one.
           } else {
             clearMatchJobId();
           }
@@ -915,7 +916,8 @@ export default function App() {
         }
 
         if (job.status === 'completed') {
-          clearMatchJobId();
+          // Keep the saved match id so a refresh restores these results and
+          // the saved video previews instead of an empty panel.
           setMatchProgress(null);
           setSegments(job.segments || []);
           setUnmatched(job.unmatchedRanges || []);
@@ -964,13 +966,15 @@ export default function App() {
     setStatus('Opening match job…');
     let job: any = null;
     try {
-      const res = await fetch(`/api/match-status/${jobId}`);
+      // Hard 20s timeout — if the server is busy/unreachable the spinner can
+      // never get stuck forever; the user gets a clear error instead.
+      const res = await fetch(`/api/match-status/${jobId}`, { signal: AbortSignal.timeout(20_000) });
       if (res.ok) job = await res.json();
     } catch { /* handled below */ }
 
     if (!job) {
       setStatus('');
-      setErrorMsg('Match job could not be opened — it may have been deleted or the server is unreachable.');
+      setErrorMsg('Match job could not be opened — it may have been deleted or the server is unreachable. Try again in a moment.');
       return;
     }
 
@@ -988,6 +992,9 @@ export default function App() {
 
     if (job.status === 'completed') {
       setMatchJobId(jobId);
+      // Persist the opened job so a page refresh restores these results and
+      // video previews automatically instead of showing an empty panel.
+      saveMatchJobId(jobId);
       setIsMatching(false);
       setMatchProgress(null);
       setPreviewSegment(null);
@@ -1017,6 +1024,50 @@ export default function App() {
         ? `Match job failed${job.error ? `: ${job.error}` : ''}.`
         : 'Match job was stopped before finishing.'
     );
+  }
+
+  // Open a completed fingerprint job from Job History — restores the job's
+  // fingerprints AND its server-saved video preview into the chosen slot
+  // (reference movie or target clip), and saves the session so the restore
+  // also survives future page refreshes.
+  async function openFingerprintJob(jobId: string, role: 'reference' | 'target') {
+    setShowHistory(false);
+    setErrorMsg('');
+    setStatus('Opening saved video…');
+    let job: any = null;
+    try {
+      const res = await fetch(`/api/jobs/${jobId}`, { signal: AbortSignal.timeout(20_000) });
+      if (res.ok) job = await res.json();
+    } catch { /* handled below */ }
+
+    if (!job || job.status !== 'completed') {
+      setStatus('');
+      setErrorMsg('This job could not be opened — it may have been deleted or is not finished yet.');
+      return;
+    }
+
+    const session: CachedJob = {
+      jobId,
+      fileName: job.originalName ?? jobId,
+      fileSize: job.fileSize ?? 0,
+      totalFrames: job.totalFrames ?? 0,
+      savedAt: Date.now(),
+    };
+    saveJobSession(role, session);
+
+    // Release any previous local blob URL for this slot before replacing it.
+    if (role === 'reference') {
+      revokeIfBlobUrl(refFileUrl);
+      setRefFile(null);
+      setRefFileUrl('');
+    } else {
+      revokeIfBlobUrl(targetFileUrl);
+      setTargetFile(null);
+      setTargetFileUrl('');
+    }
+
+    applyRestoredSession(role, session, session.totalFrames);
+    setStatus(`Opened "${session.fileName}" as ${role === 'reference' ? 'reference movie' : 'target clip'}.`);
   }
 
   async function handleReattach(jobId: string, type: 'fingerprint' | 'match' = 'fingerprint') {
@@ -1894,7 +1945,7 @@ export default function App() {
 
         {/* ── Job History panel ── */}
         {showHistory && (
-          <JobHistory onClose={() => setShowHistory(false)} onReattach={handleReattach} onOpenMatch={openMatchJob} />
+          <JobHistory onClose={() => setShowHistory(false)} onReattach={handleReattach} onOpenMatch={openMatchJob} onOpenFingerprint={openFingerprintJob} />
         )}
 
         {/* ── Saved Sessions panel ── */}
@@ -2856,14 +2907,33 @@ export default function App() {
                   </p>
                 </div>
                 <div className="flex gap-px h-8 rounded overflow-hidden">
-                  {previewSegment.matchSequence.map((item, i) => {
-                    const pct = item.similarity;
-                    const bg  = pct >= 80 ? 'bg-green-500' : pct >= 60 ? 'bg-yellow-500' : 'bg-red-500';
-                    return (
-                      <div key={i} className={`flex-1 ${bg}`} style={{ opacity: 0.4 + (pct / 100) * 0.6 }}
-                        title={`Frame ${i + 1}: ${item.similarity.toFixed(1)}% @ clip ${fmt(item.shortTime)} → movie ${fmt(item.movieTime)}`} />
-                    );
-                  })}
+                  {(() => {
+                    // Downsample to at most 150 bars — a long segment can carry
+                    // thousands of matchSequence frames, and rendering one DOM
+                    // element per frame froze/crashed the app (especially on
+                    // mobile) when opening big saved matches.
+                    const seq = previewSegment.matchSequence;
+                    const MAX_BARS = 150;
+                    const step = Math.max(1, Math.ceil(seq.length / MAX_BARS));
+                    const bars: Array<{ similarity: number; shortTime: number; movieTime: number; frameIdx: number }> = [];
+                    for (let i = 0; i < seq.length; i += step) {
+                      const chunk = seq.slice(i, i + step);
+                      bars.push({
+                        similarity: chunk.reduce((a, f) => a + f.similarity, 0) / chunk.length,
+                        shortTime: chunk[0].shortTime,
+                        movieTime: chunk[0].movieTime,
+                        frameIdx: i,
+                      });
+                    }
+                    return bars.map((item, i) => {
+                      const pct = item.similarity;
+                      const bg  = pct >= 80 ? 'bg-green-500' : pct >= 60 ? 'bg-yellow-500' : 'bg-red-500';
+                      return (
+                        <div key={i} className={`flex-1 ${bg}`} style={{ opacity: 0.4 + (pct / 100) * 0.6 }}
+                          title={`Frame ${item.frameIdx + 1}${step > 1 ? `–${Math.min(item.frameIdx + step, seq.length)}` : ''}: ${item.similarity.toFixed(1)}% @ clip ${fmt(item.shortTime)} → movie ${fmt(item.movieTime)}`} />
+                      );
+                    });
+                  })()}
                 </div>
                 <div className="flex justify-between text-xs text-slate-700 mt-1 font-mono">
                   <span>{fmt(previewSegment.shortStart)}</span>

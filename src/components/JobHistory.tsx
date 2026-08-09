@@ -104,12 +104,13 @@ function StatusIcon({ status }: { status: JobEntry['status'] }) {
 // Single job card
 // ---------------------------------------------------------------------------
 
-function JobCard({
+const JobCard = React.memo(function JobCard({
   job,
   onStop,
   onDelete,
   onReattach,
   onOpenMatch,
+  onOpenFingerprint,
   onDeleteVideo,
 }: {
   job: JobEntry;
@@ -117,10 +118,12 @@ function JobCard({
   onDelete: (id: string, type: 'fingerprint' | 'match') => void;
   onReattach?: (id: string, type: 'fingerprint' | 'match') => void;
   onOpenMatch?: (id: string) => void;
+  onOpenFingerprint?: (id: string, role: 'reference' | 'target') => void;
   onDeleteVideo?: (id: string) => void;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmDeleteVideo, setConfirmDeleteVideo] = useState(false);
+  const [pickOpenRole, setPickOpenRole] = useState(false);
   const [stopping, setStopping] = useState(false);
 
   const isMatch = job.type === 'match';
@@ -286,6 +289,41 @@ function JobCard({
           </button>
         )}
 
+        {/* Open — restore a completed fingerprint job (and its saved video) into the main panel */}
+        {!isRunning && !isMatch && job.status === 'completed' && onOpenFingerprint && (
+          !pickOpenRole ? (
+            <button
+              onClick={() => setPickOpenRole(true)}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-indigo-500/30 text-indigo-400 bg-indigo-500/10 hover:bg-indigo-500/20 transition cursor-pointer"
+            >
+              <FolderOpen className="w-3 h-3" />
+              Open
+            </button>
+          ) : (
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[11px] text-slate-400">Open as:</span>
+              <button
+                onClick={() => { setPickOpenRole(false); onOpenFingerprint(job.id, 'reference'); }}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition cursor-pointer"
+              >
+                Movie
+              </button>
+              <button
+                onClick={() => { setPickOpenRole(false); onOpenFingerprint(job.id, 'target'); }}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-violet-600 hover:bg-violet-500 text-white transition cursor-pointer"
+              >
+                Clip
+              </button>
+              <button
+                onClick={() => setPickOpenRole(false)}
+                className="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-300 transition cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+          )
+        )}
+
         {/* Remove saved video — frees server disk space, keeps fingerprints */}
         {!isRunning && !isMatch && job.hasVideo && onDeleteVideo && (
           !confirmDeleteVideo ? (
@@ -344,7 +382,7 @@ function JobCard({
       </div>
     </div>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // JobHistory panel
@@ -354,9 +392,12 @@ interface JobHistoryProps {
   onClose: () => void;
   onReattach?: (jobId: string, type: 'fingerprint' | 'match') => void;
   onOpenMatch?: (jobId: string) => void;
+  /** Open a completed fingerprint job's saved video back into the main panel
+   *  as the reference movie or the target clip. */
+  onOpenFingerprint?: (jobId: string, role: 'reference' | 'target') => void;
 }
 
-export function JobHistory({ onClose, onReattach, onOpenMatch }: JobHistoryProps) {
+export function JobHistory({ onClose, onReattach, onOpenMatch, onOpenFingerprint }: JobHistoryProps) {
   const [jobs, setJobs] = useState<JobEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -367,13 +408,23 @@ export function JobHistory({ onClose, onReattach, onOpenMatch }: JobHistoryProps
 
   const fetchJobs = useCallback(async () => {
     try {
-      const res = await fetch('/api/jobs');
+      const res = await fetch('/api/jobs', { signal: AbortSignal.timeout(15_000) });
       if (!res.ok) return;
       const data: JobEntry[] = await res.json();
       const payload = JSON.stringify(data);
       if (payload !== lastPayloadRef.current) {
         lastPayloadRef.current = payload;
-        setJobs(data);
+        // Keep the previous object reference for any job whose data didn't
+        // change — combined with React.memo(JobCard) this means only the
+        // cards that actually changed re-render, so the list never flickers
+        // or "refreshes" while a job is running.
+        setJobs(prev => {
+          const prevById = new Map(prev.map(j => [j.id, j]));
+          return data.map(j => {
+            const old = prevById.get(j.id);
+            return old && JSON.stringify(old) === JSON.stringify(j) ? old : j;
+          });
+        });
       }
     } catch {
       /* network error — keep old state */
@@ -505,6 +556,9 @@ export function JobHistory({ onClose, onReattach, onOpenMatch }: JobHistoryProps
                   job={job}
                   onStop={handleStop}
                   onDelete={handleDelete}
+                  onOpenMatch={onOpenMatch}
+                  onOpenFingerprint={onOpenFingerprint}
+                  onDeleteVideo={handleDeleteVideo}
                 />
               </React.Fragment>
             ))}
