@@ -486,6 +486,9 @@ export function JobHistory({
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<'all' | 'match' | 'fingerprint' | 'saved'>('all');
+  // Surfaces failures from delete / remove-video actions, which otherwise
+  // fail silently because those handlers swallow their errors.
+  const [actionError, setActionError] = useState('');
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Serialized snapshot of the last applied jobs payload — lets us skip
   // setState entirely when nothing changed, so the panel doesn't visibly
@@ -649,6 +652,22 @@ export function JobHistory({
 
       {/* Body */}
       <div className="p-4 space-y-4 max-h-[70vh] overflow-y-auto">
+        {actionError && (
+          <div
+            role="alert"
+            className="flex items-start justify-between gap-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"
+          >
+            <span>{actionError}</span>
+            <button
+              onClick={() => setActionError('')}
+              className="shrink-0 text-red-400 hover:text-red-200 transition cursor-pointer"
+              aria-label="Dismiss error"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
         {loading && (
           <div className="flex items-center justify-center py-8 text-slate-500 text-sm gap-2">
             <RefreshCw className="w-4 h-4 animate-spin" />
