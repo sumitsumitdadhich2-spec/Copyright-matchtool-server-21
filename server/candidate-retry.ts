@@ -24,36 +24,21 @@
  *    appended to the same on-disk history — nothing already there is ever
  *    deleted, even if this retry fails to find an accept.
  */
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
-import * as readline from 'readline';
-import { MatchedSegment, matchVideosFromFiles } from './candidate-matching-engine';
+import { MatchedSegment } from './candidate-matching-engine';
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
 import { verifySegmentByVideo, VLM_CONFIDENCE_THRESHOLD, VLM_MAX_ATTEMPTS } from './vlm-verify';
+import {
+  broaderSearchForRange,
+  BROADER_SEARCH_MAX_NEW,
+  SAME_LOCATION_TOLERANCE,
+} from './broader-search';
+import { degenerateCandidateReason } from './degenerate-guard';
 import {
   StoredCandidateSet,
   CandidateCheck,
   readCandidatesFile,
   writeCandidatesFileSync,
 } from './candidate-recovery';
-
-/** Cap on how many freshly-discovered candidates a single broader search appends. */
-const BROADER_SEARCH_MAX_NEW = 10;
-/** Deliberately looser than the app default (82) — this is a fallback pass
- *  whose only job is to surface locations the original scan missed; VLM
- *  verification below is still the real accept/reject gate. */
-const BROADER_SEARCH_MIN_SIMILARITY = 40;
-const BROADER_SEARCH_MIN_CONSECUTIVE_FRAMES = 3;
-/** Wider than the app default (3) so a slightly different edit speed/frame
- *  offset than the original scan assumed can still line up. */
-const BROADER_SEARCH_FRAME_DRIFT = 8;
-/** Small amount of extra context on each side of the short-clip range so the
- *  scene-chunk splitter has more than a couple of frames to work with. */
-const BROADER_SEARCH_PAD_SECONDS = 1.5;
-/** Same drift tolerance used elsewhere (getAlternateCandidatesForRange) to
- *  treat two movie timestamps as "the same location". */
-const SAME_LOCATION_TOLERANCE = 0.5;
 
 /**
  * Hard cap on Gemini verifications a SINGLE Retry click may spend, across as
@@ -62,27 +47,6 @@ const SAME_LOCATION_TOLERANCE = 0.5;
  * starts a fresh budget and keeps hunting for NEW candidates.
  */
 const RETRY_MAX_ATTEMPTS = Number(process.env.RETRY_MAX_ATTEMPTS) || VLM_MAX_ATTEMPTS;
-
-/**
- * Each broader-search round widens the net a little more, so repeat Retry
- * clicks surface genuinely new movie locations instead of rediscovering the
- * same ones. Round 0 uses the base values above.
- */
-function broaderSearchParamsForRound(round: number): {
-  minSimilarity: number;
-  minConsecutiveFrames: number;
-  frameDrift: number;
-  padSeconds: number;
-} {
-  const step = Math.max(0, round);
-  return {
-    // Floor at 20 — below that the engine returns mostly noise.
-    minSimilarity: Math.max(20, BROADER_SEARCH_MIN_SIMILARITY - step * 5),
-    minConsecutiveFrames: Math.max(2, BROADER_SEARCH_MIN_CONSECUTIVE_FRAMES - (step > 0 ? 1 : 0)),
-    frameDrift: Math.min(24, BROADER_SEARCH_FRAME_DRIFT + step * 4),
-    padSeconds: Math.min(6, BROADER_SEARCH_PAD_SECONDS + step * 0.75),
-  };
-}
 
 export interface RetrySegmentResult {
   /**
@@ -103,82 +67,19 @@ export interface RetrySegmentResult {
 }
 
 /**
- * Write a temporary fingerprint file containing only the short-clip frames
- * within [start-pad, end+pad], preserving their original timestamps, so a
- * fresh matchVideosFromFiles() call can be scoped to just this range without
- * touching the real per-job fingerprint files on disk.
- */
-async function writeFilteredShortFingerprint(
-  shortResultPath: string,
-  rangeStart: number,
-  rangeEnd: number,
-): Promise<string | null> {
-  const tempPath = path.join(
-    os.tmpdir(),
-    `retry-broader-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`,
-  );
-  const rl = readline.createInterface({
-    input: fs.createReadStream(shortResultPath, { encoding: 'utf8' }),
-    crlfDelay: Infinity,
-  });
-  const lines: string[] = [];
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    try {
-      const frame = JSON.parse(line);
-      if (typeof frame.timestamp === 'number' && frame.timestamp >= rangeStart && frame.timestamp <= rangeEnd) {
-        lines.push(line);
-      }
-    } catch { /* skip corrupt line */ }
-  }
-  if (lines.length === 0) return null;
-  await fs.promises.writeFile(tempPath, lines.join('\n') + '\n');
-  return tempPath;
-}
-
-/**
  * Re-run the real matching engine restricted to this segment's short-clip
  * range, with a wider drift + relaxed similarity floor, to surface movie
- * locations the original full-clip scan didn't. Reuses matchVideosFromFiles
- * verbatim (same chunked/full-load RAM-safety logic, same scene-chunk
- * scan) — this is not a second scoring algorithm.
+ * locations the original full-clip scan didn't. Delegates to the shared
+ * broader-search primitive (broader-search.ts) — same logic, now also used
+ * by the main pass for weak initial candidate pools.
  */
-async function runBroaderSearch(
+function runBroaderSearch(
   entry: StoredCandidateSet,
   shortResultPath: string,
   movieResultPath: string,
   round: number,
 ): Promise<MatchedSegment[]> {
-  const params = broaderSearchParamsForRound(round);
-  const rangeStart = Math.max(0, entry.shortStart - params.padSeconds);
-  const rangeEnd = entry.shortEnd + params.padSeconds;
-
-  const tempShortPath = await writeFilteredShortFingerprint(shortResultPath, rangeStart, rangeEnd);
-  if (!tempShortPath) return [];
-
-  try {
-    const result = await matchVideosFromFiles(tempShortPath, movieResultPath, {
-      minSimilarity: params.minSimilarity,
-      minConsecutiveFrames: params.minConsecutiveFrames,
-      frameDrift: params.frameDrift,
-    });
-
-    const pool = [...(result.segments || []), ...(result.candidatePool || [])];
-    const overlapping = pool.filter(seg =>
-      Math.min(seg.shortEnd, entry.shortEnd) - Math.max(seg.shortStart, entry.shortStart) > 0.15,
-    );
-
-    const deduped: MatchedSegment[] = [];
-    for (const seg of overlapping) {
-      if (!deduped.some(d => Math.abs(d.movieStart - seg.movieStart) <= SAME_LOCATION_TOLERANCE)) {
-        deduped.push(seg);
-      }
-    }
-    deduped.sort((a, b) => b.confidence - a.confidence);
-    return deduped;
-  } finally {
-    fs.promises.unlink(tempShortPath).catch(() => { /* best-effort cleanup */ });
-  }
+  return broaderSearchForRange(entry.shortStart, entry.shortEnd, shortResultPath, movieResultPath, round);
 }
 
 /** Verify one candidate via the exact same VIDEO-segment Gemini call and
@@ -192,6 +93,19 @@ async function checkCandidate(
   movieVideoPath: string,
   logLabel: string,
 ): Promise<void> {
+  // Degenerate-candidate guard: a structurally impossible mapping (frozen
+  // matchSequence / near-zero speedRatio) is auto-rejected WITHOUT spending
+  // a Gemini call — the VLM cannot be trusted on these (a visually similar
+  // duplicate scene makes it answer "same" at high confidence).
+  const degenerateReason = degenerateCandidateReason(candidate.segment);
+  if (degenerateReason) {
+    console.log(`[${logLabel}] auto-rejected degenerate candidate: ${degenerateReason}`);
+    candidate.checked = true;
+    candidate.verdict = 'rejected';
+    candidate.matchLikelihood = 0;
+    candidate.evidence = [`Auto-rejected without VLM: ${degenerateReason}`];
+    return;
+  }
   try {
     const result = await verifySegmentByVideo(
       shortVideoPath,
@@ -366,6 +280,9 @@ export async function retrySegmentCandidates(
   let bestIdx = -1;
   let bestScore = -1;
   entry.candidates.forEach((c, i) => {
+    // Never fall back to a structurally impossible candidate, even if an
+    // earlier (pre-guard) run recorded a high VLM likelihood for it.
+    if (degenerateCandidateReason(c.segment)) return;
     const score =
       typeof c.matchLikelihood === 'number'
         ? c.matchLikelihood

@@ -15,6 +15,7 @@
  */
 import { MatchedSegment } from './candidate-matching-engine';
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
+import { degenerateCandidateReason } from './degenerate-guard';
 import { verifySegmentByVideo, VLM_CONFIDENCE_THRESHOLD, VLM_CONCURRENCY } from './vlm-verify';
 import {
   listCandidateFilesForJob,
@@ -96,6 +97,27 @@ export async function runDeferredRecoveryPass(
 
     for (const c of uncheckedOrder) {
       const candidateEntry = entry.candidates[c];
+
+      // Degenerate-candidate guard: structurally impossible mappings
+      // (near-zero speedRatio / frozen matchSequence) are auto-rejected
+      // without a Gemini call — the VLM cannot be trusted on these when the
+      // movie contains a visually similar duplicate scene.
+      const degenerateReason = degenerateCandidateReason(candidateEntry.segment);
+      if (degenerateReason) {
+        console.log(`[DeferredRecovery] seg${segmentIndex}#${c + 1}: auto-rejected degenerate candidate (${degenerateReason})`);
+        candidateEntry.checked = true;
+        candidateEntry.verdict = 'rejected';
+        candidateEntry.matchLikelihood = 0;
+        candidateEntry.evidence = [`Auto-rejected without VLM: ${degenerateReason}`];
+        onProgress?.({
+          segmentIndex,
+          totalRejected: segmentIndexes.length,
+          candidateAttempt: c + 1,
+          totalCandidates: entry.candidates.length,
+          verdict: 'rejected',
+        });
+        continue;
+      }
 
       let verdict: DeferredRecoveryProgress['verdict'] = 'unverifiable';
       try {

@@ -13,6 +13,8 @@ import {
 } from './vlm-verify';
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
 import { geminiConfigured } from './gemini-vlm';
+import { degenerateCandidateReason } from './degenerate-guard';
+import { broaderSearchForRange, BROADER_SEARCH_MAX_NEW, SAME_LOCATION_TOLERANCE } from './broader-search';
 
 /**
  * How many candidates the fast pre-filters (SSCD/CLIP embeddings) build and
@@ -20,6 +22,19 @@ import { geminiConfigured } from './gemini-vlm';
  * accept/reject anything — they only pick WHICH frames Gemini looks at first.
  */
 const CANDIDATE_POOL_TARGET = Number(process.env.CANDIDATE_POOL_TARGET) || 10;
+
+/**
+ * FIRST-PASS BROADER SEARCH (bug fix): when the strongest candidate in a
+ * segment's initial pool has a hash confidence below this threshold, the
+ * true scene very likely isn't in the pool at all (observed bug: best
+ * initial candidate 75.6% while the real scene — found only by a manual
+ * Retry's broader search — scored 87.3%). In that case one broader-search
+ * round runs immediately, BEFORE any Gemini attempt, so the main pass can
+ * find the real location on the first try. Requires the caller to supply
+ * the fingerprint file paths; without them behavior is unchanged.
+ */
+const LOW_CONFIDENCE_BROADEN_THRESHOLD =
+  Number(process.env.LOW_CONFIDENCE_BROADEN_THRESHOLD) || 80;
 
 // Fixed batch size for VLM server cache-reset points. Purely a cache-hygiene
 // boundary — does not change segment order, candidate selection, or verdicts.
@@ -160,6 +175,14 @@ export async function resolveSegmentsWithVLM(
    * candidate discovery for a later deferred recovery pass; never awaited here.
    */
   onSegmentResolved?: (info: SegmentResolvedInfo) => void,
+  /**
+   * Optional fingerprint file paths. When supplied, a segment whose initial
+   * candidate pool looks weak (top hash confidence below
+   * LOW_CONFIDENCE_BROADEN_THRESHOLD) gets ONE broader-search round up front
+   * to pull in movie locations the original scan missed — before any Gemini
+   * attempt is spent. Purely additive: strong pools are untouched.
+   */
+  fingerprintPaths?: { shortResultPath: string; movieResultPath: string },
 ): Promise<MatchedSegment[]> {
   if (segments.length === 0) return segments;
 
@@ -217,6 +240,46 @@ export async function resolveSegmentsWithVLM(
       candidates.push(alt);
     }
 
+    // ------------------------------------------------------------------
+    // FIRST-PASS BROADER SEARCH (bug fix): if even the STRONGEST candidate
+    // in the pool has a weak hash confidence, the real scene probably isn't
+    // in the pool at all. Run one broader-search round NOW (same primitive
+    // the manual Retry uses) and merge any genuinely new movie locations,
+    // so Gemini gets a chance to see the true scene on the first attempt
+    // instead of only after a manual Retry.
+    // ------------------------------------------------------------------
+    if (fingerprintPaths) {
+      const topConfidence = Math.max(...candidates.map(c => c.confidence));
+      if (topConfidence < LOW_CONFIDENCE_BROADEN_THRESHOLD) {
+        try {
+          console.log(
+            `[VLM] seg${i}: weak initial pool (top hash confidence ` +
+            `${topConfidence.toFixed(1)} < ${LOW_CONFIDENCE_BROADEN_THRESHOLD}) — ` +
+            `running first-pass broader search`
+          );
+          const fresh = (await broaderSearchForRange(
+            original.shortStart,
+            original.shortEnd,
+            fingerprintPaths.shortResultPath,
+            fingerprintPaths.movieResultPath,
+            0,
+          ))
+            .filter(seg => !candidates.some(c => Math.abs(c.movieStart - seg.movieStart) <= SAME_LOCATION_TOLERANCE))
+            .slice(0, BROADER_SEARCH_MAX_NEW);
+          if (fresh.length > 0) {
+            console.log(
+              `[VLM] seg${i}: first-pass broader search added ${fresh.length} new candidate(s) ` +
+              `(best new confidence ${fresh[0].confidence.toFixed(1)})`
+            );
+            candidates.push(...fresh);
+          }
+        } catch (err: any) {
+          // Broadening is best-effort only — never fail the segment over it.
+          console.warn(`[VLM] seg${i}: first-pass broader search failed: ${err?.message || err}`);
+        }
+      }
+    }
+
     let order = candidates.map((_, k) => k);
     if (candidates.length > 1) {
       try {
@@ -241,6 +304,29 @@ export async function resolveSegmentsWithVLM(
     for (const candIdx of order) {
       if (attempt >= VLM_MAX_ATTEMPTS) break;
       const candidate = candidates[candIdx];
+
+      // ----------------------------------------------------------------
+      // DEGENERATE-CANDIDATE GUARD (bug fix): a structurally impossible
+      // mapping — near-zero speedRatio / frozen matchSequence (every short
+      // frame stuck on one movie instant) — can NEVER be a real copy, yet
+      // Gemini may still accept it at high confidence when the movie has a
+      // visually similar duplicate scene. Auto-reject WITHOUT spending a
+      // Gemini call or a candidate-budget slot, and never let one become
+      // the accepted answer.
+      // ----------------------------------------------------------------
+      const degenerateReason = degenerateCandidateReason(candidate);
+      if (degenerateReason) {
+        console.log(`[VLM] seg${i}: auto-rejected degenerate candidate (${degenerateReason})`);
+        triedCandidates.push({
+          segment: candidate,
+          verdict: 'rejected',
+          matchLikelihood: 0,
+          evidence: [`Auto-rejected without VLM: ${degenerateReason}`],
+        });
+        onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'rejected' });
+        continue;
+      }
+
       attempt++;
 
       // ----------------------------------------------------------------

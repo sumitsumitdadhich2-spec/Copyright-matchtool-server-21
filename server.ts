@@ -29,6 +29,7 @@ import {
 } from './server/candidate-recovery';
 import { runDeferredRecoveryPass } from './server/deferred-recovery';
 import { retrySegmentCandidates } from './server/candidate-retry';
+import { degenerateCandidateReason } from './server/degenerate-guard';
 
 // ── Process-level safety net ────────────────────────────────────────────────
 // Long background jobs (2-hour-movie fingerprinting/matching) touch a huge
@@ -1023,7 +1024,7 @@ async function startServer() {
     res.json({ deleted });
   });
 
-  // 6. Match endpoint �� background job, same model as fingerprint jobs.
+  // 6. Match endpoint ��� background job, same model as fingerprint jobs.
   // Kicks off matching (+ optional VLM verification) asynchronously and
   // returns a matchJobId immediately; the client polls /api/match-status/:id
   // instead of holding one long-lived SSE connection open (which mobile
@@ -1214,6 +1215,11 @@ async function startServer() {
                 );
                 if (entry) writeCandidatesFileAsync(uploadDir, matchJobId, info.segmentIndex, entry);
               },
+              // Fingerprint paths enable the first-pass broader search: when
+              // a segment's initial candidate pool is weak (top hash
+              // confidence < 80), one broader-search round runs up front so
+              // the true movie location can be found without a manual Retry.
+              { shortResultPath, movieResultPath },
             );
             if (finalSegments.length !== result.segments.length) {
               console.log(`[Match ${matchJobId}] VLM verification: ${result.segments.length} → ${finalSegments.length} segment(s).`);
@@ -1287,7 +1293,10 @@ async function startServer() {
                 if (overlapsExisting) continue;
                 // Highest-confidence checked (rejected) candidate wins;
                 // unverifiable ones have no confidence and rank last.
-                const checked = entry.candidates.filter(c => c.checked);
+                // Degenerate candidates (frozen matchSequence / near-zero
+                // speedRatio) are never shown as the kept-best segment.
+                const checked = entry.candidates.filter(
+                  c => c.checked && !degenerateCandidateReason(c.segment));
                 if (checked.length === 0) continue;
                 const best = checked.reduce((a, b) =>
                   ((b.confidencePct ?? -1) > (a.confidencePct ?? -1) ? b : a));
