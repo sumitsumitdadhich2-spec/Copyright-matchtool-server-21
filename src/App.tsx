@@ -78,6 +78,15 @@ interface StoredCandidateSet {
   dropped: boolean;
   /** Server-reported: a manual Retry is currently running for this segment. */
   retrying?: boolean;
+  /** True when the used candidate is only the best-scoring fallback after the
+   *  full verification budget ran out — NOT a genuine AI-confirmed match. */
+  bestEffort?: boolean;
+  /** AI-written detailed description of the target clip (deep-search flow). */
+  clipDescription?: string;
+  /** Ranking signal the AI auto-selected for this clip. */
+  recommendedMode?: 'hash' | 'embedding' | 'combined';
+  /** How many deep-search description rounds have run for this segment. */
+  deepSearchDepth?: number;
 }
 
 interface SanityResult {
@@ -168,7 +177,7 @@ function ConfidenceBadge({ confidence, isApproximate }: { confidence: number; is
  * currently-shown candidate was accepted, rejected, unverifiable, or never
  * even checked (because a match was already found earlier in the pool).
  */
-function CandidateVerdictBadge({ candidate, isUsed }: { candidate: CandidateCheck; isUsed: boolean }) {
+function CandidateVerdictBadge({ candidate, isUsed, isBestEffort }: { candidate: CandidateCheck; isUsed: boolean; isBestEffort?: boolean }) {
   const pct = candidate.confidencePct !== undefined ? ` ${candidate.confidencePct.toFixed(0)}%` : '';
   let badge: React.ReactNode;
   if (!candidate.checked) {
@@ -284,10 +293,11 @@ function MatchProgressPanel({ progress }: {
     shortStart?: number; shortEnd?: number;
     segmentsFound?: number;
     vlmSegmentIndex?: number; vlmTotalSegments?: number; vlmVerdict?: string;
+    vlmAttempt?: number; vlmTotalBudget?: number;
     startTime: number;
   };
 }) {
-  const { phase, pct, chunkIdx, totalChunks, shortStart, shortEnd, segmentsFound, vlmSegmentIndex, vlmTotalSegments, vlmVerdict, startTime } = progress;
+  const { phase, pct, chunkIdx, totalChunks, shortStart, shortEnd, segmentsFound, vlmSegmentIndex, vlmTotalSegments, vlmVerdict, vlmAttempt, vlmTotalBudget, startTime } = progress;
   const elapsed = (Date.now() - startTime) / 1000;
   const eta = pct > 2 ? Math.max(0, Math.round(elapsed * (100 - pct) / pct)) : null;
 
@@ -299,10 +309,13 @@ function MatchProgressPanel({ progress }: {
     matching:      'Matching scene chunks…',
     finalizing:    'Finalising results…',
     vlm_verify:    'Verifying scenes with AI…',
+    vlm_deep_search:   'Deep search — AI hunting new candidates…',
+    deferred_recovery: 'Recovering dropped segments…',
   };
 
   const showChunk = phase === 'matching' && totalChunks != null && chunkIdx != null;
-  const showVlm = phase === 'vlm_verify' && vlmTotalSegments != null && vlmSegmentIndex != null;
+  const showVlm = (phase === 'vlm_verify' || phase === 'vlm_deep_search') && vlmTotalSegments != null && vlmSegmentIndex != null;
+  const isDeepSearch = phase === 'vlm_deep_search';
 
   return (
     <div className="space-y-2 pt-0.5">
@@ -354,12 +367,17 @@ function MatchProgressPanel({ progress }: {
 
       {/* Detail row: AI scene-verification pass (only if VLM is configured) */}
       {showVlm && (
-        <div className="flex items-center justify-between text-xs rounded-md bg-indigo-950/40 px-2.5 py-1.5">
+        <div className={`flex items-center justify-between text-xs rounded-md px-2.5 py-1.5 ${isDeepSearch ? 'bg-purple-950/40' : 'bg-indigo-950/40'}`}>
           <div className="flex items-center gap-1.5 min-w-0 text-slate-300">
-            <span className="text-slate-500 shrink-0">Verifying segment:</span>
+            <span className="text-slate-500 shrink-0">{isDeepSearch ? 'Deep search — segment:' : 'Verifying segment:'}</span>
             <span className="font-medium truncate">
               {vlmSegmentIndex! + 1}/{vlmTotalSegments}
             </span>
+            {vlmAttempt != null && vlmTotalBudget != null && (
+              <span className={`shrink-0 font-mono ${isDeepSearch ? 'text-purple-300' : 'text-slate-400'}`}>
+                · candidate {vlmAttempt}/{vlmTotalBudget}
+              </span>
+            )}
           </div>
           {vlmVerdict && (
             <span className={`shrink-0 ml-3 font-medium capitalize ${
@@ -424,6 +442,7 @@ export default function App() {
     shortStart?: number; shortEnd?: number;
     segmentsFound?: number;
     vlmSegmentIndex?: number; vlmTotalSegments?: number; vlmVerdict?: string;
+    vlmAttempt?: number; vlmTotalBudget?: number;
     startTime: number;
   } | null>(null);
   const [matchJobId, setMatchJobId] = useState<string>('');
@@ -842,6 +861,8 @@ export default function App() {
             vlmSegmentIndex: job.progress.vlmSegmentIndex,
             vlmTotalSegments: job.progress.vlmTotalSegments,
             vlmVerdict: job.progress.vlmVerdict,
+            vlmAttempt: job.progress.vlmAttempt,
+            vlmTotalBudget: job.progress.vlmTotalBudget,
             startTime: pollStartTime,
           });
         }
@@ -975,6 +996,8 @@ export default function App() {
                 vlmSegmentIndex: job.progress.vlmSegmentIndex,
                 vlmTotalSegments: job.progress.vlmTotalSegments,
                 vlmVerdict: job.progress.vlmVerdict,
+                vlmAttempt: job.progress.vlmAttempt,
+                vlmTotalBudget: job.progress.vlmTotalBudget,
                 startTime: prev?.startTime ?? now,
               }));
             }

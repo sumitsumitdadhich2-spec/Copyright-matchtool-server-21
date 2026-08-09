@@ -11,6 +11,8 @@ interface MatchJobProgress {
   vlmSegmentIndex?: number;
   vlmTotalSegments?: number;
   vlmVerdict?: string;
+  vlmAttempt?: number;
+  vlmTotalBudget?: number;
 }
 
 interface JobEntry {
@@ -36,6 +38,8 @@ const MATCH_PHASE_LABEL: Record<string, string> = {
   matching:      'Matching scene chunks',
   finalizing:    'Finalising results',
   vlm_verify:    'Verifying scenes with AI',
+  vlm_deep_search:   'Deep search — AI hunting new candidates',
+  deferred_recovery: 'Recovering dropped segments',
 };
 
 // ---------------------------------------------------------------------------
@@ -172,8 +176,13 @@ function JobCard({
           <div className="flex justify-between text-[11px] font-mono text-slate-400">
             <span>
               {MATCH_PHASE_LABEL[job.progress?.phase ?? ''] ?? 'Matching…'}
-              {job.progress?.phase === 'vlm_verify' && job.progress.vlmTotalSegments != null && (
-                <> ({(job.progress.vlmSegmentIndex ?? 0) + 1}/{job.progress.vlmTotalSegments})</>
+              {(job.progress?.phase === 'vlm_verify' || job.progress?.phase === 'vlm_deep_search') && job.progress.vlmTotalSegments != null && (
+                <>
+                  {' '}({(job.progress.vlmSegmentIndex ?? 0) + 1}/{job.progress.vlmTotalSegments})
+                  {job.progress.vlmAttempt != null && job.progress.vlmTotalBudget != null && (
+                    <> · candidate {job.progress.vlmAttempt}/{job.progress.vlmTotalBudget}</>
+                  )}
+                </>
               )}
             </span>
             <span className="text-indigo-400 font-semibold">{job.progress?.pct ?? 0}%</span>
