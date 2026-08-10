@@ -1359,11 +1359,6 @@ async function startServer() {
                   writeCandidatesFileAsync(uploadDir, matchJobId, info.segmentIndex, entry);
                 }
               },
-              // Fingerprint paths enable the first-pass broader search: when
-              // a segment's initial candidate pool is weak (top hash
-              // confidence < 80), one broader-search round runs up front so
-              // the true movie location can be found without a manual Retry.
-              { shortResultPath, movieResultPath },
             );
             if (finalSegments.length !== result.segments.length) {
               console.log(`[Match ${matchJobId}] VLM verification: ${result.segments.length} → ${finalSegments.length} segment(s).`);
@@ -1725,8 +1720,7 @@ async function startServer() {
         );
         console.log(
           `[Retry] Match ${matchJobId} segment ${segmentIndex}: ${result.outcome} ` +
-          `(mode=${result.mode}, newCandidates=${result.newCandidatesAdded}, ` +
-          `attempts=${result.attemptsUsed}, searchRounds=${result.searchRounds}).`
+          `(attempts=${result.attemptsUsed}).`
         );
 
         // On acceptance — genuine Gemini accept OR the best-so-far fallback

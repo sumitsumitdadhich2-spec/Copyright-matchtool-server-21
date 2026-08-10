@@ -14,8 +14,7 @@ import {
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
 import { geminiConfigured } from './gemini-vlm';
 import { degenerateCandidateReason } from './degenerate-guard';
-import { broaderSearchForRange, BROADER_SEARCH_MAX_NEW, SAME_LOCATION_TOLERANCE } from './broader-search';
-import { describeTargetClip, orderCandidatesByMode, RankMode } from './clip-description';
+import type { RankMode } from './clip-description';
 
 /**
  * How many candidates the fast pre-filters (SSCD/CLIP embeddings) build and
@@ -23,33 +22,6 @@ import { describeTargetClip, orderCandidatesByMode, RankMode } from './clip-desc
  * accept/reject anything — they only pick WHICH frames Gemini looks at first.
  */
 const CANDIDATE_POOL_TARGET = Number(process.env.CANDIDATE_POOL_TARGET) || 10;
-
-/**
- * FIRST-PASS BROADER SEARCH (bug fix): when the strongest candidate in a
- * segment's initial pool has a hash confidence below this threshold, the
- * true scene very likely isn't in the pool at all (observed bug: best
- * initial candidate 75.6% while the real scene — found only by a manual
- * Retry's broader search — scored 87.3%). In that case one broader-search
- * round runs immediately, BEFORE any Gemini attempt, so the main pass can
- * find the real location on the first try. Requires the caller to supply
- * the fingerprint file paths; without them behavior is unchanged.
- */
-const LOW_CONFIDENCE_BROADEN_THRESHOLD =
-  Number(process.env.LOW_CONFIDENCE_BROADEN_THRESHOLD) || 80;
-
-/**
- * AUTO-EXTEND (candidate-system upgrade): when ALL of the first
- * VLM_MAX_ATTEMPTS (10) candidates are genuinely rejected, the segment does
- * NOT stop there anymore. Gemini writes a detailed description of the target
- * clip, auto-selects the most reliable ranking signal for it (hash /
- * embedding / combined — see clip-description.ts), and broader-search rounds
- * keep discovering NEW movie locations which are verified in that ranked
- * order — up to this HARD TOTAL CAP of verifications per segment (first 10
- * included). The first-10 flow itself is byte-for-byte unchanged; this phase
- * is purely additive and only runs after it.
- */
-export const VLM_TOTAL_MAX_ATTEMPTS =
-  Number(process.env.VLM_TOTAL_MAX_ATTEMPTS) || 30;
 
 // Fixed batch size for VLM server cache-reset points. Purely a cache-hygiene
 // boundary — does not change segment order, candidate selection, or verdicts.
@@ -81,10 +53,8 @@ totalSegments: number;
 attempt: number;
 verdict: 'accepted' | 'rejected' | 'unverifiable' | 'dropped';
 /**
- * Which verification phase emitted this event (additive, optional):
- *  - 'initial'     — the untouched first-10 loop (budget VLM_MAX_ATTEMPTS).
- *  - 'deep-search' — the auto-extend loop after every initial candidate was
- *                    rejected (budget VLM_TOTAL_MAX_ATTEMPTS).
+ * Which verification phase emitted this event (additive, optional).
+ * Only 'initial' (the first-10 loop, budget VLM_MAX_ATTEMPTS) is emitted.
  * Display-only; never consulted by any accept/reject decision.
  */
 phase?: 'initial' | 'deep-search';
@@ -183,14 +153,14 @@ export interface SegmentResolvedInfo {
   /** The candidate ultimately kept for this range, or null if the range was dropped entirely. */
   accepted: MatchedSegment | null;
   /**
-   * When `accepted` is null and the auto-extend phase spent the segment's
-   * FULL total budget (VLM_TOTAL_MAX_ATTEMPTS) without a genuine accept:
-   * index into `triedCandidates` of the highest-match-likelihood candidate —
-   * the single "best effort" the UI shows for this range (clearly NOT
-   * VLM-confirmed). All rejected candidates stay in the history untouched.
+   * When `accepted` is null and all attempts ran out without a genuine
+   * accept: index into `triedCandidates` of the highest-match-likelihood
+   * candidate — the single "best effort" the UI shows for this range
+   * (clearly NOT VLM-confirmed). All rejected candidates stay in the
+   * history untouched.
    */
   bestEffortIndex?: number;
-  /** Gemini's target-clip description, when the auto-extend phase generated one. */
+  /** Gemini's target-clip description (from previously persisted data, if any). */
   clipDescription?: string;
   /** Ranking signal Gemini auto-selected for this clip (hash/embedding/combined). */
   recommendedMode?: RankMode;
@@ -212,14 +182,6 @@ export async function resolveSegmentsWithVLM(
    * candidate discovery for a later deferred recovery pass; never awaited here.
    */
   onSegmentResolved?: (info: SegmentResolvedInfo) => void,
-  /**
-   * Optional fingerprint file paths. When supplied, a segment whose initial
-   * candidate pool looks weak (top hash confidence below
-   * LOW_CONFIDENCE_BROADEN_THRESHOLD) gets ONE broader-search round up front
-   * to pull in movie locations the original scan missed — before any Gemini
-   * attempt is spent. Purely additive: strong pools are untouched.
-   */
-  fingerprintPaths?: { shortResultPath: string; movieResultPath: string },
 ): Promise<MatchedSegment[]> {
   if (segments.length === 0) return segments;
 
@@ -275,46 +237,6 @@ export async function resolveSegmentsWithVLM(
       if (candidates.length >= CANDIDATE_POOL_TARGET) break;
       if (candidates.some(c => Math.abs(c.movieStart - alt.movieStart) <= 0.5)) continue;
       candidates.push(alt);
-    }
-
-    // ------------------------------------------------------------------
-    // FIRST-PASS BROADER SEARCH (bug fix): if even the STRONGEST candidate
-    // in the pool has a weak hash confidence, the real scene probably isn't
-    // in the pool at all. Run one broader-search round NOW (same primitive
-    // the manual Retry uses) and merge any genuinely new movie locations,
-    // so Gemini gets a chance to see the true scene on the first attempt
-    // instead of only after a manual Retry.
-    // ------------------------------------------------------------------
-    if (fingerprintPaths) {
-      const topConfidence = Math.max(...candidates.map(c => c.confidence));
-      if (topConfidence < LOW_CONFIDENCE_BROADEN_THRESHOLD) {
-        try {
-          console.log(
-            `[VLM] seg${i}: weak initial pool (top hash confidence ` +
-            `${topConfidence.toFixed(1)} < ${LOW_CONFIDENCE_BROADEN_THRESHOLD}) — ` +
-            `running first-pass broader search`
-          );
-          const fresh = (await broaderSearchForRange(
-            original.shortStart,
-            original.shortEnd,
-            fingerprintPaths.shortResultPath,
-            fingerprintPaths.movieResultPath,
-            0,
-          ))
-            .filter(seg => !candidates.some(c => Math.abs(c.movieStart - seg.movieStart) <= SAME_LOCATION_TOLERANCE))
-            .slice(0, BROADER_SEARCH_MAX_NEW);
-          if (fresh.length > 0) {
-            console.log(
-              `[VLM] seg${i}: first-pass broader search added ${fresh.length} new candidate(s) ` +
-              `(best new confidence ${fresh[0].confidence.toFixed(1)})`
-            );
-            candidates.push(...fresh);
-          }
-        } catch (err: any) {
-          // Broadening is best-effort only — never fail the segment over it.
-          console.warn(`[VLM] seg${i}: first-pass broader search failed: ${err?.message || err}`);
-        }
-      }
     }
 
     let order = candidates.map((_, k) => k);
@@ -452,183 +374,6 @@ export async function resolveSegmentsWithVLM(
       if (accepted) break;
     }
 
-    // ------------------------------------------------------------------
-    // AUTO-EXTEND PHASE (candidate-system upgrade — purely additive; the
-    // first-10 flow above is untouched). Runs ONLY when every candidate in
-    // the initial pool was checked/rejected without a genuine accept:
-    //   1. Gemini writes a DETAILED DESCRIPTION of the target clip and
-    //      auto-selects the most reliable ranking signal for it.
-    //   2. Any leftover discovered-but-unverified candidates are verified
-    //      first (ordered by that signal) — cheapest wins first.
-    //   3. Broader-search rounds keep surfacing NEW movie locations (each
-    //      round widens the net), ranked by the same signal and verified
-    //      one by one — never re-checking any already-tried location.
-    //   4. Hard stop at VLM_TOTAL_MAX_ATTEMPTS (30) total verifications or
-    //      when the search saturates (2 consecutive empty rounds).
-    // The segment is NOT abandoned until this full budget is spent.
-    // ------------------------------------------------------------------
-    let clipDescription: string | undefined;
-    let recommendedMode: RankMode | undefined;
-
-    if (!accepted && fingerprintPaths && geminiConfigured() && attempt < VLM_TOTAL_MAX_ATTEMPTS) {
-      console.log(
-        `[VLM] seg${i}: all ${attempt} initial candidate(s) rejected — AUTO-EXTEND starts ` +
-        `(budget ${attempt}/${VLM_TOTAL_MAX_ATTEMPTS} used)`
-      );
-
-      // 1. AI clip profile — description + auto-selected ranking mode.
-      //    Best-effort: on failure the search still runs in 'combined' mode.
-      const profile = await describeTargetClip(
-        shortVideoPath, original.shortStart, original.shortEnd, 0, `ClipProfile seg${i}`,
-      );
-      const mode: RankMode = profile?.recommendedMode ?? 'combined';
-      clipDescription = profile?.description;
-      recommendedMode = mode;
-
-      /** Verify ONE extended candidate with the exact same degenerate guard,
-       *  Gemini video call, threshold, and infra-retry policy the first-10
-       *  loop uses. Returns true when the segment is done (accepted). */
-      const verifyExtended = async (candidate: MatchedSegment): Promise<boolean> => {
-        const degenerateReason = degenerateCandidateReason(candidate);
-        if (degenerateReason) {
-          console.log(`[VLM] seg${i} (extend): auto-rejected degenerate candidate (${degenerateReason})`);
-          triedCandidates.push({
-            segment: candidate,
-            verdict: 'rejected',
-            matchLikelihood: 0,
-            evidence: [`Auto-rejected without VLM: ${degenerateReason}`],
-          });
-          onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'rejected', phase: 'deep-search', totalBudget: VLM_TOTAL_MAX_ATTEMPTS });
-          return false;
-        }
-        attempt++;
-        for (let retry = 0; retry <= VLM_INFRA_RETRIES; retry++) {
-          if (retry > 0) await sleep(infraBackoffDelay(retry - 1));
-          try {
-            const result = await verifySegmentByVideo(
-              shortVideoPath, movieVideoPath, candidate,
-              `VLM seg${i}#${attempt}ext${retry > 0 ? `r${retry}` : ''}`,
-            );
-            if (result === null) {
-              if (retry < VLM_INFRA_RETRIES) continue;
-              sawUnverifiable = true;
-              triedCandidates.push({ segment: candidate, verdict: 'unverifiable' });
-              onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'unverifiable', phase: 'deep-search', totalBudget: VLM_TOTAL_MAX_ATTEMPTS });
-              return false;
-            }
-            if (result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD) {
-              accepted = candidate;
-              triedCandidates.push({
-                segment: candidate, verdict: 'accepted',
-                confidencePct: result.confidencePct,
-                matchLikelihood: result.matchLikelihood,
-                evidence: result.evidence,
-              });
-              onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'accepted', phase: 'deep-search', totalBudget: VLM_TOTAL_MAX_ATTEMPTS });
-              return true;
-            }
-            triedCandidates.push({
-              segment: candidate, verdict: 'rejected',
-              confidencePct: result.confidencePct,
-              matchLikelihood: result.matchLikelihood,
-              evidence: result.evidence,
-            });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'rejected', phase: 'deep-search', totalBudget: VLM_TOTAL_MAX_ATTEMPTS });
-            return false;
-          } catch (err: any) {
-            if (retry < VLM_INFRA_RETRIES) continue;
-            sawUnverifiable = true;
-            triedCandidates.push({ segment: candidate, verdict: 'unverifiable' });
-            onProgress?.({ segmentIndex: i, totalSegments: segments.length, attempt, verdict: 'unverifiable', phase: 'deep-search', totalBudget: VLM_TOTAL_MAX_ATTEMPTS });
-            return false;
-          }
-        }
-        return false;
-      };
-
-      // Every movie location this segment has already considered — never
-      // re-check any of them.
-      const triedLocations = () => [
-        ...candidates.map(c => c.movieStart),
-        ...triedCandidates.map(t => t.segment.movieStart),
-      ];
-
-      // 2. Leftover discovered-but-unverified candidates first (the initial
-      //    pool can be larger than the first-10 budget), in mode order.
-      //    IMPORTANT: the capped `candidates` array (CANDIDATE_POOL_TARGET)
-      //    may have LEFT OUT alternates the matching engine already
-      //    discovered — pull those from the full candidatePool too, so the
-      //    deep-search phase spends its budget on every known location
-      //    before paying for broader-search re-scans.
-      const poolLeftovers = getAlternateCandidatesForRange(
-        candidatePool,
-        original.shortStart,
-        original.shortEnd,
-        candidates.map(c => c.movieStart),
-      );
-      for (const alt of poolLeftovers) {
-        if (candidates.some(c => Math.abs(c.movieStart - alt.movieStart) <= SAME_LOCATION_TOLERANCE)) continue;
-        candidates.push(alt);
-      }
-      const verifiedStarts = new Set(triedCandidates.map(t => t.segment.movieStart));
-      const leftoverIdxs = candidates
-        .map((c, k) => (verifiedStarts.has(c.movieStart) ? -1 : k))
-        .filter(k => k !== -1);
-      if (leftoverIdxs.length > 0) {
-        const orderedLeftovers = await orderCandidatesByMode(
-          mode, candidates.map(segment => ({ segment })), leftoverIdxs,
-          shortVideoPath, movieVideoPath, `ExtendRank seg${i}`,
-        );
-        for (const k of orderedLeftovers) {
-          if (accepted || attempt >= VLM_TOTAL_MAX_ATTEMPTS) break;
-          await verifyExtended(candidates[k]);
-        }
-      }
-
-      // 3. Broader-search rounds for genuinely NEW movie locations.
-      let extRound = 1; // round 0 may already have run as the first-pass broaden
-      let emptyRounds = 0;
-      while (!accepted && attempt < VLM_TOTAL_MAX_ATTEMPTS && emptyRounds < 2) {
-        let fresh: MatchedSegment[] = [];
-        try {
-          const known = triedLocations();
-          fresh = (await broaderSearchForRange(
-            original.shortStart, original.shortEnd,
-            fingerprintPaths.shortResultPath, fingerprintPaths.movieResultPath,
-            extRound,
-          ))
-            .filter(seg => !known.some(t => Math.abs(t - seg.movieStart) <= SAME_LOCATION_TOLERANCE))
-            .slice(0, BROADER_SEARCH_MAX_NEW);
-        } catch (err: any) {
-          console.warn(`[VLM] seg${i} (extend): broader-search round ${extRound} failed: ${err?.message || err}`);
-        }
-        extRound++;
-
-        if (fresh.length === 0) { emptyRounds++; continue; }
-        emptyRounds = 0;
-        console.log(`[VLM] seg${i} (extend): round ${extRound - 1} surfaced ${fresh.length} new candidate(s)`);
-
-        // Track them so later rounds/dedupe see them, then verify in mode order.
-        const baseIdx = candidates.length;
-        candidates.push(...fresh);
-        const freshIdxs = fresh.map((_, k) => baseIdx + k);
-        const orderedFresh = await orderCandidatesByMode(
-          mode, candidates.map(segment => ({ segment })), freshIdxs,
-          shortVideoPath, movieVideoPath, `ExtendRank seg${i}`,
-        );
-        for (const k of orderedFresh) {
-          if (accepted || attempt >= VLM_TOTAL_MAX_ATTEMPTS) break;
-          await verifyExtended(candidates[k]);
-        }
-      }
-
-      if (!accepted) {
-        console.log(
-          `[VLM] seg${i}: auto-extend exhausted (${attempt}/${VLM_TOTAL_MAX_ATTEMPTS} verifications) ` +
-          `without a genuine accept — best-effort fallback will be surfaced`
-        );
-      }
-    }
 
     // ------------------------------------------------------------------
     // BEST-EFFORT PICK: when the FULL budget ran out without a genuine
@@ -664,8 +409,7 @@ export async function resolveSegmentsWithVLM(
     // dropped) so the caller can persist full candidate-comparison history —
     // not just what happened to previously-dropped segments.
     onSegmentResolved?.({
-      segmentIndex: i, original, triedCandidates, accepted,
-      bestEffortIndex, clipDescription, recommendedMode,
+      segmentIndex: i, original, triedCandidates, accepted, bestEffortIndex,
     });
   }
 

@@ -62,16 +62,9 @@ export interface StoredCandidateSet {
    */
   bestEffort?: boolean;
   /**
-   * How many broader-search rounds this segment has already run. Each Retry
-   * click that exhausts the pool escalates the search width using this count,
-   * so repeat clicks surface genuinely NEW movie locations instead of
-   * rediscovering the same ones.
-   */
-  broaderSearchRounds?: number;
-  /**
-   * AI-written detailed description of the target clip segment (from the
-   * auto-extend / deep-search flow). Guides candidate ORDERING only — it is
-   * never a verdict. Refreshed with a finer version at each deep-search depth.
+   * AI-written detailed description of the target clip segment (persisted
+   * display data from older runs). Guides candidate ORDERING only — it is
+   * never a verdict.
    */
   clipDescription?: string;
   /**
@@ -79,11 +72,7 @@ export interface StoredCandidateSet {
    * 'embedding' (cropped/zoomed/filtered clip), or 'combined'.
    */
   recommendedMode?: 'hash' | 'embedding' | 'combined';
-  /**
-   * How many DEEP-SEARCH description rounds have run for this segment (each
-   * manual Retry click that reaches broader search increments it, asking
-   * Gemini for a progressively finer clip description).
-   */
+  /** Legacy field from older persisted entries — ignored. */
   deepSearchDepth?: number;
 }
 
