@@ -14,6 +14,7 @@
  * NEVER triggers a new scan of the movie.
  */
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
+import { sortIndexesByGreenScore, greenScoreLogTag } from './candidate-green-score';
 import { verifySegmentByVideo, VLM_CONFIDENCE_THRESHOLD, VLM_MAX_ATTEMPTS } from './vlm-verify';
 import { orderCandidatesByMode } from './clip-description';
 import { degenerateCandidateReason } from './degenerate-guard';
@@ -153,6 +154,16 @@ export async function retrySegmentCandidates(
         if (ranked) order = ranked;
       }
     } catch { /* ranking is best-effort only */ }
+
+    // GREEN-QUALITY PRIMARY ordering: candidates with more green timeline
+    // frames (similarity >= 80, the UI's own threshold) are verified FIRST.
+    // Stable sort over the ranking above, so the embedding/mode order
+    // survives as the SECONDARY tie-breaker. Ordering only — never a verdict.
+    order = sortIndexesByGreenScore(i => entry.candidates[i]?.segment, order);
+    console.log(
+      `[CandidateRetry] seg${segmentIndex}: green-score verification order: ` +
+      order.map(i => `#${i}(${greenScoreLogTag(entry.candidates[i]?.segment)})`).join(' > ')
+    );
 
     for (const idx of order) {
       if (attemptsUsed >= RETRY_MAX_ATTEMPTS) break;

@@ -15,6 +15,7 @@
  */
 import { MatchedSegment } from './candidate-matching-engine';
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
+import { sortIndexesByGreenScore, greenScoreLogTag } from './candidate-green-score';
 import { degenerateCandidateReason } from './degenerate-guard';
 import { verifySegmentByVideo, VLM_CONFIDENCE_THRESHOLD, VLM_CONCURRENCY } from './vlm-verify';
 import {
@@ -94,6 +95,16 @@ export async function runDeferredRecoveryPass(
       'DeferredRecovery',
     );
     if (ranked) uncheckedOrder = ranked;
+
+    // GREEN-QUALITY PRIMARY ordering: candidates with more green timeline
+    // frames (similarity >= 80, the UI's own threshold) are verified FIRST.
+    // Stable sort over the embedding rank above, so crop-robust order
+    // survives as the SECONDARY tie-breaker. Ordering only — never a verdict.
+    uncheckedOrder = sortIndexesByGreenScore(i => entry.candidates[i]?.segment, uncheckedOrder);
+    console.log(
+      `[DeferredRecovery] seg${segmentIndex}: green-score verification order: ` +
+      uncheckedOrder.map(i => `#${i}(${greenScoreLogTag(entry.candidates[i]?.segment)})`).join(' > ')
+    );
 
     for (const c of uncheckedOrder) {
       const candidateEntry = entry.candidates[c];

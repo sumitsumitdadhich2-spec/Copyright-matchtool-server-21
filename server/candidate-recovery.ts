@@ -18,6 +18,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { MatchedSegment, getAlternateCandidatesForRange } from './candidate-matching-engine';
+import { sortSegmentsByGreenScore } from './candidate-green-score';
 
 export interface CandidateCheck {
   segment: MatchedSegment;
@@ -90,6 +91,13 @@ export function matchCandidatesFilePath(uploadDir: string, matchJobId: string, s
  * Pick up to `max` next-best alternate movie-timestamp candidates for a
  * short-clip range, beyond everything already tried. Pure reuse of the
  * matching engine's own `getAlternateCandidatesForRange` — no new scoring.
+ *
+ * GREEN-QUALITY PRIMARY: the pool is stable-sorted by green-score (fraction
+ * of matchSequence frames with similarity >= 80, the UI timeline's own
+ * threshold; avg similarity tie-break) BEFORE the top-`max` cut, so the kept
+ * candidates are the greenest ones — not merely the first-found ones. The
+ * engine's discovery scan/scoring is untouched; only the final ordering/cut
+ * changed.
  */
 export function discoverBackgroundCandidates(
   candidatePool: MatchedSegment[] | undefined,
@@ -98,7 +106,9 @@ export function discoverBackgroundCandidates(
   excludeMovieTimestamps: number[],
   max = CANDIDATES_MAX,
 ): MatchedSegment[] {
-  return getAlternateCandidatesForRange(candidatePool, shortStart, shortEnd, excludeMovieTimestamps).slice(0, max);
+  return sortSegmentsByGreenScore(
+    getAlternateCandidatesForRange(candidatePool, shortStart, shortEnd, excludeMovieTimestamps),
+  ).slice(0, max);
 }
 
 /**

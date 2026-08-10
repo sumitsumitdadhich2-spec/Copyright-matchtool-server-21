@@ -12,6 +12,7 @@ import {
   VLM_CONCURRENCY,
 } from './vlm-verify';
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
+import { sortIndexesByGreenScore, sortSegmentsByGreenScore, greenScoreLogTag } from './candidate-green-score';
 import { geminiConfigured } from './gemini-vlm';
 import { degenerateCandidateReason } from './degenerate-guard';
 import type { RankMode } from './clip-description';
@@ -227,12 +228,17 @@ export async function resolveSegmentsWithVLM(
     // anything here; ranking failure just keeps the confidence order.
     // ------------------------------------------------------------------
     const candidates: MatchedSegment[] = [original];
-    const alternates = getAlternateCandidatesForRange(
+    // GREEN-QUALITY PRIMARY discovery ordering: sort the alternate pool by
+    // green-score (fraction of matchSequence frames with similarity >= 80,
+    // the UI timeline's own threshold) BEFORE the CANDIDATE_POOL_TARGET cap,
+    // so the pool keeps the greenest candidates — not merely the first-found
+    // ones. Ordering/cut only; discovery scan and scoring stay untouched.
+    const alternates = sortSegmentsByGreenScore(getAlternateCandidatesForRange(
       candidatePool,
       original.shortStart,
       original.shortEnd,
       [original.movieStart],
-    );
+    ));
     for (const alt of alternates) {
       if (candidates.length >= CANDIDATE_POOL_TARGET) break;
       if (candidates.some(c => Math.abs(c.movieStart - alt.movieStart) <= 0.5)) continue;
@@ -253,6 +259,19 @@ export async function resolveSegmentsWithVLM(
       } catch {
         // Ranking is best-effort only — keep hash-confidence order.
       }
+    }
+
+    // GREEN-QUALITY PRIMARY verification ordering: candidates with more
+    // green timeline frames (similarity >= 80) are verified FIRST. Stable
+    // sort over the embedding rank above, so crop-robust order survives as
+    // the SECONDARY tie-breaker. Ordering only — Gemini stays the sole
+    // verdict-maker.
+    order = sortIndexesByGreenScore(k => candidates[k], order);
+    if (candidates.length > 1) {
+      console.log(
+        `[VLM] seg${i}: green-score verification order: ` +
+        order.map(k => `#${k}(${greenScoreLogTag(candidates[k])})`).join(' > ')
+      );
     }
 
     // ------------------------------------------------------------------

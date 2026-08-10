@@ -25,6 +25,7 @@
  */
 import { MatchedSegment } from './candidate-matching-engine';
 import { rankCandidatesCropRobust } from './candidate-embedding-rank';
+import { sortIndexesByGreenScore } from './candidate-green-score';
 import { geminiDescribeVideo } from './gemini-vlm';
 import { cutSegmentToTempFile, deleteTempSegment } from './segment-cutter';
 import { fpsForDuration } from './vlm-verify';
@@ -141,6 +142,11 @@ export async function describeTargetClip(
  *  hash      -> sort by the matching engine's hash confidence, descending.
  *  embedding -> crop-robust SSCD/CLIP embedding rank (existing ranker).
  *  combined  -> average of each candidate's position in BOTH orderings.
+ *
+ * GREEN-QUALITY PRIMARY: whatever order the mode produces, candidates with
+ * more green timeline frames (matchSequence similarity >= 80, the UI's own
+ * threshold) are verified FIRST — a stable sort keeps the mode-selected
+ * order as the SECONDARY tie-breaker. Still reorder-only; never a verdict.
  */
 export async function orderCandidatesByMode(
   mode: RankMode,
@@ -152,10 +158,13 @@ export async function orderCandidatesByMode(
 ): Promise<number[]> {
   if (indexes.length <= 1) return indexes;
 
+  const greenFirst = (order: number[]) =>
+    sortIndexesByGreenScore(i => candidates[i]?.segment, order);
+
   const hashOrder = [...indexes].sort(
     (a, b) => (candidates[b].segment.confidence ?? 0) - (candidates[a].segment.confidence ?? 0),
   );
-  if (mode === 'hash') return hashOrder;
+  if (mode === 'hash') return greenFirst(hashOrder);
 
   let embeddingOrder: number[] | null = null;
   try {
@@ -164,17 +173,17 @@ export async function orderCandidatesByMode(
     );
   } catch { /* ranking is best-effort only */ }
 
-  if (mode === 'embedding') return embeddingOrder ?? hashOrder;
+  if (mode === 'embedding') return greenFirst(embeddingOrder ?? hashOrder);
 
   // combined: average rank position across both signals.
-  if (!embeddingOrder) return hashOrder;
+  if (!embeddingOrder) return greenFirst(hashOrder);
   const pos = (order: number[], idx: number) => {
     const p = order.indexOf(idx);
     return p === -1 ? order.length : p;
   };
-  return [...indexes].sort(
+  return greenFirst([...indexes].sort(
     (a, b) =>
       (pos(hashOrder, a) + pos(embeddingOrder!, a)) -
       (pos(hashOrder, b) + pos(embeddingOrder!, b)),
-  );
+  ));
 }
