@@ -2,7 +2,7 @@
  * CANDIDATE-FIND matching engine — dedicated copy for the candidate system.
  *
  * This file is an exact 1:1 copy of matching-engine.ts, created so the
- * candidate-find flow (candidate-retry.ts broader search, candidate-recovery.ts
+ * candidate-find flow (candidate-retry.ts pool verification, candidate-recovery.ts
  * alt-candidate pool, deferred-recovery.ts) can be tuned/modified independently
  * WITHOUT ever affecting the main first-pass matching engine.
  *
@@ -2973,8 +2973,8 @@ export async function matchVideosFromFiles(
   // Peek at movie frame count via line index (fast: one sequential pass).
   // This also gives us byte offsets ready for the chunked path if needed.
   // PERFORMANCE FIX: the line index for the SAME movie file is cached
-  // process-wide (keyed by path + mtime + size), so auto-extend / broader
-  // search rounds never re-scan the movie NDJSON just to rebuild it.
+  // process-wide (keyed by path + mtime + size), so repeat calls for the
+  // same movie never re-scan the movie NDJSON just to rebuild it.
   onProgress?.({ phase: 'indexing', pct: 10 });
   const { value: lineIndex, cacheHit: indexCacheHit } = await getOrLoadMovieAsset(
     movieResultPath,
@@ -3056,7 +3056,7 @@ export async function matchVideosFromFiles(
   // PERFORMANCE FIX (bottleneck 1): the movie PreSet — the single most
   // expensive precompute in the pipeline — is cached per movie file version.
   // "Streaming precompute: movie fingerprints…" now logs at most ONCE per
-  // uploaded movie; every auto-extend / broader-search round reuses it.
+  // uploaded movie; every repeat call for the same movie reuses it.
   // The PreSet is read-only during matching, so sharing it across concurrent
   // calls is safe.
   onProgress?.({ phase: 'loading_movie', pct: 18 });
