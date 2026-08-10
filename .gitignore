@@ -7,3 +7,9 @@ coverage/
 .env*
 !.env.example
 runtime-settings.json
+
+# Runtime job artifacts: uploaded videos, match results, candidate dumps.
+# Generated per job and often hundreds of MB, which breaks pushes because
+# GitHub rejects any single file over 100 MB.
+uploads/*
+!uploads/.gitkeep
