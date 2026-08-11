@@ -7,3 +7,11 @@ coverage/
 .env*
 !.env.example
 runtime-settings.json
+
+# Video files & uploads — never commit these to git (they fill up repo storage)
+uploads/
+*.mp4
+*.mov
+*.avi
+*.webm
+*.mkv

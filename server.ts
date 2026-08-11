@@ -79,6 +79,11 @@ async function startServer() {
   // Configure multer storage
   const storage = multer.diskStorage({
     destination: (req, file, cb) => {
+      // Re-create the directory if it was deleted while the server is running
+      // (e.g. during a manual cleanup) so uploads never fail with ENOENT.
+      if (!fs.existsSync(uploadDir)) {
+        fs.mkdirSync(uploadDir, { recursive: true });
+      }
       cb(null, uploadDir);
     },
     filename: (req, file, cb) => {
