@@ -7,3 +7,10 @@ coverage/
 .env*
 !.env.example
 runtime-settings.json
+
+# Run artifacts: uploaded videos, extracted frames, per-job result/candidate JSON.
+# These are large (hundreds of MB) and regenerated on every run, so they must
+# never be committed. GitHub rejects any single file over 100 MB.
+uploads/
+tmp/
+frames/
