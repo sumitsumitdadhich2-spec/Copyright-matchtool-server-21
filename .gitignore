@@ -8,10 +8,13 @@ coverage/
 !.env.example
 runtime-settings.json
 
-# Video files & uploads — never commit these to git (they fill up repo storage)
-uploads/
-*.mp4
-*.mov
-*.avi
-*.webm
-*.mkv
+# Uploaded videos & metadata in uploads/ ARE saved to git (persist across projects).
+# Only large fingerprint result files are excluded (GitHub blocks files > 100MB).
+uploads/*_result.json
+
+# Stray test videos in the repo root stay ignored
+/*.mp4
+/*.mov
+/*.avi
+/*.webm
+/*.mkv
