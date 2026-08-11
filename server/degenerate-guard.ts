@@ -52,7 +52,23 @@ export const DEGENERATE_MAX_SPEED_RATIO =
 /** matchSequence spans below which the movie side counts as "frozen" when
  *  the short side spans at least DEGENERATE_MIN_SHORT_SPAN_S. */
 const DEGENERATE_FROZEN_MOVIE_SPAN_S = 0.25;
-const DEGENERATE_MIN_SHORT_SPAN_S = 1.0;
+export const DEGENERATE_MIN_SHORT_SPAN_S = 1.0;
+
+/**
+ * Measured short-side span of the candidate's matchSequence, falling back to
+ * the segment's declared bounds when the sequence is too small to measure.
+ */
+function shortSpanSeconds(seg: DegenerateCheckableSegment): number {
+  if (seg.matchSequence.length >= 2) {
+    let minShort = Infinity, maxShort = -Infinity;
+    for (const f of seg.matchSequence) {
+      if (f.shortTime < minShort) minShort = f.shortTime;
+      if (f.shortTime > maxShort) maxShort = f.shortTime;
+    }
+    if (Number.isFinite(minShort) && Number.isFinite(maxShort)) return maxShort - minShort;
+  }
+  return seg.shortEnd - seg.shortStart;
+}
 
 /**
  * Returns a human-readable reason when the candidate is structurally
@@ -61,10 +77,34 @@ const DEGENERATE_MIN_SHORT_SPAN_S = 1.0;
 export function degenerateCandidateReason(
   seg: DegenerateCheckableSegment,
 ): string | null {
+  // ── SPAN GATE (bug fix) ──────────────────────────────────────────────────
+  // Both speed-ratio tests below read `seg.speedRatio`, which is a linear
+  // regression of movie-frame index over short-frame index. That regression
+  // only carries information when the short side spans enough time for the
+  // real slope to rise above frame-level matching jitter.
+  //
+  // For a sub-second segment (e.g. 0.84 s ≈ 21 frames at 25 fps) the true
+  // movie span is also sub-second, so ±0.3 s of per-frame jitter completely
+  // swamps the fit. The regression collapses toward zero and
+  // computeRegressionSlope() clamps it to SLOPE_MIN (0.1) — a clamp sentinel
+  // meaning "unmeasurable", NOT a measurement of a frozen timeline. Feeding
+  // that 0.1 into the < 0.35 test rejected perfectly good short candidates
+  // (observed: seg13/seg14/seg18 of a 42-segment run, where the correct
+  // movie location sat right between the accepted neighbours and still got
+  // auto-rejected before Gemini ever saw it).
+  //
+  // The frozen-matchSequence test (check 3) is the structural test that
+  // actually catches the original bug — 53 short frames stuck on one movie
+  // frame — and it already requires this same minimum span. So below the
+  // threshold we make NO structural claim and let the VLM decide, which is
+  // strictly safer than guessing from an unmeasurable slope.
+  const shortSpan = shortSpanSeconds(seg);
+  const speedRatioMeasurable = shortSpan >= DEGENERATE_MIN_SHORT_SPAN_S;
+
   // 1. Near-zero (or backwards) speed ratio — the regression over the whole
   //    matchSequence says the movie timeline barely advances while the short
   //    plays. A real copy cannot look like this.
-  if (Number.isFinite(seg.speedRatio) && seg.speedRatio < DEGENERATE_MIN_SPEED_RATIO) {
+  if (speedRatioMeasurable && Number.isFinite(seg.speedRatio) && seg.speedRatio < DEGENERATE_MIN_SPEED_RATIO) {
     return (
       `speedRatio ${seg.speedRatio.toFixed(2)} < ${DEGENERATE_MIN_SPEED_RATIO} ` +
       `(movie timeline frozen relative to short clip)`
@@ -75,7 +115,7 @@ export function degenerateCandidateReason(
   //    faster than any legitimate fast-forward edit. These mappings are
   //    hash collisions across duplicate-looking scenes; the VLM cannot be
   //    trusted on them ("same" at high confidence), so reject structurally.
-  if (Number.isFinite(seg.speedRatio) && seg.speedRatio > DEGENERATE_MAX_SPEED_RATIO) {
+  if (speedRatioMeasurable && Number.isFinite(seg.speedRatio) && seg.speedRatio > DEGENERATE_MAX_SPEED_RATIO) {
     return (
       `speedRatio ${seg.speedRatio.toFixed(2)} > ${DEGENERATE_MAX_SPEED_RATIO} ` +
       `(movie timeline advances implausibly fast relative to short clip)`

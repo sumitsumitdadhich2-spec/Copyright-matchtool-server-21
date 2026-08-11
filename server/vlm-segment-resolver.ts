@@ -15,6 +15,11 @@ import { rankCandidatesCropRobust } from './candidate-embedding-rank';
 import { sortIndexesByGreenScore, sortSegmentsByGreenScore, greenScoreLogTag } from './candidate-green-score';
 import { geminiConfigured } from './gemini-vlm';
 import { degenerateCandidateReason } from './degenerate-guard';
+import {
+  computeContinuityWindow,
+  sortIndexesByContinuity,
+  continuityLogTag,
+} from './candidate-continuity';
 import type { RankMode } from './clip-description';
 
 /**
@@ -274,10 +279,64 @@ export async function resolveSegmentsWithVLM(
       );
     }
 
+    // TIMELINE-CONTINUITY PRIMARY ordering (bug fix): a copied segment is a
+    // contiguous excerpt, so candidates sitting where this segment's
+    // neighbours predict it are verified FIRST. The hash pool ranks purely on
+    // frame similarity and can scatter candidates across the whole movie, so
+    // with a limited attempt budget the correct one could previously fall
+    // outside the checked prefix. Stable over the green-score order above, so
+    // that stays the ordering wherever continuity has nothing to say.
+    // Ordering only — Gemini remains the sole verdict-maker.
+    const continuityWindow = computeContinuityWindow(segments, i);
+    if (continuityWindow && candidates.length > 1) {
+      const reordered = sortIndexesByContinuity(k => candidates[k], order, continuityWindow);
+      const changed = reordered.some((k, n) => k !== order[n]);
+      order = reordered;
+      console.log(
+        `[VLM] seg${i}: continuity window ` +
+        `[${continuityWindow.lower.toFixed(2)}–${continuityWindow.upper.toFixed(2)}]s ` +
+        `from ${continuityWindow.neighbourCount} neighbour(s)` +
+        (changed ? ' — reordered: ' : ' — order unchanged: ') +
+        order.map(k => `#${k}@${candidates[k].movieStart.toFixed(2)}(${continuityLogTag(candidates[k], continuityWindow)})`).join(' > ')
+      );
+    }
+
     // ------------------------------------------------------------------
     // VERIFICATION — Gemini only, in ranked order, up to VLM_MAX_ATTEMPTS.
     // ------------------------------------------------------------------
     let sawUnverifiable = false;
+
+    // ------------------------------------------------------------------
+    // GUARD PRE-PASS (bug fix): evaluate the degenerate guard across the
+    // WHOLE pool before verifying anything, so we can tell the difference
+    // between "some candidates are structurally impossible" (normal — reject
+    // them for free) and "the guard eliminated every single candidate".
+    //
+    // In the latter case the old code dropped the segment after ZERO Gemini
+    // calls, reporting it as "no match found" even though the pool was never
+    // actually examined. That is strictly worse than asking Gemini: the guard
+    // is a heuristic about mapping geometry, whereas Gemini looks at the real
+    // pixels. So when the guard would leave nothing to check, we bypass it for
+    // this segment and let Gemini adjudicate the pool it was given.
+    //
+    // Gemini stays the sole verdict-maker either way; this only decides which
+    // candidates are allowed to reach it.
+    // ------------------------------------------------------------------
+    const guardReasons = new Map<number, string>();
+    for (const candIdx of order) {
+      const reason = degenerateCandidateReason(candidates[candIdx]);
+      if (reason) guardReasons.set(candIdx, reason);
+    }
+    const guardBypassed = order.length > 0 && guardReasons.size === order.length;
+    if (guardBypassed) {
+      console.warn(
+        `[VLM] seg${i}: degenerate guard would reject ALL ${order.length} candidate(s) ` +
+        `— bypassing guard and letting Gemini verify them rather than dropping the ` +
+        `segment unchecked. Reasons: ` +
+        order.map(k => `#${k}(${guardReasons.get(k)})`).join('; ')
+      );
+      guardReasons.clear();
+    }
 
     for (const candIdx of order) {
       if (attempt >= VLM_MAX_ATTEMPTS) break;
@@ -292,7 +351,7 @@ export async function resolveSegmentsWithVLM(
       // Gemini call or a candidate-budget slot, and never let one become
       // the accepted answer.
       // ----------------------------------------------------------------
-      const degenerateReason = degenerateCandidateReason(candidate);
+      const degenerateReason = guardReasons.get(candIdx);
       if (degenerateReason) {
         console.log(`[VLM] seg${i}: auto-rejected degenerate candidate (${degenerateReason})`);
         triedCandidates.push({
@@ -405,7 +464,7 @@ export async function resolveSegmentsWithVLM(
     if (!accepted && triedCandidates.length > 0) {
       let bestScore = -1;
       triedCandidates.forEach((t, k) => {
-        if (degenerateCandidateReason(t.segment)) return;
+        if (!guardBypassed && degenerateCandidateReason(t.segment)) return;
         const score = typeof t.matchLikelihood === 'number' ? t.matchLikelihood : -1;
         if (score > bestScore) { bestScore = score; bestEffortIndex = k; }
       });
