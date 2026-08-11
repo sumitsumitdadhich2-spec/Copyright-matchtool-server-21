@@ -56,14 +56,18 @@ interface UnmatchedRange {
   shortEnd: number;
 }
 
-// Preview-only candidate data (deferred-candidate-recovery feature). Mirrors
-// server/candidate-recovery.ts's StoredCandidateSet — never part of the
+// Preview-only per-range verification data. Mirrors
+// server/verification/store.ts's VerificationRecord — never part of the
 // primary match result JSON, fetched separately for the compare UI only.
 interface CandidateCheck {
   segment: MatchedSegment;
   checked: boolean;
   verdict?: 'accepted' | 'rejected' | 'unverifiable';
   confidencePct?: number;
+  /** Gemini's one-line justification for its verdict. */
+  reason?: string;
+  /** Hash-matching confidence from the engine (ordering signal only). */
+  hashConfidence?: number;
 }
 
 interface StoredCandidateSet {
@@ -72,21 +76,16 @@ interface StoredCandidateSet {
   shortEnd: number;
   recordedAt: number;
   candidates: CandidateCheck[];
-  /** Index into `candidates` that was actually used for this short-clip range. */
+  /** Index into `candidates` currently used as the active match for the range. */
+  usedCandidateIndex?: number;
+  /** Alias of `usedCandidateIndex` kept by the server for compatibility. */
   recoveredCandidateIndex?: number;
-  /** False when the main VLM pass accepted this range outright (comparison history only). */
+  /** True when Gemini rejected every candidate for this range. */
   dropped: boolean;
-  /** Server-reported: a manual Retry is currently running for this segment. */
+  /** Why verification could not run for this range, when it could not. */
+  skippedReason?: string;
+  /** Server-reported: a manual Re-check is currently running for this segment. */
   retrying?: boolean;
-  /** True when the used candidate is only the best-scoring fallback after the
-   *  full verification budget ran out — NOT a genuine AI-confirmed match. */
-  bestEffort?: boolean;
-  /** AI-written detailed description of the target clip (deep-search flow). */
-  clipDescription?: string;
-  /** Ranking signal the AI auto-selected for this clip. */
-  recommendedMode?: 'hash' | 'embedding' | 'combined';
-  /** How many deep-search description rounds have run for this segment. */
-  deepSearchDepth?: number;
 }
 
 interface SanityResult {
@@ -198,7 +197,7 @@ function ConfidenceBadge({ confidence, isApproximate }: { confidence: number; is
  * currently-shown candidate was accepted, rejected, unverifiable, or never
  * even checked (because a match was already found earlier in the pool).
  */
-function CandidateVerdictBadge({ candidate, isUsed, isBestEffort }: { candidate: CandidateCheck; isUsed: boolean; isBestEffort?: boolean }) {
+function CandidateVerdictBadge({ candidate, isUsed }: { candidate: CandidateCheck; isUsed: boolean }) {
   const pct = candidate.confidencePct !== undefined ? ` ${candidate.confidencePct.toFixed(0)}%` : '';
   let badge: React.ReactNode;
   if (!candidate.checked) {

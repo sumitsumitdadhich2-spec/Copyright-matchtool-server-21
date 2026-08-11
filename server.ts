@@ -174,7 +174,7 @@ async function startServer() {
 
   const matchJobs = new Map<string, MatchJob>();
   /** Cancel functions for in-flight match jobs. Calling this flips the job to
-   *  'stopped' immediately; because matchVideosFromFiles()/resolveSegmentsWithVLM()
+   *  'stopped' immediately; because matchVideosFromFiles()/verifyMatchedSegments()
    *  must not be modified, the underlying computation is not preemptible
    *  mid-algorithm — it is simply left to finish in the background and its
    *  result is discarded (the job's status is checked before it is ever
@@ -182,12 +182,12 @@ async function startServer() {
    *  in the spec. The user sees the stop take effect immediately. */
   const matchJobCancelFns = new Map<string, () => void>();
 
-  // Manual per-segment "Retry" flow (preview UI). In-memory only, purely to
-  // let the UI show a spinner while a retry is in flight and to reject a
-  // second concurrent retry on the same segment — never candidate data
-  // itself, which stays disk-backed via candidate-recovery.ts. Losing this
-  // set on a server restart is fine: the retry itself couldn't have survived
-  // the restart either, so "not retrying" is the correct post-restart state.
+  // Manual per-segment "Re-check" flow (preview UI). In-memory only, purely to
+  // let the UI show a spinner while a re-check is in flight and to reject a
+  // second concurrent re-check on the same segment — never candidate data
+  // itself, which stays disk-backed via server/verification/store.ts. Losing
+  // this set on a server restart is fine: the re-check itself couldn't have
+  // survived the restart either, so "not retrying" is the correct state.
   const retryInFlight = new Set<string>();
   function retryKey(matchJobId: string, segmentIndex: number): string {
     return `${matchJobId}:${segmentIndex}`;
@@ -1405,13 +1405,13 @@ async function startServer() {
     res.json({ ...entry, retrying: retryInFlight.has(retryKey(matchJobId, idx)) });
   });
 
-  // 6j. Manual per-segment Retry — a user-triggered action layered on top of
-  // the automatic pipeline (never touches groundMatchedSegments(),
-  // resolveSegmentsWithVLM(), or runDeferredRecoveryPass() themselves; see
-  // server/candidate-retry.ts for the retry logic and its non-negotiable
-  // constraints). Returns immediately; the frontend polls the candidates
-  // endpoints above (now including a `retrying` flag) to detect completion,
-  // reusing the same fetch-and-poll pattern the rest of the app already uses.
+  // 6j. Manual per-segment Re-check — a user-triggered action that re-runs the
+  // exact same verification code path (server/verification/verify.ts →
+  // recheckSegment) for ONE range and overwrites its record. Never touches
+  // the matching engine. Returns immediately; the frontend polls the
+  // candidates endpoints above (which include a `retrying` flag) to detect
+  // completion, reusing the same fetch-and-poll pattern the rest of the app
+  // already uses.
   app.post('/api/match/:matchJobId/segment/:segmentIndex/retry', async (req, res) => {
     const { matchJobId, segmentIndex: segmentIndexStr } = req.params;
     const segmentIndex = Number(segmentIndexStr);
@@ -1421,109 +1421,93 @@ async function startServer() {
     if (!job) return res.status(404).json({ error: 'Match job not found' });
     if (job.status !== 'completed') return res.status(400).json({ error: 'Match job is not completed yet' });
 
-    const entry = readCandidatesFile(uploadDir, matchJobId, segmentIndex);
-    if (!entry) return res.status(404).json({ error: 'No candidate history for this segment' });
+    const entry = readRecord(uploadDir, matchJobId, segmentIndex);
+    if (!entry) return res.status(404).json({ error: 'No verification record for this segment' });
 
     const key = retryKey(matchJobId, segmentIndex);
     if (retryInFlight.has(key)) {
-      return res.status(409).json({ error: 'Retry already in progress for this segment' });
+      return res.status(409).json({ error: 'Re-check already in progress for this segment' });
     }
 
-    // Gemini is the ONE AND ONLY verdict-maker (same rate-limit system as
-    // the main pass: sliding-window pacer + wait-and-retry on per-minute
-    // 429s). The fast embedding pre-filters only rank candidates and can
-    // never verify anything on their own.
+    // Fail fast with a clear reason instead of kicking off a re-check that
+    // recheckSegment would only refuse anyway.
     if (!geminiConfigured()) {
       return res.status(503).json({ error: 'No verification provider available — set GEMINI_API_KEY.' });
     }
-    // Gemini's DAILY quota is gone -> tell the user directly instead of
-    // running a retry that cannot verify anything.
     const gStatus = getGeminiStatus();
     if (gStatus.dailyLimitReached) {
-      return res.status(503).json({ error: 'Gemini daily limit over — nayi API key add karo, phir Retry dabao.' });
+      return res.status(503).json({ error: 'Gemini daily quota exhausted — add a new API key, then hit Re-check again.' });
     }
 
     const movieVideoPath = getVideoPathForJob(job.movieJobId);
     const shortVideoPath = getVideoPathForJob(job.shortJobId);
     if (!movieVideoPath || !shortVideoPath) {
-      return res.status(400).json({ error: 'Original videos are no longer available for frame extraction.' });
-    }
-    const movieResultPath = path.join(uploadDir, `${job.movieJobId}_result.json`);
-    const shortResultPath = path.join(uploadDir, `${job.shortJobId}_result.json`);
-    if (!fs.existsSync(movieResultPath) || !fs.existsSync(shortResultPath)) {
-      return res.status(400).json({ error: 'Fingerprint data no longer available for this job.' });
+      return res.status(400).json({ error: 'Original videos are no longer available for clip extraction.' });
     }
 
     retryInFlight.add(key);
     res.json({ ok: true, matchJobId, segmentIndex });
 
     const originalRange = { shortStart: entry.shortStart, shortEnd: entry.shortEnd };
+    // The range's current active candidate is the primary; every candidate the
+    // record already knows about is offered back as the alternate pool.
+    const activeIdx = entry.usedCandidateIndex ?? entry.recoveredCandidateIndex ?? 0;
+    const primarySegment = entry.candidates[activeIdx]?.segment ?? entry.candidates[0]?.segment;
 
     (async () => {
       try {
-        console.log(`[Retry] Match ${matchJobId} segment ${segmentIndex}: starting…`);
-        const result = await retrySegmentCandidates(
-          uploadDir, matchJobId, segmentIndex,
-          shortVideoPath, movieVideoPath,
-          shortResultPath, movieResultPath,
-        );
-        console.log(
-          `[Retry] Match ${matchJobId} segment ${segmentIndex}: ${result.outcome} ` +
-          `(attempts=${result.attemptsUsed}).`
-        );
+        console.log(`[Re-check] Match ${matchJobId} segment ${segmentIndex}: starting…`);
+        const result = await recheckSegment({
+          segment: primarySegment,
+          segmentIndex,
+          candidatePool: entry.candidates.map(c => c.segment),
+          shortVideoPath,
+          movieVideoPath,
+          uploadDir,
+          matchJobId,
+        });
+        console.log(`[Re-check] Match ${matchJobId} segment ${segmentIndex}: ${result.message}.`);
 
-        // On acceptance — genuine Gemini accept OR the best-so-far fallback
-        // after the attempt budget ran out — swap the active match for this
-        // short-clip range in the job's live segments + persisted result
-        // JSON. Matched by range, not array index — the deferred recovery
-        // pass can insert/reorder segments, so a candidate file's
-        // segmentIndex no longer maps 1:1 to a slot in the segments array.
-        if (
-          (result.outcome === 'accepted' || result.outcome === 'best_effort') &&
-          result.acceptedCandidateIndex !== undefined
-        ) {
-          const refreshed = readCandidatesFile(uploadDir, matchJobId, segmentIndex);
-          const newSeg = refreshed?.candidates[result.acceptedCandidateIndex]?.segment;
-          const liveJob = matchJobs.get(matchJobId);
-          if (newSeg && liveJob?.segments) {
-            let arrIdx = liveJob.segments.findIndex((s: any) =>
-              Math.abs(s.shortStart - originalRange.shortStart) < 0.05 &&
-              Math.abs(s.shortEnd - originalRange.shortEnd) < 0.05);
-            // Fallback: largest overlap with the candidate file's range —
-            // same logic select-candidate already uses. Needed because a
-            // kept best-confidence placeholder (or a previous swap) can have
-            // slightly different bounds than the original range; without
-            // this the accepted retry would be appended as a duplicate
-            // instead of replacing the placeholder.
-            if (arrIdx === -1) {
-              let bestOverlap = 0;
-              liveJob.segments.forEach((s: any, i: number) => {
-                const overlap = Math.min(s.shortEnd, originalRange.shortEnd) - Math.max(s.shortStart, originalRange.shortStart);
-                if (overlap > bestOverlap) { bestOverlap = overlap; arrIdx = i; }
-              });
-            }
-            if (arrIdx !== -1) {
-              liveJob.segments[arrIdx] = newSeg;
-            } else {
-              // This range had no active segment before (previously dropped
-              // and never recovered) — add it now.
-              liveJob.segments = [...liveJob.segments, newSeg].sort((a: any, b: any) => a.shortStart - b.shortStart);
-            }
-            // Recompute the display-only timeline flags — swapping in a new
-            // match can create OR resolve a backwards jump against the
-            // neighbouring segments, so the badges must not stay stale.
-            try { liveJob.segments = flagTimelineOutliers(liveJob.segments); } catch { /* display-only */ }
-            await fs.promises.writeFile(matchResultPath(matchJobId), JSON.stringify({
-              segments: liveJob.segments,
-              unmatchedRanges: liveJob.unmatchedRanges,
-              movieFrames: liveJob.movieFrames,
-              shortFrames: liveJob.shortFrames,
-              vlmStats: liveJob.vlmStats,
-            }));
+        // Swap the (possibly switched, possibly re-flagged) segment back into
+        // the job's live segments + persisted result JSON. Matched by range,
+        // not array index — a record's segmentIndex does not have to map 1:1
+        // to a slot in the segments array after earlier swaps.
+        const newSeg: any = result.segment;
+        const liveJob = matchJobs.get(matchJobId);
+        if (newSeg && liveJob?.segments) {
+          let arrIdx = liveJob.segments.findIndex((s: any) =>
+            Math.abs(s.shortStart - originalRange.shortStart) < 0.05 &&
+            Math.abs(s.shortEnd - originalRange.shortEnd) < 0.05);
+          // Fallback: largest overlap with the record's range — a previous
+          // swap can have shifted the active range slightly; without this
+          // the re-checked segment would be appended as a duplicate.
+          if (arrIdx === -1) {
+            let bestOverlap = 0;
+            liveJob.segments.forEach((s: any, i: number) => {
+              const overlap = Math.min(s.shortEnd, originalRange.shortEnd) - Math.max(s.shortStart, originalRange.shortStart);
+              if (overlap > bestOverlap) { bestOverlap = overlap; arrIdx = i; }
+            });
           }
+          if (arrIdx !== -1) {
+            liveJob.segments[arrIdx] = newSeg;
+          } else {
+            // This range had no active segment before — add it now.
+            liveJob.segments = [...liveJob.segments, newSeg].sort((a: any, b: any) => a.shortStart - b.shortStart);
+          }
+          // Recompute the display-only timeline flags — swapping in a new
+          // match can create OR resolve a backwards jump against the
+          // neighbouring segments, so the badges must not stay stale.
+          try { liveJob.segments = flagTimelineOutliers(liveJob.segments); } catch { /* display-only */ }
+          await fs.promises.writeFile(matchResultPath(matchJobId), JSON.stringify({
+            segments: liveJob.segments,
+            unmatchedRanges: liveJob.unmatchedRanges,
+            movieFrames: liveJob.movieFrames,
+            shortFrames: liveJob.shortFrames,
+            verifySummary: liveJob.verifySummary,
+          }));
         }
       } catch (err: any) {
-        console.error(`[Retry] Match ${matchJobId} segment ${segmentIndex} failed:`, err?.message || err);
+        console.error(`[Re-check] Match ${matchJobId} segment ${segmentIndex} failed:`, err?.message || err);
       } finally {
         retryInFlight.delete(key);
       }
@@ -1552,7 +1536,7 @@ async function startServer() {
       return res.status(409).json({ error: 'A Retry is currently running for this segment — wait for it to finish first.' });
     }
 
-    const entry = readCandidatesFile(uploadDir, matchJobId, segmentIndex);
+    const entry = readRecord(uploadDir, matchJobId, segmentIndex);
     if (!entry) return res.status(404).json({ error: 'No candidate data for this segment' });
     const candidate = entry.candidates[candidateIndex];
     if (!candidate) return res.status(404).json({ error: 'Candidate not found' });
@@ -1593,18 +1577,18 @@ async function startServer() {
         unmatchedRanges: job.unmatchedRanges,
         movieFrames: job.movieFrames,
         shortFrames: job.shortFrames,
-        vlmStats: job.vlmStats,
+        verifySummary: job.verifySummary,
       }));
     } catch (e) {
       console.error(`[SelectCandidate] Failed to persist result for ${matchJobId}:`, e);
       return res.status(500).json({ error: 'Could not persist the selection to disk.' });
     }
 
-    // Record the user's choice in the candidate history so the ★ Used badge
+    // Record the user's choice in the verification record so the ★ Used badge
     // follows the selection everywhere in the UI.
     try {
-      entry.recoveredCandidateIndex = candidateIndex;
-      writeCandidatesFileSync(uploadDir, matchJobId, segmentIndex, entry);
+      entry.usedCandidateIndex = candidateIndex;
+      writeRecord(uploadDir, matchJobId, entry);
     } catch (e) {
       console.error(`[SelectCandidate] Failed to update candidate file for ${matchJobId} seg ${segmentIndex}:`, e);
       // Segments were already persisted — not fatal for the selection itself.
@@ -1641,7 +1625,7 @@ async function startServer() {
       return res.status(409).json({ error: 'A Retry is currently running for this segment — wait for it to finish first.' });
     }
 
-    const entry = readCandidatesFile(uploadDir, matchJobId, segmentIndex);
+    const entry = readRecord(uploadDir, matchJobId, segmentIndex);
     if (!entry) return res.status(404).json({ error: 'No candidate data for this segment' });
     const candidate = entry.candidates[candidateIndex];
     if (!candidate) return res.status(404).json({ error: 'Candidate not found' });
@@ -1661,16 +1645,16 @@ async function startServer() {
     seg.movieEnd = newEnd;
 
     try {
-      writeCandidatesFileSync(uploadDir, matchJobId, segmentIndex, entry);
+      writeRecord(uploadDir, matchJobId, entry);
     } catch (e) {
-      console.error(`[AdjustCandidate] Failed to persist candidate file for ${matchJobId} seg ${segmentIndex}:`, e);
+      console.error(`[AdjustCandidate] Failed to persist verification record for ${matchJobId} seg ${segmentIndex}:`, e);
       return res.status(500).json({ error: 'Could not persist the adjustment to disk.' });
     }
 
     // If this candidate IS the active/main match for its range, mirror the
     // new bounds into the live segments + persisted result JSON.
     let segmentsUpdated = false;
-    if (entry.recoveredCandidateIndex === candidateIndex) {
+    if ((entry.usedCandidateIndex ?? entry.recoveredCandidateIndex ?? 0) === candidateIndex) {
       const segsArr: any[] = job.segments ?? [];
       let arrIdx = segsArr.findIndex((s: any) =>
         Math.abs(s.shortStart - entry.shortStart) < 0.05 &&
@@ -1695,7 +1679,7 @@ async function startServer() {
             unmatchedRanges: job.unmatchedRanges,
             movieFrames: job.movieFrames,
             shortFrames: job.shortFrames,
-            vlmStats: job.vlmStats,
+            verifySummary: job.verifySummary,
           }));
         } catch (e) {
           console.error(`[AdjustCandidate] Failed to persist result for ${matchJobId}:`, e);
