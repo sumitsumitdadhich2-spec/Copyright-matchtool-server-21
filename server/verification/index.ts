@@ -18,7 +18,10 @@ export {
   readAllRecords,
   listRecordIndexes,
   deleteRecordsForJob,
+  writeRecord,
   type CandidateRecord,
   type CandidateVerdict,
   type VerificationRecord,
 } from './store';
+
+export { flagTimelineOutliers } from './timeline';

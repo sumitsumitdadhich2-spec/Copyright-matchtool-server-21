@@ -15,22 +15,17 @@ import * as http from 'http';
 import { createServer as createViteServer } from 'vite';
 import { extractFingerprints, NUM_WORKERS } from './server/pipeline';
 import { matchVideosFromFiles } from './server/matching-engine';
-import { resolveSegmentsWithVLM, SegmentResolvedInfo } from './server/vlm-segment-resolver';
-import { vlmNetworkStats, resetVlmNetworkStats } from './server/vlm-verify';
 import { getGeminiStatus, geminiConfigured } from './server/gemini-vlm';
 import {
-  buildCandidateHistoryEntry,
-  buildHashOnlyCandidateHistoryEntry,
-  writeCandidatesFileAsync,
-  writeCandidatesFileSync,
-  listCandidateFilesForJob,
-  readCandidatesFile,
-  deleteCandidateFilesForJob,
-} from './server/candidate-recovery';
-import { runDeferredRecoveryPass } from './server/deferred-recovery';
-import { retrySegmentCandidates } from './server/candidate-retry';
-import { degenerateCandidateReason } from './server/degenerate-guard';
-import { flagTimelineOutliers } from './server/timeline-outliers';
+  verifyMatchedSegments,
+  recheckSegment,
+  readRecord,
+  readAllRecords,
+  deleteRecordsForJob,
+  writeRecord,
+  flagTimelineOutliers,
+  type VerifySummary,
+} from './server/verification';
 
 // ── Process-level safety net ────────────────────────────────────────────────
 // Long background jobs (2-hour-movie fingerprinting/matching) touch a huge
@@ -146,14 +141,12 @@ async function startServer() {
     shortStart?: number;
     shortEnd?: number;
     segmentsFound?: number;
-    vlmSegmentIndex?: number;
-    vlmTotalSegments?: number;
-    vlmAttempt?: number;
-    vlmVerdict?: string;
-    /** 'initial' | 'deep-search' — which VLM verification phase is running (display-only). */
-    vlmPhase?: string;
-    /** Total per-segment verification budget for the current phase (10 initial / 30 deep-search). */
-    vlmTotalBudget?: number;
+    /** Verification stage: how many matched ranges have been verified so far. */
+    verifyDone?: number;
+    /** Verification stage: total matched ranges to verify. */
+    verifyTotal?: number;
+    /** Verification stage: human-readable progress line. */
+    verifyMessage?: string;
   }
 
   interface MatchJob {
@@ -172,19 +165,11 @@ async function startServer() {
     unmatchedRanges?: any[];
     movieFrames?: number;
     shortFrames?: number;
-    /** Optional breakdown of VLM outcomes, when the VLM pass ran (see
-     *  vlmNetworkStats in server/vlm-verify.ts). Purely additive reporting —
-     *  distinguishes genuine content rejections from requests that never got
-     *  a real answer (server overload/network failure) so "why did this
-     *  range end up unmatched" is answerable from results, not just logs. */
-    vlmStats?: {
-      accepted: number;
-      rejected: number;
-      inconclusiveNetwork: number;
-      otherUnverifiable: number;
-      recoveredByDeferred: number;
-      stillUnmatchedAfterDeferred: number;
-    };
+    /** Outcome summary of the Gemini verification stage (see
+     *  server/verification/verify.ts). `ran: false` + `reason` explains
+     *  exactly why verification was skipped, so "why is nothing verified"
+     *  is answerable from results, not just logs. */
+    verifySummary?: VerifySummary;
   }
 
   const matchJobs = new Map<string, MatchJob>();
@@ -271,7 +256,7 @@ async function startServer() {
           job.unmatchedRanges = result.unmatchedRanges;
           job.movieFrames = result.movieFrames;
           job.shortFrames = result.shortFrames;
-          job.vlmStats = result.vlmStats;
+          job.verifySummary = result.verifySummary;
         } catch { /* corrupt result — treat as failed */ job.status = 'failed'; job.error = 'Result file corrupted'; }
       } else {
         job.status = 'failed';
@@ -1258,273 +1243,40 @@ async function startServer() {
 
         console.log(`[Match ${matchJobId}] Done: ${result.segments.length} segments, ${result.unmatchedRanges.length} unmatched ranges.`);
 
-        // Baseline candidate-comparison history for every segment, from the
-        // hash-matching result alone — fire-and-forget, same pattern as the
-        // VLM path below. This is what makes the compare-candidates preview
-        // work even when VLM is off/unreachable or the original videos
-        // aren't retained for frame extraction; if the VLM pass below does
-        // run for a given segment, its richer per-segment entry overwrites
-        // this one for that same index. Purely additive — reuses the
-        // already-computed candidatePool, never affects which segments the
-        // main pass accepted or their order.
-        // Awaited (in parallel) so the files are guaranteed on disk before
-        // the job can flip to `completed` — otherwise a fast no-VLM run lets
-        // the frontend fetch /candidates before any file exists and the
-        // "View all candidates" button never shows. Write failures are
-        // caught+logged inside writeCandidatesFileAsync, so this can never
-        // fail the match itself.
-        await Promise.all(result.segments.map((segment, index) => {
-          const entry = buildHashOnlyCandidateHistoryEntry(index, segment, result.candidatePool);
-          return writeCandidatesFileAsync(uploadDir, matchJobId, index, entry);
-        }));
 
-        // ── Optional VLM scene-verification pass ────────────────────────────
-        // Only runs when both original video files are still on disk (jobs from
-        // before video retention was added won't have them) and the VLM
-        // endpoint is configured + reachable. Otherwise the original
-        // hash-matched segments are returned untouched — the tool must keep
-        // working with the AWS GPU server off.
-        let finalSegments = result.segments;
+        // ── Gemini verification stage ───────────────────────────────────────
+        // The new candidate/verification system (server/verification/). Takes
+        // the engine's segments + the two original uploaded files, verifies
+        // each range with Gemini (server/gemini-vlm.ts, used as-is), and
+        // returns the finalised segments. It never throws: when Gemini is
+        // unconfigured / out of daily quota, or the original videos are gone,
+        // it skips LOUDLY and passes the segments through unverified, writing
+        // a per-range record that says exactly why.
         const movieVideoPath = getVideoPathForJob(movieJobId);
         const shortVideoPath = getVideoPathForJob(shortJobId);
 
-        // Tallies for the human-readable outcome breakdown below (point 3 of
-        // the VLM-overload fix): distinguishes genuine content rejections
-        // from requests that never got a real answer (server overload/
-        // network failure), which would otherwise be indistinguishable from
-        // "the content didn't match" in the logs. Purely additive counting
-        // over the same onProgress events already emitted below — never
-        // consulted by any accept/reject decision.
-        const vlmMainStats = { accepted: 0, rejected: 0, unverifiable: 0, dropped: 0 };
-        const deferredStats = { accepted: 0, rejected: 0, unverifiable: 0, exhausted: 0 };
-        let vlmStatsSummary: MatchJob['vlmStats'] | undefined;
+        const { segments: finalSegments, summary: verifySummary } = await verifyMatchedSegments({
+          segments: result.segments,
+          candidatePool: result.candidatePool,
+          shortVideoPath,
+          movieVideoPath,
+          uploadDir,
+          matchJobId,
+          onProgress: (done, total, message) => {
+            const j = matchJobs.get(matchJobId);
+            if (!j || j.status !== 'processing') return;
+            j.progress = {
+              phase: 'verify',
+              pct: Math.min(99, 97 + Math.round((done / Math.max(1, total)) * 3)),
+              verifyDone: done,
+              verifyTotal: total,
+              verifyMessage: message,
+            };
+          },
+        });
 
-        if (movieVideoPath && shortVideoPath && result.segments.length > 0) {
-          resetVlmNetworkStats();
-          try {
-            finalSegments = await resolveSegmentsWithVLM(
-              result.segments,
-              shortVideoPath,
-              movieVideoPath,
-              result.candidatePool,
-              (info) => {
-                if (info.verdict in vlmMainStats) (vlmMainStats as any)[info.verdict]++;
-                const j = matchJobs.get(matchJobId);
-                if (!j || j.status !== 'processing') return;
-                const pct = info.totalSegments > 0
-                  ? 97 + Math.round(((info.segmentIndex + (info.verdict === 'rejected' ? 0 : 1)) / info.totalSegments) * 3)
-                  : 97;
-                j.progress = {
-                  // Display-only phase passthrough: 'vlm_deep_search' while
-                  // the auto-extend deep search is verifying candidates
-                  // beyond the initial pool, else the existing 'vlm_verify'.
-                  phase: info.phase === 'deep-search' ? 'vlm_deep_search' : 'vlm_verify',
-                  pct: Math.min(99, pct),
-                  vlmSegmentIndex: info.segmentIndex,
-                  vlmTotalSegments: info.totalSegments,
-                  vlmAttempt: info.attempt,
-                  vlmVerdict: info.verdict,
-                  vlmPhase: info.phase,
-                  vlmTotalBudget: info.totalBudget,
-                };
-              },
-              // Persist full candidate-comparison history for EVERY segment —
-              // accepted on the first try, accepted after retries, or finally
-              // dropped. Purely additive: reuses the already-computed
-              // candidatePool (no new similarity scan), writes to disk without
-              // being awaited so it can never delay the main VLM loop above,
-              // and never changes which candidate the main pass actually used.
-              (info: SegmentResolvedInfo) => {
-                const entry = buildCandidateHistoryEntry(
-                  info.segmentIndex,
-                  info.original,
-                  info.triedCandidates,
-                  info.accepted,
-                  result.candidatePool,
-                );
-                if (entry) {
-                  // Auto-extend metadata (strictly additive): the AI's target-
-                  // clip description + auto-selected ranking mode, and — when
-                  // the full 30-verification budget ran out with no genuine
-                  // accept — the single best-effort candidate to surface
-                  // ("★ Used" + bestEffort badge). dropped stays true and every
-                  // rejected verdict stays visible, exactly like Retry's
-                  // best-effort fallback.
-                  if (info.clipDescription) entry.clipDescription = info.clipDescription;
-                  if (info.recommendedMode) entry.recommendedMode = info.recommendedMode;
-                  if (!info.accepted && info.bestEffortIndex !== undefined) {
-                    entry.recoveredCandidateIndex = info.bestEffortIndex;
-                    entry.bestEffort = true;
-                  }
-                  writeCandidatesFileAsync(uploadDir, matchJobId, info.segmentIndex, entry);
-                }
-              },
-            );
-            if (finalSegments.length !== result.segments.length) {
-              console.log(`[Match ${matchJobId}] VLM verification: ${result.segments.length} → ${finalSegments.length} segment(s).`);
-            }
-          } catch (vlmErr: any) {
-            // VLM pass itself must never take down the match — fall back to the
-            // original hash-matched segments.
-            console.error(`[Match ${matchJobId}] VLM verification pass failed, keeping original segments:`, vlmErr);
-            finalSegments = result.segments;
-          }
-
-          // ── Deferred recovery pass ──────────────────────────────────────
-          // Runs only after the main VLM pass above has fully finished with
-          // every segment. Sequentially re-examines each dropped segment's
-          // background-discovered candidates; any recovered segment is
-          // reinserted at its correct chronological position.
-          if (matchJobs.get(matchJobId)?.status === 'processing') {
-            try {
-              const recovered = await runDeferredRecoveryPass(
-                uploadDir,
-                matchJobId,
-                shortVideoPath,
-                movieVideoPath,
-                (info) => {
-                  if (info.verdict in deferredStats) (deferredStats as any)[info.verdict]++;
-                  const j = matchJobs.get(matchJobId);
-                  if (!j || j.status !== 'processing') return;
-                  j.progress = {
-                    phase: 'deferred_recovery',
-                    pct: 99,
-                    vlmSegmentIndex: info.segmentIndex,
-                    vlmTotalSegments: info.totalRejected,
-                    vlmAttempt: info.candidateAttempt,
-                    vlmVerdict: info.verdict,
-                  };
-                },
-              );
-              if (recovered.length > 0) {
-                finalSegments = [...finalSegments, ...recovered].sort((a, b) => a.shortStart - b.shortStart);
-                console.log(`[Match ${matchJobId}] Deferred recovery: recovered ${recovered.length} segment(s).`);
-              }
-            } catch (deferredErr: any) {
-              // Strictly additive — a failure here must never regress below
-              // what the main pass already produced.
-              console.error(`[Match ${matchJobId}] Deferred recovery pass failed, keeping main-pass segments:`, deferredErr);
-            }
-          }
-
-          // ── Keep best-confidence candidate for still-dropped ranges ─────
-          // Instead of silently removing a range where VLM rejected every
-          // candidate (main pass + deferred recovery), keep the
-          // highest-confidence already-checked candidate as the visible
-          // segment for that range. It renders exactly like any other
-          // segment, so the user can review it and use the per-segment
-          // Retry button. Purely additive presentation logic: the candidate
-          // file keeps `dropped: true` and every existing verdict untouched
-          // (all candidates checked = this range would have been dropped),
-          // so Retry / recovery / matching semantics are all unchanged.
-          if (matchJobs.get(matchJobId)?.status === 'processing') {
-            try {
-              let keptBest = 0;
-              for (const idx of listCandidateFilesForJob(uploadDir, matchJobId)) {
-                const entry = readCandidatesFile(uploadDir, matchJobId, idx);
-                if (!entry || entry.dropped !== true) continue;
-                // Skip ranges deferred recovery actually recovered — their
-                // file can keep dropped: true but has an accepted candidate.
-                if (entry.candidates.some(c => c.verdict === 'accepted')) continue;
-                // Skip if a final segment already covers this range.
-                const overlapsExisting = finalSegments.some(s =>
-                  Math.min(s.shortEnd, entry.shortEnd) - Math.max(s.shortStart, entry.shortStart) > 0.05);
-                if (overlapsExisting) continue;
-                // Highest-confidence checked (rejected) candidate wins;
-                // unverifiable ones have no confidence and rank last.
-                // Degenerate candidates (frozen matchSequence / near-zero
-                // speedRatio) are never shown as the kept-best segment.
-                const checked = entry.candidates.filter(
-                  c => c.checked && !degenerateCandidateReason(c.segment));
-                if (checked.length === 0) continue;
-                // Respect an existing best-effort pick: when the auto-extend
-                // deep search already chose the highest-match-likelihood
-                // candidate (entry.bestEffort + recoveredCandidateIndex),
-                // surface THAT candidate instead of re-picking by raw
-                // confidencePct — otherwise this block would clobber the
-                // likelihood-based selection with a different candidate.
-                let best: (typeof checked)[number];
-                if (
-                  entry.bestEffort === true &&
-                  typeof entry.recoveredCandidateIndex === 'number' &&
-                  entry.candidates[entry.recoveredCandidateIndex]?.checked &&
-                  !degenerateCandidateReason(entry.candidates[entry.recoveredCandidateIndex].segment)
-                ) {
-                  best = entry.candidates[entry.recoveredCandidateIndex];
-                } else {
-                  best = checked.reduce((a, b) =>
-                    ((b.confidencePct ?? -1) > (a.confidencePct ?? -1) ? b : a));
-                }
-                const bestIdx = entry.candidates.indexOf(best);
-                // Tag it so the UI can show a "Rejected — Retry needed" badge
-                // instead of a normal confidence badge: every candidate for
-                // this range was VLM-rejected; this is NOT a verified match.
-                finalSegments = [...finalSegments, { ...best.segment, vlmRejectedKept: true }]
-                  .sort((a, b) => a.shortStart - b.shortStart);
-                // Mark it as the candidate currently shown ("★ Used") —
-                // without clearing dropped/verdicts, so history still shows
-                // every candidate was checked and rejected.
-                if (bestIdx !== -1) {
-                  entry.recoveredCandidateIndex = bestIdx;
-                  writeCandidatesFileSync(uploadDir, matchJobId, idx, entry);
-                }
-                keptBest++;
-              }
-              if (keptBest > 0) {
-                console.log(`[Match ${matchJobId}] Kept best-confidence candidate for ${keptBest} would-be-dropped segment(s) so they stay visible for manual Retry.`);
-              }
-            } catch (keepErr: any) {
-              // Strictly additive — a failure here must never regress below
-              // what the main + deferred passes already produced.
-              console.error(`[Match ${matchJobId}] Keep-best-candidate step failed:`, keepErr?.message || keepErr);
-            }
-          }
-
-          // Outcome breakdown (point 3): how many "unmatched" outcomes were
-          // genuine content rejections vs. inconclusive because the VLM
-          // request never got a real answer (server overload/network
-          // failure) even after retries. `vlmNetworkStats.verifyInconclusive`
-          // is scoped to this job's VLM+deferred passes because it was
-          // zeroed via resetVlmNetworkStats() right before they started.
-          const inconclusiveNetwork = vlmNetworkStats.verifyInconclusive;
-          const totalUnverifiable = vlmMainStats.unverifiable + deferredStats.unverifiable;
-          vlmStatsSummary = {
-            accepted: vlmMainStats.accepted + deferredStats.accepted,
-            rejected: vlmMainStats.rejected + deferredStats.rejected,
-            inconclusiveNetwork,
-            otherUnverifiable: Math.max(0, totalUnverifiable - inconclusiveNetwork),
-            recoveredByDeferred: deferredStats.accepted,
-            stillUnmatchedAfterDeferred: deferredStats.exhausted,
-          };
-          console.log(
-            `[Match ${matchJobId}] VLM outcome breakdown — accepted: ${vlmStatsSummary.accepted} ` +
-            `(${vlmStatsSummary.recoveredByDeferred} via deferred recovery), rejected (content mismatch): ` +
-            `${vlmStatsSummary.rejected}, inconclusive (Gemini quota exhausted/unreachable): ` +
-            `${vlmStatsSummary.inconclusiveNetwork}, other unverifiable (frame extraction/response parsing): ` +
-            `${vlmStatsSummary.otherUnverifiable}, still unmatched after deferred recovery: ` +
-            `${vlmStatsSummary.stillUnmatchedAfterDeferred}.`
-          );
-        }
-
-        // If stopped while VLM ran, discard the result.
+        // If stopped while verification ran, discard the result.
         if (matchJobs.get(matchJobId)?.status !== 'processing') return;
-
-        // ── Timeline monotonicity check (display-only) ──────────────────
-        // Flags segments that jump off the dominant forward movie timeline
-        // (e.g. Seg N at 90.88s followed by Seg N+1 back at 84.28s) with
-        // `timelineOutlier: true` so the UI can show a "Timeline jump"
-        // badge. Never removes or re-orders segments, and flags nothing
-        // when the short looks genuinely re-ordered (see timeline-outliers.ts).
-        try {
-          finalSegments = flagTimelineOutliers(finalSegments);
-          const outliers = finalSegments.filter(s => s.timelineOutlier).length;
-          if (outliers > 0) {
-            console.log(`[Match ${matchJobId}] Timeline check: flagged ${outliers} segment(s) off the dominant forward movie timeline.`);
-          }
-        } catch (tlErr: any) {
-          // Display-only — a failure here must never affect the result.
-          console.error(`[Match ${matchJobId}] Timeline outlier check failed:`, tlErr?.message || tlErr);
-        }
 
         const completedAt = Date.now();
         const finalJob = matchJobs.get(matchJobId);
@@ -1535,7 +1287,7 @@ async function startServer() {
           finalJob.unmatchedRanges = result.unmatchedRanges;
           finalJob.movieFrames = result.movieFrames;
           finalJob.shortFrames = result.shortFrames;
-          finalJob.vlmStats = vlmStatsSummary;
+          finalJob.verifySummary = verifySummary;
           finalJob.progress = { phase: 'finalizing', pct: 100 };
         }
         matchJobCancelFns.delete(matchJobId);
@@ -1550,7 +1302,7 @@ async function startServer() {
           unmatchedRanges: result.unmatchedRanges,
           movieFrames: result.movieFrames,
           shortFrames: result.shortFrames,
-          vlmStats: vlmStatsSummary,
+          verifySummary,
         }));
       } catch (err: any) {
         console.error(`[Match ${matchJobId}] Error:`, err);
@@ -1588,7 +1340,7 @@ async function startServer() {
       unmatchedRanges: job.unmatchedRanges,
       movieFrames: job.movieFrames,
       shortFrames: job.shortFrames,
-      vlmStats: job.vlmStats,
+      verifySummary: job.verifySummary,
       startedAt: job.startedAt,
       completedAt: job.completedAt,
       gemini: getGeminiStatus(),
@@ -1624,7 +1376,7 @@ async function startServer() {
     let deleted = false;
     if (fs.existsSync(mp)) { try { fs.unlinkSync(mp); deleted = true; } catch { /* ignore */ } }
     if (fs.existsSync(rp)) { try { fs.unlinkSync(rp); } catch { /* ignore */ } }
-    deleteCandidateFilesForJob(uploadDir, matchJobId);
+    deleteRecordsForJob(uploadDir, matchJobId);
 
     matchJobs.delete(matchJobId);
     matchJobCancelFns.delete(matchJobId);
@@ -1633,16 +1385,13 @@ async function startServer() {
     res.json({ deleted });
   });
 
-  // 6i. Preview-only candidate data — the segments background-discovered and
-  // (if the main pass finished) deferred-verified for a previously-rejected
-  // short-clip range. Never part of the primary match result JSON; purely
-  // for the frontend to show what was checked at a given point in the timeline.
+  // 6i. Per-range verification records — every candidate considered for each
+  // short-clip range, its Gemini verdict, and which one is the active match.
+  // Never part of the primary match result JSON; purely for the frontend's
+  // compare-candidates preview and the manual re-check flow.
   app.get('/api/match/:matchJobId/candidates', (req, res) => {
     const { matchJobId } = req.params;
-    const indexes = listCandidateFilesForJob(uploadDir, matchJobId);
-    const entries = indexes
-      .map(idx => readCandidatesFile(uploadDir, matchJobId, idx))
-      .filter((e): e is NonNullable<typeof e> => e !== null)
+    const entries = readAllRecords(uploadDir, matchJobId)
       .map(e => ({ ...e, retrying: retryInFlight.has(retryKey(matchJobId, e.segmentIndex)) }));
     res.json({ matchJobId, segments: entries });
   });
@@ -1651,7 +1400,7 @@ async function startServer() {
     const { matchJobId, segmentIndex } = req.params;
     const idx = Number(segmentIndex);
     if (!Number.isFinite(idx)) return res.status(400).json({ error: 'segmentIndex must be a number' });
-    const entry = readCandidatesFile(uploadDir, matchJobId, idx);
+    const entry = readRecord(uploadDir, matchJobId, idx);
     if (!entry) return res.status(404).json({ error: 'No candidate data for this segment' });
     res.json({ ...entry, retrying: retryInFlight.has(retryKey(matchJobId, idx)) });
   });

@@ -73,10 +73,10 @@ export interface VerifyRequest {
   segments: MatchedSegment[];
   /** The engine's pre-dedup pool, used only to offer alternates. */
   candidatePool?: MatchedSegment[];
-  /** Absolute path of the uploaded short clip. */
-  shortVideoPath: string;
-  /** Absolute path of the uploaded reference movie. */
-  movieVideoPath: string;
+  /** Absolute path of the uploaded short clip (undefined when not retained). */
+  shortVideoPath: string | undefined;
+  /** Absolute path of the uploaded reference movie (undefined when not retained). */
+  movieVideoPath: string | undefined;
   /** Where per-range records are written. */
   uploadDir: string;
   matchJobId: string;
@@ -118,6 +118,17 @@ export async function verifyMatchedSegments(req: VerifyRequest): Promise<VerifyR
   // --- Graceful degradation, loudly ------------------------------------------
   // The old system's worst bug was silently no-opping when its provider was
   // unconfigured. Every skip path below names itself explicitly.
+  if (!req.shortVideoPath || !req.movieVideoPath) {
+    const reason =
+      'original uploaded video file(s) are no longer on disk — verification SKIPPED, all segments pass through unverified';
+    console.warn(`[Verify] ${reason}.`);
+    await writeSkippedRecords(req, reason);
+    return {
+      segments: flagTimelineOutliers(req.segments),
+      summary: emptySummary(reason, total),
+    };
+  }
+
   if (!geminiConfigured()) {
     const reason =
       'GEMINI_API_KEY is not set — verification SKIPPED, all segments pass through unverified';
@@ -242,7 +253,7 @@ async function verifyOneRange(
   // The short-clip side is identical for every candidate of this range, so it
   // is cut once and reused across all Gemini calls.
   const shortClip = await cutClip(
-    req.shortVideoPath,
+    req.shortVideoPath!,
     primary.shortStart,
     primary.shortEnd,
     `short-${segmentIndex}`,
@@ -263,7 +274,7 @@ async function verifyOneRange(
       const entry = record.candidates[i];
 
       const movieClip = await cutClip(
-        req.movieVideoPath,
+        req.movieVideoPath!,
         candidate.movieStart,
         candidate.movieEnd,
         `movie-${segmentIndex}-${i}`,
@@ -412,8 +423,10 @@ export interface RecheckResult {
  * Same code path as the bulk pass, so a retry can never disagree with it.
  */
 export async function recheckSegment(req: RecheckRequest): Promise<RecheckResult> {
-  if (!geminiConfigured()) {
-    const message = 'GEMINI_API_KEY is not set — cannot re-check this segment';
+  if (!req.shortVideoPath || !req.movieVideoPath || !geminiConfigured()) {
+    const message = !geminiConfigured()
+      ? 'GEMINI_API_KEY is not set — cannot re-check this segment'
+      : 'original uploaded video file(s) are no longer on disk — cannot re-check this segment';
     console.warn(`[Verify] Re-check of range ${req.segmentIndex} refused: ${message}.`);
     const record: VerificationRecord = {
       segmentIndex: req.segmentIndex,
