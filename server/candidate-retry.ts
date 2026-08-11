@@ -18,6 +18,7 @@ import { sortIndexesByGreenScore, greenScoreLogTag } from './candidate-green-sco
 import { verifySegmentByVideo, VLM_CONFIDENCE_THRESHOLD, VLM_MAX_ATTEMPTS } from './vlm-verify';
 import { orderCandidatesByMode } from './clip-description';
 import { degenerateCandidateReason } from './degenerate-guard';
+import { denseScanCandidatesForRange, DENSE_SCAN_ENABLED } from './dense-embedding-scan';
 import {
   StoredCandidateSet,
   CandidateCheck,
@@ -97,6 +98,73 @@ async function checkCandidate(
 }
 
 /**
+ * POOL TOP-UP (last resort, additive only).
+ *
+ * The candidate pool comes from the hash-based matching engine, whose crop
+ * variants only cover 9:16-from-16:9 and 16:9-from-9:16 geometry. A 1:1
+ * square, heavily-zoomed edit of a 16:9 source produces NO usable hash
+ * candidate at all, so the pool for such a segment is either empty or
+ * entirely wrong — and no amount of re-verifying it can ever succeed.
+ *
+ * When (and only when) the pool has no unchecked candidates left, densely
+ * scan the whole movie with aspect-aware crop windows and append whatever it
+ * finds as fresh, unchecked candidates. Every appended candidate still has to
+ * pass the SAME Gemini video verification as everything else — this widens
+ * the search space, it never accepts anything on its own.
+ *
+ * Returns the indexes of the newly appended candidates ([] on any failure).
+ */
+async function topUpPoolWithDenseScan(
+  entry: StoredCandidateSet,
+  segmentIndex: number,
+  shortVideoPath: string,
+  movieVideoPath: string,
+): Promise<number[]> {
+  if (!DENSE_SCAN_ENABLED) return [];
+
+  // Suppress regions the pool already covers so the scan spends its budget on
+  // genuinely new movie timestamps.
+  const excludeMovieTimestamps = entry.candidates.map(c => c.segment.movieStart);
+
+  let fresh;
+  try {
+    fresh = await denseScanCandidatesForRange({
+      shortVideoPath,
+      movieVideoPath,
+      shortStart: entry.shortStart,
+      shortEnd: entry.shortEnd,
+      excludeMovieTimestamps,
+      label: `CandidateRetry seg${segmentIndex}`,
+    });
+  } catch (err: any) {
+    console.log(`[CandidateRetry] seg${segmentIndex}: dense-scan top-up failed (${err?.message || err})`);
+    return [];
+  }
+
+  if (!fresh || fresh.length === 0) {
+    console.log(`[CandidateRetry] seg${segmentIndex}: dense-scan top-up found nothing new`);
+    return [];
+  }
+
+  const appended: number[] = [];
+  for (const segment of fresh) {
+    // Never append a duplicate of a timestamp already in the pool.
+    const duplicate = entry.candidates.some(
+      c => Math.abs(c.segment.movieStart - segment.movieStart) < 1.0,
+    );
+    if (duplicate) continue;
+    entry.candidates.push({ segment, checked: false });
+    appended.push(entry.candidates.length - 1);
+  }
+
+  console.log(
+    `[CandidateRetry] seg${segmentIndex}: dense-scan top-up appended ${appended.length} candidate(s): ` +
+    appended.map(i => `#${i}@${entry.candidates[i].segment.movieStart.toFixed(2)}s`).join(' '),
+  );
+  return appended;
+}
+
+/**
  * Run one Retry click for a segment: verify the next unchecked candidates
  * from the already-discovered pool (embedding-ranked first) until a genuine
  * accept, the pool runs out, or the click's attempt budget is spent. Persists
@@ -122,9 +190,25 @@ export async function retrySegmentCandidates(
   const persist = () => writeCandidatesFileSync(uploadDir, matchJobId, segmentIndex, entry);
 
   /** Already-checked candidates are NEVER re-verified — only fresh ones. */
-  const uncheckedIdxs = entry.candidates
+  let uncheckedIdxs = entry.candidates
     .map((c, i) => (c.checked ? -1 : i))
     .filter(i => i !== -1);
+
+  // Pool exhausted: widen the search space with a dense aspect-aware scan
+  // rather than dead-ending. Additive only — appended candidates are still
+  // verified by the same Gemini gate below.
+  if (uncheckedIdxs.length === 0) {
+    console.log(
+      `[CandidateRetry] seg${segmentIndex}: pool exhausted — running dense-scan top-up`,
+    );
+    const appended = await topUpPoolWithDenseScan(
+      entry, segmentIndex, shortVideoPath, movieVideoPath,
+    );
+    if (appended.length > 0) {
+      persist();
+      uncheckedIdxs = appended;
+    }
+  }
 
   if (uncheckedIdxs.length > 0) {
     // Mode-aware ranking: when a previously-persisted AI clip profile
@@ -182,8 +266,8 @@ export async function retrySegmentCandidates(
     }
   } else {
     console.log(
-      `[CandidateRetry] seg${segmentIndex}: no unchecked candidates left in the pool — ` +
-      `no more candidates to try`
+      `[CandidateRetry] seg${segmentIndex}: no unchecked candidates left in the pool and ` +
+      `the dense-scan top-up added none — no more candidates to try`
     );
   }
 
