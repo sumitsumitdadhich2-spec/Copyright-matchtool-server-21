@@ -233,13 +233,6 @@ function CandidateVerdictBadge({ candidate, isUsed }: { candidate: CandidateChec
           ★ Used
         </span>
       )}
-      {isUsed && isBestEffort && (
-        <span
-          title="Highest-scoring candidate after the full verification budget ran out — NOT confirmed by AI video verification. Click Retry to search deeper."
-          className="inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-[11px] font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/25">
-          <AlertCircle className="w-3 h-3" /> Best effort — not AI-confirmed
-        </span>
-      )}
     </div>
   );
 }
@@ -319,12 +312,11 @@ function MatchProgressPanel({ progress }: {
     chunkIdx?: number; totalChunks?: number;
     shortStart?: number; shortEnd?: number;
     segmentsFound?: number;
-    vlmSegmentIndex?: number; vlmTotalSegments?: number; vlmVerdict?: string;
-    vlmAttempt?: number; vlmTotalBudget?: number;
+    verifyDone?: number; verifyTotal?: number; verifyMessage?: string;
     startTime: number;
   };
 }) {
-  const { phase, pct, chunkIdx, totalChunks, shortStart, shortEnd, segmentsFound, vlmSegmentIndex, vlmTotalSegments, vlmVerdict, vlmAttempt, vlmTotalBudget, startTime } = progress;
+  const { phase, pct, chunkIdx, totalChunks, shortStart, shortEnd, segmentsFound, verifyDone, verifyTotal, verifyMessage, startTime } = progress;
   const elapsed = (Date.now() - startTime) / 1000;
   const eta = pct > 2 ? Math.max(0, Math.round(elapsed * (100 - pct) / pct)) : null;
 
@@ -335,14 +327,11 @@ function MatchProgressPanel({ progress }: {
     scanning:      'Scanning movie for matches…',
     matching:      'Matching scene chunks…',
     finalizing:    'Finalising results…',
-    vlm_verify:    'Verifying scenes with AI…',
-    vlm_deep_search:   'Deep search — AI hunting new candidates…',
-    deferred_recovery: 'Recovering dropped segments…',
+    verify:        'Verifying matches with Gemini…',
   };
 
   const showChunk = phase === 'matching' && totalChunks != null && chunkIdx != null;
-  const showVlm = (phase === 'vlm_verify' || phase === 'vlm_deep_search') && vlmTotalSegments != null && vlmSegmentIndex != null;
-  const isDeepSearch = phase === 'vlm_deep_search';
+  const showVerify = phase === 'verify' && verifyTotal != null && verifyDone != null;
 
   return (
     <div className="space-y-2 pt-0.5">
@@ -392,29 +381,18 @@ function MatchProgressPanel({ progress }: {
         </div>
       )}
 
-      {/* Detail row: AI scene-verification pass (only if VLM is configured) */}
-      {showVlm && (
-        <div className={`flex items-center justify-between text-xs rounded-md px-2.5 py-1.5 ${isDeepSearch ? 'bg-purple-950/40' : 'bg-indigo-950/40'}`}>
+      {/* Detail row: Gemini verification pass over the matched ranges */}
+      {showVerify && (
+        <div className="flex items-center justify-between text-xs rounded-md px-2.5 py-1.5 bg-indigo-950/40">
           <div className="flex items-center gap-1.5 min-w-0 text-slate-300">
-            <span className="text-slate-500 shrink-0">{isDeepSearch ? 'Deep search — segment:' : 'Verifying segment:'}</span>
-            <span className="font-medium truncate">
-              {vlmSegmentIndex! + 1}/{vlmTotalSegments}
+            <span className="text-slate-500 shrink-0">Verifying range:</span>
+            <span className="font-medium shrink-0">
+              {verifyDone}/{verifyTotal}
             </span>
-            {vlmAttempt != null && vlmTotalBudget != null && (
-              <span className={`shrink-0 font-mono ${isDeepSearch ? 'text-purple-300' : 'text-slate-400'}`}>
-                · candidate {vlmAttempt}/{vlmTotalBudget}
-              </span>
+            {verifyMessage && (
+              <span className="text-slate-500 truncate">· {verifyMessage}</span>
             )}
           </div>
-          {vlmVerdict && (
-            <span className={`shrink-0 ml-3 font-medium capitalize ${
-              vlmVerdict === 'accepted' ? 'text-emerald-400'
-                : vlmVerdict === 'rejected' || vlmVerdict === 'dropped' ? 'text-orange-400'
-                : 'text-slate-400'
-            }`}>
-              {vlmVerdict}
-            </span>
-          )}
         </div>
       )}
     </div>
@@ -468,11 +446,26 @@ export default function App() {
     chunkIdx?: number; totalChunks?: number;
     shortStart?: number; shortEnd?: number;
     segmentsFound?: number;
-    vlmSegmentIndex?: number; vlmTotalSegments?: number; vlmVerdict?: string;
-    vlmAttempt?: number; vlmTotalBudget?: number;
+    verifyDone?: number; verifyTotal?: number; verifyMessage?: string;
     startTime: number;
   } | null>(null);
   const [matchJobId, setMatchJobId] = useState<string>('');
+
+  // Outcome summary of the Gemini verification stage for the loaded match job
+  // (mirrors server/verification/verify.ts's VerifySummary). `ran: false` +
+  // `reason` explains exactly why verification was skipped, so "why is nothing
+  // verified" is answerable straight from the results banner.
+  const [verifySummary, setVerifySummary] = useState<{
+    ran: boolean;
+    reason: string;
+    rangesTotal: number;
+    rangesVerified: number;
+    accepted: number;
+    rejected: number;
+    unverifiable: number;
+    switched: number;
+    geminiCalls: number;
+  } | null>(null);
 
   // Gemini free-tier quota status (polled alongside match-status). When the
   // daily quota is exhausted the server keeps auto-probing for the reset;
@@ -2720,7 +2713,7 @@ export default function App() {
                                             </div>
                                           )}
                                         </div>
-                                        <CandidateVerdictBadge candidate={c} isUsed={isUsed} isBestEffort={rowCs.bestEffort === true} />
+                                        <CandidateVerdictBadge candidate={c} isUsed={isUsed} />
                                         {renderTrimControls(rowCs, cIdx, isSelecting || !!selectingCandidateKey || segmentBusy || isMatching)}
                                         <div className="flex items-center gap-1.5 ml-auto">
                                           <button
@@ -3014,7 +3007,7 @@ export default function App() {
                         Next Candidate <ChevronRight className="w-3 h-3" />
                       </button>
                     </div>
-                    {currentCandidate && <CandidateVerdictBadge candidate={currentCandidate} isUsed={isUsed} isBestEffort={activeCandidateSet.bestEffort === true} />}
+                    {currentCandidate && <CandidateVerdictBadge candidate={currentCandidate} isUsed={isUsed} />}
                     {/* ±1 s boundary trim for the currently-stepped candidate */}
                     {currentCandidate && renderTrimControls(
                       activeCandidateSet, candidateIndex,
@@ -3277,7 +3270,7 @@ export default function App() {
                           </div>
                         )}
                       </div>
-                      <CandidateVerdictBadge candidate={c} isUsed={isUsed} isBestEffort={viewAllCandidatesFor.bestEffort === true} />
+                      <CandidateVerdictBadge candidate={c} isUsed={isUsed} />
                     </button>
                   );
                 })
