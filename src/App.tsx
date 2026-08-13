@@ -719,6 +719,7 @@ export default function App() {
             setSegments(job.segments || []);
             setUnmatched(job.unmatchedRanges || []);
             setMatchStats({ movieFrames: job.movieFrames, shortFrames: job.shortFrames });
+            setVerifySummary(job.verifySummary ?? null);
             // Restore video previews from the server's saved copies — the local
             // File objects are gone after a refresh, but /api/video/:jobId survives.
             restoreVideoPreviews(job.movieJobId, job.shortJobId);
@@ -983,11 +984,9 @@ export default function App() {
             shortStart: job.progress.shortStart,
             shortEnd: job.progress.shortEnd,
             segmentsFound: job.progress.segmentsFound,
-            vlmSegmentIndex: job.progress.vlmSegmentIndex,
-            vlmTotalSegments: job.progress.vlmTotalSegments,
-            vlmVerdict: job.progress.vlmVerdict,
-            vlmAttempt: job.progress.vlmAttempt,
-            vlmTotalBudget: job.progress.vlmTotalBudget,
+            verifyDone: job.progress.verifyDone,
+            verifyTotal: job.progress.verifyTotal,
+            verifyMessage: job.progress.verifyMessage,
             startTime: pollStartTime,
           });
         }
@@ -999,6 +998,7 @@ export default function App() {
           setSegments(job.segments || []);
           setUnmatched(job.unmatchedRanges || []);
           setMatchStats({ movieFrames: job.movieFrames, shortFrames: job.shortFrames });
+          setVerifySummary(job.verifySummary ?? null);
           setIsMatching(false);
           // If previews are empty (reconnected after a refresh), restore them
           // from the server's saved videos so results are actually watchable.
@@ -1077,6 +1077,7 @@ export default function App() {
       setSegments([]);
       setUnmatched([]);
       setMatchStats(null);
+      setVerifySummary(null);
       setStatus('Reconnecting to match processing…');
       // Bring back both video previews from the server's saved copies so the
       // panel isn't empty while the job keeps running after a reconnect.
@@ -1096,6 +1097,7 @@ export default function App() {
       setSegments(job.segments || []);
       setUnmatched(job.unmatchedRanges || []);
       setMatchStats({ movieFrames: job.movieFrames, shortFrames: job.shortFrames });
+      setVerifySummary(job.verifySummary ?? null);
       const segCount = (job.segments || []).length;
       setStatus(`Opened saved match: ${segCount} segment${segCount === 1 ? '' : 's'} found.`);
       // Restore both video previews from the server's saved copies.
@@ -1294,11 +1296,9 @@ export default function App() {
                 shortStart: job.progress.shortStart,
                 shortEnd: job.progress.shortEnd,
                 segmentsFound: job.progress.segmentsFound,
-                vlmSegmentIndex: job.progress.vlmSegmentIndex,
-                vlmTotalSegments: job.progress.vlmTotalSegments,
-                vlmVerdict: job.progress.vlmVerdict,
-                vlmAttempt: job.progress.vlmAttempt,
-                vlmTotalBudget: job.progress.vlmTotalBudget,
+                verifyDone: job.progress.verifyDone,
+                verifyTotal: job.progress.verifyTotal,
+                verifyMessage: job.progress.verifyMessage,
                 startTime: prev?.startTime ?? now,
               }));
             }
@@ -1509,6 +1509,7 @@ export default function App() {
       }
       setIsMatching(true);
       setMatchProgress(null);
+      setVerifySummary(null);
       setStatus(`Fingerprints ready (${finalTotalFrames} frames). Running segment matching…`);
 
       // Convert minSegmentDuration (seconds) to min consecutive frames @ 25fps
@@ -1965,6 +1966,7 @@ export default function App() {
         const job = await statusRes.json();
         const newSegments = job.segments || [];
         setSegments(newSegments);
+        if (job.verifySummary) setVerifySummary(job.verifySummary);
         // If the currently-previewed segment's range now points at a
         // different (or newly-added) active match, keep the preview in sync.
         if (previewSegment) {
@@ -2480,6 +2482,33 @@ export default function App() {
                 <Download className="w-3.5 h-3.5" /> Export JSON
               </button>
             </div>
+
+            {/* ── Verification summary banner ── */}
+            {verifySummary && (
+              verifySummary.ran ? (
+                <div className="px-5 py-2.5 border-b border-slate-800 bg-slate-900/60 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs font-mono">
+                  <span className="text-slate-400">Scene verification:</span>
+                  <span className="text-green-400">{verifySummary.accepted} accepted</span>
+                  {verifySummary.rejected > 0 && (
+                    <span className="text-red-400">{verifySummary.rejected} rejected</span>
+                  )}
+                  {verifySummary.switched > 0 && (
+                    <span className="text-amber-400">{verifySummary.switched} switched to a better candidate</span>
+                  )}
+                  {verifySummary.unverifiable > 0 && (
+                    <span className="text-slate-500">{verifySummary.unverifiable} unverifiable</span>
+                  )}
+                  <span className="text-slate-600">
+                    {verifySummary.rangesVerified}/{verifySummary.rangesTotal} ranges · {verifySummary.geminiCalls} Gemini call{verifySummary.geminiCalls !== 1 ? 's' : ''}
+                  </span>
+                </div>
+              ) : (
+                <div className="px-5 py-2.5 border-b border-slate-800 bg-amber-500/5 flex items-start gap-2 text-xs">
+                  <span className="text-amber-400 font-semibold shrink-0">Verification skipped:</span>
+                  <span className="text-slate-400">{verifySummary.reason}</span>
+                </div>
+              )
+            )}
 
             {/* ── Clip coverage timeline ── */}
             {matchStats && matchStats.shortFrames > 0 && (() => {
