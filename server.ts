@@ -477,17 +477,19 @@ async function startServer() {
   // 1b. Runtime settings (Gemini API key + GPU embed service URL).
   // Persisted to runtime-settings.json so they survive restarts, and applied
   // to process.env immediately so all later-spawned worker threads inherit them.
-  // Env vars already set at process launch take precedence at boot, but a POST
-  // from the UI always overrides for the current run.
+  // UI-saved values are authoritative: they win over env vars both at boot and
+  // via POST. Env vars are only a fallback when nothing was saved from the UI.
   const settingsPath = path.join(process.cwd(), 'runtime-settings.json');
   const loadRuntimeSettings = () => {
     try {
       if (fs.existsSync(settingsPath)) {
         const saved = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
-        if (saved.geminiApiKey && !process.env.GEMINI_API_KEY) {
+        // UI-saved settings are authoritative: they override env vars at boot.
+        // Env vars only act as a fallback when nothing was ever saved from the UI.
+        if (saved.geminiApiKey) {
           process.env.GEMINI_API_KEY = saved.geminiApiKey;
         }
-        if (saved.gpuEmbedServiceUrl && !process.env.GPU_EMBED_SERVICE_URL) {
+        if (saved.gpuEmbedServiceUrl) {
           process.env.GPU_EMBED_SERVICE_URL = saved.gpuEmbedServiceUrl;
         }
         console.log('[settings] Loaded runtime settings from runtime-settings.json');
