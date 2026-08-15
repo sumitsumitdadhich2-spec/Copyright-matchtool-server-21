@@ -33,6 +33,20 @@ export interface CandidateRecord {
   reason?: string;
   /** Hash-matching confidence from the engine — the ordering signal only. */
   hashConfidence: number;
+  /** Task 5 ranking: combined verification-order score. Absent for the
+   *  engine's own pick (which always stays first) and when ranking is off. */
+  rankScore?: number;
+  /** Task 5 ranking: the individual signals that produced rankScore, kept
+   *  for debugging. `timelineScore` is null for non-linear edits. */
+  rankSignals?: {
+    hashConfidence: number;
+    /** 0..1 — speed-corrected candidate span vs the short range's span. */
+    spanScore: number;
+    /** 0..1 — agreeing-frame count relative to the best candidate's. */
+    frameScore: number;
+    /** 0..1 or null — agreement with the timeline the other segments form. */
+    timelineScore: number | null;
+  };
 }
 
 export interface VerificationRecord {
@@ -52,6 +66,17 @@ export interface VerificationRecord {
   skippedReason?: string;
   /** Set while a manual re-check is in flight (added by the API layer). */
   retrying?: boolean;
+  /** Task 1/5 debug metadata: detected fps + VFR flags from the ffprobe pass
+   *  (server/video-metadata.ts), copied onto every record so a range can be
+   *  debugged without hunting for the job-level metadata file. */
+  videoMetadata?: {
+    shortDeclaredFps: number | null;
+    shortAverageFps: number | null;
+    shortIsVFR: boolean;
+    movieDeclaredFps: number | null;
+    movieAverageFps: number | null;
+    movieIsVFR: boolean;
+  } | null;
 }
 
 function fileName(matchJobId: string, segmentIndex: number): string {

@@ -43,14 +43,27 @@ import {
   type CandidateRecord,
   type VerificationRecord,
 } from './store';
-import { flagTimelineOutliers } from './timeline';
+import { flagTimelineOutliers, timelineConsistencyScore } from './timeline';
+import { readMatchVideoMetadata } from '../video-metadata';
 
 // ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
 
-/** Extra candidates fetched from the engine's pool, on top of its own pick. */
-const MAX_ALTERNATES = clampInt(process.env.VERIFY_MAX_ALTERNATES, 2, 0, 6);
+/** Extra candidates fetched from the engine's pool, on top of its own pick.
+ *  Default raised 2 → 5: Task 5 ranking puts the likeliest alternates first
+ *  and first-accept-wins stops at the first yes, so a deeper pool costs
+ *  nothing on easy ranges and rescues hard ones. */
+const MAX_ALTERNATES = clampInt(process.env.VERIFY_MAX_ALTERNATES, 5, 0, 8);
+/** Task 5 kill switch — VERIFY_RANKING_ENABLED=0 restores pure
+ *  hash-confidence ordering of the alternates. */
+const RANKING_ENABLED = process.env.VERIFY_RANKING_ENABLED !== '0';
+/** Task 5 ranking weights: rankScore = hashConfidence (0-100 scale) plus each
+ *  0..1 signal times its weight. Neutral-safe: a candidate with no timeline
+ *  information scores the same as one at 0.5 consistency. */
+const RANK_SPAN_WEIGHT = clampNum(process.env.VERIFY_RANK_SPAN_WEIGHT, 10, 0, 100);
+const RANK_FRAMES_WEIGHT = clampNum(process.env.VERIFY_RANK_FRAMES_WEIGHT, 10, 0, 100);
+const RANK_TIMELINE_WEIGHT = clampNum(process.env.VERIFY_RANK_TIMELINE_WEIGHT, 15, 0, 100);
 /** Ranges verified in parallel. Gemini's own RPM pacing lives in gemini-vlm.ts. */
 const CONCURRENCY = clampInt(process.env.VERIFY_CONCURRENCY, 2, 1, 8);
 /** A verdict below this confidence is not trusted either way. */
@@ -62,6 +75,12 @@ function clampInt(raw: string | undefined, fallback: number, min: number, max: n
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+function clampNum(raw: string | undefined, fallback: number, min: number, max: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +193,9 @@ export async function verifyMatchedSegments(req: VerifyRequest): Promise<VerifyR
   const ordered = [...req.segments].sort((a, b) => a.shortStart - b.shortStart);
   const finalised: Array<MatchedSegment | null> = new Array(ordered.length).fill(null);
 
+  // Task 1/5 debug metadata (fps, VFR) — read once, stamped on every record.
+  const videoMeta = loadVideoMetaForRecords(req.uploadDir, req.matchJobId);
+
   let done = 0;
   let cursor = 0;
 
@@ -182,7 +204,9 @@ export async function verifyMatchedSegments(req: VerifyRequest): Promise<VerifyR
       const index = cursor++;
       if (index >= ordered.length) return;
 
-      const outcome = await verifyOneRange(req, ordered[index], index);
+      // Task 5 timeline consistency ranks against the OTHER ranges of the clip.
+      const neighbors = ordered.filter((_, j) => j !== index);
+      const outcome = await verifyOneRange(req, ordered[index], index, neighbors, videoMeta);
 
       summary.geminiCalls += outcome.calls;
       summary.rangesVerified++;
@@ -234,20 +258,25 @@ async function verifyOneRange(
   req: VerifyRequest,
   primary: MatchedSegment,
   segmentIndex: number,
+  neighbors: MatchedSegment[],
+  videoMeta: VerificationRecord['videoMetadata'],
 ): Promise<RangeOutcome> {
-  const candidates = collectCandidates(primary, req.candidatePool);
+  const candidates = collectCandidates(primary, req.candidatePool, neighbors);
 
   const record: VerificationRecord = {
     segmentIndex,
     shortStart: primary.shortStart,
     shortEnd: primary.shortEnd,
     recordedAt: Date.now(),
-    candidates: candidates.map(segment => ({
-      segment,
+    candidates: candidates.map(c => ({
+      segment: c.segment,
       checked: false,
-      hashConfidence: segment.confidence,
+      hashConfidence: c.segment.confidence,
+      rankScore: c.rankScore,
+      rankSignals: c.rankSignals,
     })),
     dropped: false,
+    videoMetadata: videoMeta,
   };
 
   // The short-clip side is identical for every candidate of this range, so it
@@ -270,7 +299,7 @@ async function verifyOneRange(
   let calls = 0;
   try {
     for (let i = 0; i < candidates.length; i++) {
-      const candidate = candidates[i];
+      const candidate = candidates[i].segment;
       const entry = record.candidates[i];
 
       const movieClip = await cutClip(
@@ -331,7 +360,7 @@ async function verifyOneRange(
           `(Gemini ${entry.confidencePct}%${i > 0 ? ', switched from the engine pick' : ''}).`,
         );
         // A winner ends the range — no point spending quota on the rest.
-        return { segment: candidates[i], record, calls };
+        return { segment: candidate, record, calls };
       }
 
       if (!verdict.same && trusted) {
@@ -369,17 +398,27 @@ async function verifyOneRange(
   };
 }
 
+/** A candidate plus its Task 5 ranking metadata (absent for the engine pick
+ *  and when ranking is disabled). */
+interface RankedCandidate {
+  segment: MatchedSegment;
+  rankScore?: number;
+  rankSignals?: NonNullable<CandidateRecord['rankSignals']>;
+}
+
 /**
- * The engine's own pick first, then its alternates for the same short range by
- * descending hash confidence. Alternates pointing at essentially the same movie
- * timestamp as an earlier candidate are dropped — re-asking Gemini about the
- * same footage is pure quota waste.
+ * The engine's own pick ALWAYS first (its structure is untouched by Task 5),
+ * then its alternates for the same short range — ordered by the Task 5 rank
+ * score when ranking is enabled, by raw hash confidence otherwise. Alternates
+ * pointing at essentially the same movie timestamp as an earlier candidate
+ * are dropped — re-asking Gemini about the same footage is pure quota waste.
  */
 function collectCandidates(
   primary: MatchedSegment,
   pool: MatchedSegment[] | undefined,
-): MatchedSegment[] {
-  const out = [primary];
+  neighbors: MatchedSegment[],
+): RankedCandidate[] {
+  const out: RankedCandidate[] = [{ segment: primary }];
   if (MAX_ALTERNATES === 0) return out;
 
   const alternates = getAlternateCandidatesForRange(
@@ -390,12 +429,106 @@ function collectCandidates(
     0.5,
   );
 
-  for (const alt of alternates) {
+  const ordered = RANKING_ENABLED
+    ? rankAlternates(alternates, primary, neighbors)
+    : alternates.map((segment): RankedCandidate => ({ segment }));
+
+  for (const alt of ordered) {
     if (out.length >= MAX_ALTERNATES + 1) break;
-    if (out.some(existing => Math.abs(existing.movieStart - alt.movieStart) < 1)) continue;
+    if (out.some(existing => Math.abs(existing.segment.movieStart - alt.segment.movieStart) < 1)) continue;
     out.push(alt);
   }
   return out;
+}
+
+/**
+ * Task 5: order alternates for verification by more than hash confidence.
+ *
+ *   rankScore = hashConfidence (0-100)
+ *             + spanScore     × VERIFY_RANK_SPAN_WEIGHT      (default 10)
+ *             + frameScore    × VERIFY_RANK_FRAMES_WEIGHT    (default 10)
+ *             + timelineScore × VERIFY_RANK_TIMELINE_WEIGHT  (default 15)
+ *
+ *   spanScore     0..1 — how close the candidate's movie span is to the short
+ *                 range's span after correcting for the candidate's own speed
+ *                 (a 10s short range at 2x speed should cover ~20s of movie).
+ *   frameScore    0..1 — multi-frame hash agreement: how many frames back this
+ *                 candidate relative to the best-supported alternate, so a
+ *                 high-average-but-3-frame fluke stops outranking a slightly
+ *                 lower-average candidate backed by 40 frames.
+ *   timelineScore 0..1 — agreement with the continuous movie section the
+ *                 clip's OTHER segments point at (timeline.ts). Null (no
+ *                 usable neighbours / non-linear edit) is NEUTRAL: scored as
+ *                 0.5, identical for every candidate of the range.
+ *
+ * Ranking only changes the ORDER Gemini is asked in; it accepts nothing by
+ * itself, so the worst possible outcome of a bad rank is spending quota in a
+ * suboptimal order — never a wrong match.
+ */
+function rankAlternates(
+  alternates: MatchedSegment[],
+  primary: MatchedSegment,
+  neighbors: MatchedSegment[],
+): RankedCandidate[] {
+  if (alternates.length === 0) return [];
+
+  const shortSpan = Math.max(0, primary.shortEnd - primary.shortStart);
+  const shortMid = (primary.shortStart + primary.shortEnd) / 2;
+  const maxFrames = Math.max(1, ...alternates.map(a => a.frameCount || 0));
+
+  const ranked = alternates.map((segment): RankedCandidate => {
+    const speed = Number.isFinite(segment.speedRatio) && segment.speedRatio > 0
+      ? segment.speedRatio
+      : 1;
+    const expectedSpan = shortSpan * speed;
+    const actualSpan = Math.max(0, segment.movieEnd - segment.movieStart);
+    const spanScore = expectedSpan > 0 && actualSpan > 0
+      ? Math.min(expectedSpan, actualSpan) / Math.max(expectedSpan, actualSpan)
+      : 0;
+    const frameScore = (segment.frameCount || 0) / maxFrames;
+    const timelineScore = timelineConsistencyScore(
+      neighbors,
+      shortMid,
+      (segment.movieStart + segment.movieEnd) / 2,
+    );
+
+    const rankScore =
+      segment.confidence +
+      spanScore * RANK_SPAN_WEIGHT +
+      frameScore * RANK_FRAMES_WEIGHT +
+      (timelineScore ?? 0.5) * RANK_TIMELINE_WEIGHT;
+
+    return {
+      segment,
+      rankScore,
+      rankSignals: { hashConfidence: segment.confidence, spanScore, frameScore, timelineScore },
+    };
+  });
+
+  ranked.sort((a, b) => (b.rankScore ?? 0) - (a.rankScore ?? 0));
+  return ranked;
+}
+
+/** Job-level fps/VFR metadata for the records, read once per verify pass.
+ *  Best-effort: null whenever the probe file is absent or unreadable. */
+function loadVideoMetaForRecords(
+  uploadDir: string,
+  matchJobId: string,
+): VerificationRecord['videoMetadata'] {
+  try {
+    const meta = readMatchVideoMetadata(uploadDir, matchJobId);
+    if (!meta) return null;
+    return {
+      shortDeclaredFps: meta.short?.declaredFps ?? null,
+      shortAverageFps: meta.short?.averageFps ?? null,
+      shortIsVFR: meta.short?.isVFR ?? false,
+      movieDeclaredFps: meta.movie?.declaredFps ?? null,
+      movieAverageFps: meta.movie?.averageFps ?? null,
+      movieIsVFR: meta.movie?.isVFR ?? false,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +588,10 @@ export async function recheckSegment(req: RecheckRequest): Promise<RecheckResult
     },
     req.segment,
     req.segmentIndex,
+    // A single-range re-check has no sibling ranges in scope; timeline
+    // consistency degrades to neutral, which is exactly the safe behavior.
+    [],
+    loadVideoMetaForRecords(req.uploadDir, req.matchJobId),
   );
 
   await writeRecordAsync(req.uploadDir, req.matchJobId, outcome.record);
