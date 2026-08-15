@@ -260,6 +260,10 @@ async function verifyOneRange(
   segmentIndex: number,
   neighbors: MatchedSegment[],
   videoMeta: VerificationRecord['videoMetadata'],
+  /** When true (manual Retry), EVERY candidate is verified — no first-accept
+   *  early stop — and the accepted candidate with the highest Gemini
+   *  confidence wins. The bulk pass keeps first-accept-wins to save quota. */
+  checkAll = false,
 ): Promise<RangeOutcome> {
   const candidates = collectCandidates(primary, req.candidatePool, neighbors);
 
@@ -353,14 +357,19 @@ async function verifyOneRange(
       const trusted = verdict.confidence >= MIN_CONFIDENCE;
       if (verdict.same && trusted) {
         entry.verdict = 'accepted';
-        record.usedCandidateIndex = i;
         console.log(
           `[Verify] Range ${segmentIndex} (${fmt(primary.shortStart)}-${fmt(primary.shortEnd)}) ` +
           `ACCEPTED candidate ${i} @ movie ${fmt(candidate.movieStart)}s ` +
           `(Gemini ${entry.confidencePct}%${i > 0 ? ', switched from the engine pick' : ''}).`,
         );
-        // A winner ends the range — no point spending quota on the rest.
-        return { segment: candidate, record, calls };
+        if (!checkAll) {
+          // Bulk pass: a winner ends the range — no point spending quota on the rest.
+          record.usedCandidateIndex = i;
+          return { segment: candidate, record, calls };
+        }
+        // checkAll (manual Retry): keep verifying the remaining candidates so
+        // the best-confidence match wins, not just the first acceptable one.
+        continue;
       }
 
       if (!verdict.same && trusted) {
@@ -374,6 +383,28 @@ async function verifyOneRange(
     }
   } finally {
     deleteClip(shortClip);
+  }
+
+  // checkAll mode: every candidate has been judged — the accepted candidate
+  // with the highest Gemini confidence wins (ties break toward the earlier,
+  // higher-ranked candidate).
+  const acceptedEntries = record.candidates
+    .map((c, i) => ({ c, i }))
+    .filter(x => x.c.verdict === 'accepted');
+  if (acceptedEntries.length > 0) {
+    acceptedEntries.sort(
+      (a, b) => (b.c.confidencePct ?? 0) - (a.c.confidencePct ?? 0) || a.i - b.i,
+    );
+    const winnerIdx = acceptedEntries[0].i;
+    record.usedCandidateIndex = winnerIdx;
+    const winner = candidates[winnerIdx].segment;
+    console.log(
+      `[Verify] Range ${segmentIndex} (${fmt(primary.shortStart)}-${fmt(primary.shortEnd)}) ` +
+      `full check: ${acceptedEntries.length}/${record.candidates.length} accepted — ` +
+      `winner is candidate ${winnerIdx} @ movie ${fmt(winner.movieStart)}s ` +
+      `(Gemini ${record.candidates[winnerIdx].confidencePct}%).`,
+    );
+    return { segment: winner, record, calls };
   }
 
   // Nobody won. Keep the engine's own pick visible so the user can review it
@@ -553,7 +584,10 @@ export interface RecheckResult {
 
 /**
  * Re-run verification for exactly one range and overwrite its record.
- * Same code path as the bulk pass, so a retry can never disagree with it.
+ * Same code path as the bulk pass, with one deliberate difference: Retry
+ * verifies EVERY candidate (no first-accept early stop) and picks the
+ * highest-confidence accepted candidate. It also never checks the daily
+ * quota gate — a manual Retry always attempts the full check.
  */
 export async function recheckSegment(req: RecheckRequest): Promise<RecheckResult> {
   if (!req.shortVideoPath || !req.movieVideoPath || !geminiConfigured()) {
@@ -592,6 +626,10 @@ export async function recheckSegment(req: RecheckRequest): Promise<RecheckResult
     // consistency degrades to neutral, which is exactly the safe behavior.
     [],
     loadVideoMetaForRecords(req.uploadDir, req.matchJobId),
+    // Manual Retry always runs the FULL check: every candidate is verified
+    // (up to one Gemini call each) and the highest-confidence accepted
+    // candidate wins. This is a deliberate quota trade-off the user chose.
+    true,
   );
 
   await writeRecordAsync(req.uploadDir, req.matchJobId, outcome.record);
