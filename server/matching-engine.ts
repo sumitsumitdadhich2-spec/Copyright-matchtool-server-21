@@ -16,6 +16,15 @@ import * as os from 'os';
 import * as readline from 'readline';
 import { FrameSignature, VariantHashes } from '../src/shared/fingerprint';
 import { getOrLoadMovieAsset, hasMovieAsset } from './movie-asset-cache';
+// Alt-candidate expansion post-pass (Tasks 2-4) — additive only. Runs AFTER
+// the engine finishes and only appends to candidatePool; never touches
+// Pass 1/2/3 selection. See server/alt-expansion.ts.
+import {
+  expandAltCandidates,
+  altDedupSeparationFrames,
+  type AltExpansionMeta,
+  type ScanPoint,
+} from './alt-expansion';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -79,6 +88,10 @@ export interface MatchedSegment {
   /** Display-only: this segment jumps off the dominant forward movie
    *  timeline established by the other segments (see timeline-outliers.ts). */
   timelineOutlier?: boolean;
+  /** Present only on alt-pool candidates built by the anchor-expansion
+   *  post-pass (server/alt-expansion.ts). Debug/ranking metadata — never set
+   *  on Pass 1/2/3 segments. */
+  altExpansion?: AltExpansionMeta;
 }
 
 export interface MatchResult {
