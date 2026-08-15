@@ -53,10 +53,11 @@ import { readMatchVideoMetadata } from '../video-metadata';
 // ---------------------------------------------------------------------------
 
 /** Extra candidates fetched from the engine's pool, on top of its own pick.
- *  Default raised 2 → 5: Task 5 ranking puts the likeliest alternates first
- *  and first-accept-wins stops at the first yes, so a deeper pool costs
- *  nothing on easy ranges and rescues hard ones. */
-const MAX_ALTERNATES = clampInt(process.env.VERIFY_MAX_ALTERNATES, 5, 0, 8);
+ *  Default raised 5 → 8 (the max): ranking puts the likeliest alternates
+ *  first and accepted candidates short-circuit the rest, so a deeper pool
+ *  costs nothing on easy ranges and rescues hard ones where the right match
+ *  ranked low. Override with VERIFY_MAX_ALTERNATES if needed. */
+const MAX_ALTERNATES = clampInt(process.env.VERIFY_MAX_ALTERNATES, 8, 0, 8);
 /** Task 5 kill switch — VERIFY_RANKING_ENABLED=0 restores pure
  *  hash-confidence ordering of the alternates. */
 const RANKING_ENABLED = process.env.VERIFY_RANKING_ENABLED !== '0';
