@@ -12,7 +12,9 @@
  *     take its candidates (the engine's own pick + the engine's alternates,
  *     ordered by hash confidence)
  *     cut both clips, ask Gemini "same footage?" once per candidate
- *     the FIRST accepted candidate wins; stop asking
+ *     when a candidate is accepted, only remaining candidates with a HIGHER
+ *     hash confidence are still checked; among all accepted candidates the
+ *     one with the highest hash confidence wins
  *     if none are accepted, the range is dropped (kept visible, flagged)
  *
  * Deliberately NOT here (all of it was in the old system and none of it
@@ -310,10 +312,26 @@ async function verifyOneRange(
   }
 
   let calls = 0;
+  /** Bulk pass: hash confidence of the best candidate accepted so far. Once a
+   *  candidate is accepted, only remaining candidates with a STRICTLY higher
+   *  hash confidence are still worth a Gemini call — if one of those is also
+   *  accepted, the higher-hash-confidence candidate wins the range. */
+  let acceptedHash: number | null = null;
   try {
     for (let i = 0; i < candidates.length; i++) {
       const candidate = candidates[i].segment;
       const entry = record.candidates[i];
+
+      if (!checkAll && acceptedHash !== null && candidate.confidence <= acceptedHash) {
+        entry.reason =
+          `skipped — an accepted candidate already has equal or higher hash confidence ` +
+          `(${Math.round(acceptedHash)}% >= ${Math.round(candidate.confidence)}%)`;
+        req.onLog?.(
+          `Candidate ${i + 1}: SKIPPED — hash confidence ${Math.round(candidate.confidence)}% is not higher ` +
+          `than the already-accepted candidate's ${Math.round(acceptedHash)}%.`,
+        );
+        continue;
+      }
 
       req.onLog?.(
         `Checking candidate ${i + 1}/${candidates.length} @ movie ${fmt(candidate.movieStart)}s–${fmt(candidate.movieEnd)}s ` +
@@ -380,9 +398,20 @@ async function verifyOneRange(
         );
         req.onLog?.(`Candidate ${i + 1}: ACCEPTED by Gemini (${entry.confidencePct}% confident).`);
         if (!checkAll) {
-          // Bulk pass: a winner ends the range — no point spending quota on the rest.
-          record.usedCandidateIndex = i;
-          return { segment: candidate, record, calls };
+          // Bulk pass: an accepted candidate settles the range UNLESS a later
+          // candidate has a strictly higher hash confidence — those still get
+          // their own Gemini check, and if also accepted, the higher hash
+          // confidence wins. Everything else is skipped to save quota.
+          acceptedHash = Math.max(acceptedHash ?? -Infinity, candidate.confidence);
+          const higherLeft = candidates
+            .slice(i + 1)
+            .filter(c => c.segment.confidence > acceptedHash!).length;
+          if (higherLeft === 0) break;
+          req.onLog?.(
+            `${higherLeft} remaining candidate(s) have a higher hash confidence than the accepted one — ` +
+            `checking those too; the highest hash confidence accepted candidate will win.`,
+          );
+          continue;
         }
         // checkAll (manual Retry): keep verifying the remaining candidates so
         // the best-confidence match wins, not just the first acceptable one.
@@ -404,29 +433,41 @@ async function verifyOneRange(
     deleteClip(shortClip);
   }
 
-  // checkAll mode: every candidate has been judged — the accepted candidate
-  // with the highest Gemini confidence wins (ties break toward the earlier,
-  // higher-ranked candidate).
+  // Winner selection among accepted candidates:
+  //   - bulk pass: the highest HASH confidence wins (that is the whole point of
+  //     still checking higher-hash candidates after a first accept), Gemini
+  //     confidence breaks ties, then the earlier/higher-ranked candidate.
+  //   - checkAll (manual Retry): the highest Gemini confidence wins, hash
+  //     confidence breaks ties, then the earlier/higher-ranked candidate.
   const acceptedEntries = record.candidates
     .map((c, i) => ({ c, i }))
     .filter(x => x.c.verdict === 'accepted');
   if (acceptedEntries.length > 0) {
-    acceptedEntries.sort(
-      (a, b) => (b.c.confidencePct ?? 0) - (a.c.confidencePct ?? 0) || a.i - b.i,
+    acceptedEntries.sort((a, b) =>
+      checkAll
+        ? (b.c.confidencePct ?? 0) - (a.c.confidencePct ?? 0) ||
+          (b.c.hashConfidence ?? 0) - (a.c.hashConfidence ?? 0) ||
+          a.i - b.i
+        : (b.c.hashConfidence ?? 0) - (a.c.hashConfidence ?? 0) ||
+          (b.c.confidencePct ?? 0) - (a.c.confidencePct ?? 0) ||
+          a.i - b.i,
     );
     const winnerIdx = acceptedEntries[0].i;
     record.usedCandidateIndex = winnerIdx;
     const winner = candidates[winnerIdx].segment;
     console.log(
       `[Verify] Range ${segmentIndex} (${fmt(primary.shortStart)}-${fmt(primary.shortEnd)}) ` +
-      `full check: ${acceptedEntries.length}/${record.candidates.length} accepted — ` +
+      `${checkAll ? 'full check' : 'bulk pass'}: ${acceptedEntries.length}/${record.candidates.length} accepted — ` +
       `winner is candidate ${winnerIdx} @ movie ${fmt(winner.movieStart)}s ` +
-      `(Gemini ${record.candidates[winnerIdx].confidencePct}%).`,
+      `(hash ${Math.round(record.candidates[winnerIdx].hashConfidence ?? 0)}%, ` +
+      `Gemini ${record.candidates[winnerIdx].confidencePct}%` +
+      `${winnerIdx > 0 ? ', switched from the engine pick' : ''}).`,
     );
     req.onLog?.(
-      `Full check done: ${acceptedEntries.length}/${record.candidates.length} accepted — ` +
+      `Check done: ${acceptedEntries.length}/${record.candidates.length} accepted — ` +
       `WINNER is candidate ${winnerIdx + 1} @ movie ${fmt(winner.movieStart)}s ` +
-      `(Gemini ${record.candidates[winnerIdx].confidencePct}% confident).`,
+      `(hash confidence ${Math.round(record.candidates[winnerIdx].hashConfidence ?? 0)}%, ` +
+      `Gemini ${record.candidates[winnerIdx].confidencePct}% confident).`,
     );
     return { segment: winner, record, calls };
   }
@@ -564,7 +605,14 @@ function rankAlternates(
     };
   });
 
-  ranked.sort((a, b) => (b.rankScore ?? 0) - (a.rankScore ?? 0));
+  // Primary order: rank score. Secondary order: raw hash confidence — when
+  // rank scores tie (or are effectively equal), the candidate the hash search
+  // itself believed in more gets asked first.
+  ranked.sort(
+    (a, b) =>
+      (b.rankScore ?? 0) - (a.rankScore ?? 0) ||
+      b.segment.confidence - a.segment.confidence,
+  );
   return ranked;
 }
 
