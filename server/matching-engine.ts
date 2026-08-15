@@ -223,6 +223,52 @@ type AlignedCand = { offset: number; sim: number };
 const SLOPE_MIN = 0.1;
 const SLOPE_MAX = 8.0;
 
+// ---------------------------------------------------------------------------
+// STRICT 80% CANDIDATE RULE (v6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Hard gate: a candidate/segment only exists when its AVERAGE hash confidence
+ * across the whole matched span is ≥ this. 77/78/79%-range candidates are
+ * never created — not in the accepted segments, not in the candidate pool,
+ * not in results. A single peak frame at 80% is NOT enough; the segment
+ * average must clear the gate.
+ */
+const STRICT_MIN_CONF = 80;
+
+/**
+ * Maximum extra exhaustive retry passes when a chunk has no ≥ STRICT_MIN_CONF
+ * segment after Passes 1 & 2. Each retry re-scans the ENTIRE movie
+ * (forward), walks bidirectionally (backward + forward from each seed),
+ * searches all crop variants, and uses a denser + offset-shifted seed grid
+ * than the previous pass. Bounded so the search can never loop forever.
+ */
+const MAX_EXHAUSTIVE_PASSES = 3;
+
+/** Seed-frame similarity floor during exhaustive retry passes (the final
+ *  segment must still average ≥ STRICT_MIN_CONF — this only lets the walk
+ *  START from a moderately-scoring frame). */
+const RETRY_SEED_MIN_SIM = 70;
+
+/**
+ * Tiny-span rejection: matched span must be a meaningful portion of the clip.
+ * E.g. a 0.24s span against a 2.12s clip is a fluke, never a genuine match.
+ */
+function strictSpanOk(shortStart: number, shortEnd: number, clipDuration: number): boolean {
+  if (clipDuration <= 0) return true;
+  const span = shortEnd - shortStart;
+  const minSpan = Math.min(clipDuration * 0.5, Math.max(0.4, clipDuration * 0.12));
+  return span >= minSpan;
+}
+
+/** Combined strict gate applied to every segment and pool candidate. */
+function passesStrictGate(
+  seg: { confidence: number; shortStart: number; shortEnd: number },
+  clipDuration: number,
+): boolean {
+  return seg.confidence >= STRICT_MIN_CONF && strictSpanOk(seg.shortStart, seg.shortEnd, clipDuration);
+}
+
 /** aHash weight vs dHash weight when both are available (no pHash) */
 const A_WEIGHT = 0.55;
 const D_WEIGHT = 0.45;
@@ -1690,6 +1736,10 @@ export async function groundMatchedSegments(
           if (seq.length < chunkMinFrames) continue;
 
           const conf = seq.reduce((a, f) => a + f.sim, 0) / seq.length;
+          // STRICT 80% RULE: a sub-80% average-confidence sequence can never
+          // become a candidate — leave those frames free for the exhaustive
+          // retry passes below.
+          if (conf < STRICT_MIN_CONF) continue;
           if (
             bestSeq === null ||
             seq.length > bestSeq.length ||
@@ -1709,6 +1759,8 @@ export async function groundMatchedSegments(
 
       altCandidatePool.push(
         ...buildAltCandidatesForChunk(chunkAltRaw, sSet, mSet, shortFps, movieFps, chunk.start, chunk.end, frameDrift)
+          // STRICT 80% RULE: sub-80% alternates never enter the pool.
+          .filter(c => c.confidence >= STRICT_MIN_CONF)
       );
     }
 

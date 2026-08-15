@@ -112,77 +112,309 @@ export function getCropRects(width: number, height: number): CropRect[] {
   return rects;
 }
 
-export function processSubtitles(imageData: ImageData, forceFullPass: boolean): boolean {
-  const { width, height, data } = imageData;
-  const mask = new Uint8Array(width * height);
-  let hasSubtitles = false;
-  let subtitlePixelCount = 0;
-  
-  const startY = Math.floor(height * 0.75);
-  
-  for (let y = startY; y < height; y++) {
+// ---------------------------------------------------------------------------
+// Shared inpaint helper — fills masked pixels from the nearest unmasked pixel
+// above; falls back to the nearest unmasked pixel below (needed for text at
+// the very top of the frame, which has no source rows above it).
+// ---------------------------------------------------------------------------
+function inpaintMask(data: Uint8ClampedArray, width: number, height: number, mask: Uint8Array): void {
+  for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      const idx = (y * width + x) * 4;
-      const r = data[idx];
-      const g = data[idx + 1];
-      
-      if (r > 180 && g > 180) {
-        mask[y * width + x] = 1;
-        hasSubtitles = true;
-        subtitlePixelCount++;
+      if (mask[y * width + x] !== 1) continue;
+      let sourceY = -1;
+      for (let sy = y - 1; sy >= 0; sy--) {
+        if (mask[sy * width + x] === 0) { sourceY = sy; break; }
+      }
+      if (sourceY === -1) {
+        for (let sy = y + 1; sy < height; sy++) {
+          if (mask[sy * width + x] === 0) { sourceY = sy; break; }
+        }
+      }
+      if (sourceY !== -1) {
+        const targetIdx = (y * width + x) * 4;
+        const sourceIdx = (sourceY * width + x) * 4;
+        data[targetIdx]     = data[sourceIdx];
+        data[targetIdx + 1] = data[sourceIdx + 1];
+        data[targetIdx + 2] = data[sourceIdx + 2];
+        data[targetIdx + 3] = data[sourceIdx + 3];
       }
     }
   }
-  
-  const bottomArea = width * (height - startY);
-  if (subtitlePixelCount < 8 || subtitlePixelCount > bottomArea * 0.25) {
-    hasSubtitles = false;
-  }
-  
-  if (!hasSubtitles && !forceFullPass) {
-    return false;
-  }
-  
+}
+
+/** 5×5 dilation of a binary mask (2px radius) */
+function dilateMask(mask: Uint8Array, width: number, height: number, radius = 2): Uint8Array {
   const dilated = new Uint8Array(width * height);
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      if (mask[y * width + x] === 1) {
-        for (let dy = -2; dy <= 2; dy++) {
-          for (let dx = -2; dx <= 2; dx++) {
-            const ny = y + dy;
-            const nx = x + dx;
-            if (ny >= 0 && ny < height && nx >= 0 && nx < width) {
-              dilated[ny * width + nx] = 1;
-            }
+      if (mask[y * width + x] !== 1) continue;
+      for (let dy = -radius; dy <= radius; dy++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+          const ny = y + dy;
+          const nx = x + dx;
+          if (ny >= 0 && ny < height && nx >= 0 && nx < width) {
+            dilated[ny * width + nx] = 1;
           }
         }
       }
     }
   }
-  
+  return dilated;
+}
+
+/**
+ * Detect black bars / letterbox / pillarbox / uniform frame-around-frame
+ * borders and return the content rectangle (in this image's coordinates),
+ * or null when no trimming is needed.
+ *
+ * A row/column counts as a "bar" when nearly all of its pixels are close to
+ * the border reference color (sampled from the outermost row/column) AND
+ * that reference color is itself very flat (uniform). Works for classic
+ * black letterbox, white borders, and colored frame-around-frame edits.
+ *
+ * Designed to run on the downscaled (~120px-high) frame — cheap, and small
+ * 1-2px trims at this scale correspond to real bars at full resolution.
+ */
+export function detectContentBounds(
+  imageData: ImageData
+): { sx: number; sy: number; sw: number; sh: number } | null {
+  const { width, height, data } = imageData;
+  if (width < 8 || height < 8) return null;
+
+  const COLOR_TOL   = 26;   // per-channel distance to reference color to count as "bar pixel"
+  const BAR_FRAC    = 0.94; // ≥94% of row/col pixels must match reference
+  const MAX_TRIM    = 0.42; // never trim more than 42% from one side
+
+  const rowMatches = (y: number, ref: [number, number, number]): boolean => {
+    let matches = 0;
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4;
+      if (
+        Math.abs(data[idx]     - ref[0]) <= COLOR_TOL &&
+        Math.abs(data[idx + 1] - ref[1]) <= COLOR_TOL &&
+        Math.abs(data[idx + 2] - ref[2]) <= COLOR_TOL
+      ) matches++;
+    }
+    return matches / width >= BAR_FRAC;
+  };
+  const colMatches = (x: number, ref: [number, number, number]): boolean => {
+    let matches = 0;
+    for (let y = 0; y < height; y++) {
+      const idx = (y * width + x) * 4;
+      if (
+        Math.abs(data[idx]     - ref[0]) <= COLOR_TOL &&
+        Math.abs(data[idx + 1] - ref[1]) <= COLOR_TOL &&
+        Math.abs(data[idx + 2] - ref[2]) <= COLOR_TOL
+      ) matches++;
+    }
+    return matches / height >= BAR_FRAC;
+  };
+
+  /** Median-ish reference color of a row/col: average of its pixels */
+  const rowRef = (y: number): [number, number, number] => {
+    let r = 0, g = 0, b = 0;
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4;
+      r += data[idx]; g += data[idx + 1]; b += data[idx + 2];
+    }
+    return [r / width, g / width, b / width];
+  };
+  const colRef = (x: number): [number, number, number] => {
+    let r = 0, g = 0, b = 0;
+    for (let y = 0; y < height; y++) {
+      const idx = (y * width + x) * 4;
+      r += data[idx]; g += data[idx + 1]; b += data[idx + 2];
+    }
+    return [r / height, g / height, b / height];
+  };
+
+  const maxTrimY = Math.floor(height * MAX_TRIM);
+  const maxTrimX = Math.floor(width * MAX_TRIM);
+
+  // Top
+  let top = 0;
+  {
+    const ref = rowRef(0);
+    if (rowMatches(0, ref)) {
+      while (top < maxTrimY && rowMatches(top, ref)) top++;
+    }
+  }
+  // Bottom
+  let bottom = 0;
+  {
+    const ref = rowRef(height - 1);
+    if (rowMatches(height - 1, ref)) {
+      while (bottom < maxTrimY && rowMatches(height - 1 - bottom, ref)) bottom++;
+    }
+  }
+  // Left
+  let left = 0;
+  {
+    const ref = colRef(0);
+    if (colMatches(0, ref)) {
+      while (left < maxTrimX && colMatches(left, ref)) left++;
+    }
+  }
+  // Right
+  let right = 0;
+  {
+    const ref = colRef(width - 1);
+    if (colMatches(width - 1, ref)) {
+      while (right < maxTrimX && colMatches(width - 1 - right, ref)) right++;
+    }
+  }
+
+  // Ignore sub-pixel noise: require at least 2px trimmed somewhere (at
+  // ~120px-high downscale, 2px ≈ a real bar at source resolution).
+  if (top + bottom < 2 && left + right < 2) return null;
+  if (top + bottom < 2) { top = 0; bottom = 0; }
+  if (left + right < 2) { left = 0; right = 0; }
+  if (top === 0 && bottom === 0 && left === 0 && right === 0) return null;
+
+  const sw = width  - left - right;
+  const sh = height - top  - bottom;
+  // Content must remain a meaningful portion of the frame
+  if (sw < width * 0.3 || sh < height * 0.3) return null;
+
+  return { sx: left, sy: top, sw, sh };
+}
+
+/**
+ * Detect and inpaint watermark-like overlays (channel logos, app watermarks)
+ * in the four corners and the center of the frame.
+ *
+ * Heuristic per region: bright, low-saturation pixels (typical of white /
+ * semi-transparent logos) that occupy a small-but-real fraction of the
+ * region box. Only masks when the overlay footprint is plausible (2–40% of
+ * the corner box; tighter 2–18% for the center to avoid nuking faces/skin),
+ * so ordinary bright content is left untouched.
+ */
+export function maskWatermarkRegions(imageData: ImageData): boolean {
+  const { width, height, data } = imageData;
+  if (width < 16 || height < 16) return false;
+
+  const boxW = Math.max(4, Math.floor(width  * 0.18));
+  const boxH = Math.max(4, Math.floor(height * 0.18));
+  const regions: Array<{ x0: number; y0: number; maxFrac: number }> = [
+    { x0: 0,             y0: 0,              maxFrac: 0.40 }, // top-left
+    { x0: width - boxW,  y0: 0,              maxFrac: 0.40 }, // top-right
+    { x0: 0,             y0: height - boxH,  maxFrac: 0.40 }, // bottom-left
+    { x0: width - boxW,  y0: height - boxH,  maxFrac: 0.40 }, // bottom-right
+    {
+      x0: Math.floor((width - boxW) / 2),
+      y0: Math.floor((height - boxH) / 2),
+      maxFrac: 0.18,                                          // center (conservative)
+    },
+  ];
+
+  const mask = new Uint8Array(width * height);
+  let masked = false;
+
+  for (const region of regions) {
+    const boxMask: Array<number> = [];
+    let count = 0;
+    for (let y = region.y0; y < region.y0 + boxH; y++) {
+      for (let x = region.x0; x < region.x0 + boxW; x++) {
+        const idx = (y * width + x) * 4;
+        const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+        const mx = Math.max(r, g, b);
+        const mn = Math.min(r, g, b);
+        // Bright + low saturation = typical white/gray logo overlay
+        if (mx > 195 && (mx - mn) < 45) {
+          boxMask.push(y * width + x);
+          count++;
+        }
+      }
+    }
+    const frac = count / (boxW * boxH);
+    if (frac >= 0.02 && frac <= region.maxFrac) {
+      for (const i of boxMask) mask[i] = 1;
+      masked = true;
+    }
+  }
+
+  if (!masked) return false;
+  const dilated = dilateMask(mask, width, height, 1);
+  inpaintMask(data, width, height, dilated);
+  return true;
+}
+
+/**
+ * Detect and inpaint on-screen text ANYWHERE in the frame (v2).
+ *
+ * v1 limitations fixed here:
+ *  - Only scanned the bottom 25% (startY = 75% height) → Shorts/Reels-style
+ *    center or top captions were never caught. Now scans the FULL frame.
+ *  - Only caught bright white-ish pixels (r>180 && g>180) → black text,
+ *    colored captions, and outlined text were missed. Detection now covers:
+ *      1. Bright white-ish text  (classic subtitles)
+ *      2. Bright saturated text  (yellow / green / cyan / magenta captions)
+ *      3. Dark / outlined text   (near-black pixels with a high-contrast
+ *                                 bright neighbour — text outlines)
+ *
+ * `forceFullPass` now acts as a smarter borderline heuristic: when true, the
+ * minimum-pixel gate is relaxed (4 instead of 8) so borderline subtitle
+ * cases are no longer skipped. When nothing text-like is found the function
+ * returns false without touching the image (no wasted redraw).
+ */
+export function processSubtitles(imageData: ImageData, forceFullPass: boolean): boolean {
+  const { width, height, data } = imageData;
+  const n = width * height;
+
+  // Precompute luminance for contrast checks (dark-outlined text detection)
+  const luma = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const idx = i * 4;
+    luma[i] = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+  }
+
+  const mask = new Uint8Array(n);
+  let textPixelCount = 0;
+
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      if (dilated[y * width + x] === 1) {
-        let sourceY = -1;
-        for (let sy = y - 1; sy >= 0; sy--) {
-          if (dilated[sy * width + x] === 0) {
-            sourceY = sy;
-            break;
-          }
-        }
-        
-        if (sourceY !== -1) {
-          const targetIdx = (y * width + x) * 4;
-          const sourceIdx = (sourceY * width + x) * 4;
-          data[targetIdx] = data[sourceIdx];
-          data[targetIdx + 1] = data[sourceIdx + 1];
-          data[targetIdx + 2] = data[sourceIdx + 2];
-          data[targetIdx + 3] = data[sourceIdx + 3];
-        }
+      const i = y * width + x;
+      const idx = i * 4;
+      const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+      const mx = Math.max(r, g, b);
+      const mn = Math.min(r, g, b);
+
+      let isText = false;
+      // 1. Bright white-ish (classic subtitles)
+      if (r > 170 && g > 170 && b > 140) {
+        isText = true;
+      }
+      // 2. Bright saturated caption colors (yellow, green, cyan, magenta…)
+      else if (mx > 170 && (mx - mn) > 90) {
+        isText = true;
+      }
+      // 3. Dark / outlined text: near-black pixel with a very bright
+      //    immediate neighbour (typical text outline contrast)
+      else if (mx < 45) {
+        const l  = luma[i];
+        const up = y > 0          ? luma[i - width] : l;
+        const dn = y < height - 1 ? luma[i + width] : l;
+        const lf = x > 0          ? luma[i - 1]     : l;
+        const rt = x < width - 1  ? luma[i + 1]     : l;
+        if (Math.max(up, dn, lf, rt) - l > 95) isText = true;
+      }
+
+      if (isText) {
+        mask[i] = 1;
+        textPixelCount++;
       }
     }
   }
-  
+
+  // Plausibility gates: too few pixels = noise, too many = actual bright
+  // scene content (sky, snow, spotlight) — do NOT mask in that case.
+  const minCount = forceFullPass ? 4 : 8;
+  if (textPixelCount < minCount || textPixelCount > n * 0.30) {
+    return false;
+  }
+
+  const dilated = dilateMask(mask, width, height, 2);
+  inpaintMask(data, width, height, dilated);
   return true;
 }
 
@@ -441,7 +673,6 @@ export function computeFingerprint(
   frameIndex: number,
   timestamp: number
 ): FrameFingerprint {
-  const rects = getCropRects(width, height);
   const variants: Record<string, VariantHashes> = {};
   
   const H_down = 120;
@@ -457,20 +688,48 @@ export function computeFingerprint(
   fullDownCtx.fillRect(0, 0, W_down, H_down);
   fullDownCtx.drawImage(ctx.canvas, 0, 0, width, height, 0, 0, W_down, H_down);
   
-  const imgData = fullDownCtx.getImageData(0, 0, W_down, H_down);
-  const changed = processSubtitles(imgData, false);
-  if (changed) {
-    fullDownCtx.putImageData(imgData, 0, 0);
+  // ── 1. Auto black-bar / letterbox / border trim (query-side) ──────────────
+  // Detected on the downscaled frame; when bars are found the content region
+  // becomes the effective frame for all crop variants, so query hashes align
+  // with the original (bar-free) movie hashes without regenerating movie
+  // fingerprints.
+  const downData = fullDownCtx.getImageData(0, 0, W_down, H_down);
+  const bounds = detectContentBounds(downData);
+
+  let workCanvas: OffscreenCanvas = fullDownCanvas;
+  let workCtx = fullDownCtx;
+  let workW = W_down;
+  let workH = H_down;
+  if (bounds) {
+    workCanvas = new OffscreenCanvas(bounds.sw, bounds.sh);
+    const c = workCanvas.getContext('2d', { willReadFrequently: true });
+    if (!c) throw new Error('Failed to get 2d context for content canvas');
+    c.imageSmoothingEnabled = true;
+    c.imageSmoothingQuality = 'high';
+    c.drawImage(fullDownCanvas, bounds.sx, bounds.sy, bounds.sw, bounds.sh, 0, 0, bounds.sw, bounds.sh);
+    workCtx = c;
+    workW = bounds.sw;
+    workH = bounds.sh;
   }
+
+  // ── 2. Text (full-frame) + watermark masking ──────────────────────────────
+  const workData = workCtx.getImageData(0, 0, workW, workH);
+  const subChanged = processSubtitles(workData, true);
+  const wmChanged  = maskWatermarkRegions(workData);
+  if (subChanged || wmChanged) {
+    workCtx.putImageData(workData, 0, 0);
+  }
+  const changed = bounds !== null || subChanged || wmChanged;
+
+  // Crop rects are computed against the effective (trimmed) frame when any
+  // preprocessing ran; otherwise against the original full-res frame.
+  const rects = changed ? getCropRects(workW, workH) : getCropRects(width, height);
   
   const finalCanvas = new OffscreenCanvas(16, 16);
   const finalCtx = finalCanvas.getContext('2d', { willReadFrequently: true });
   if (!finalCtx) throw new Error('Failed to get 2d context for final canvas');
   finalCtx.imageSmoothingEnabled = true;
   finalCtx.imageSmoothingQuality = 'high';
-  
-  const scaleX = W_down / width;
-  const scaleY = H_down / height;
 
   let fullVariantSignature: FrameSignature | undefined;
   
@@ -480,11 +739,8 @@ export function computeFingerprint(
     if (!changed) {
       finalCtx.drawImage(ctx.canvas, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, 16, 16);
     } else {
-      const sx = rect.sx * scaleX;
-      const sy = rect.sy * scaleY;
-      const sw = rect.sw * scaleX;
-      const sh = rect.sh * scaleY;
-      finalCtx.drawImage(fullDownCanvas, sx, sy, sw, sh, 0, 0, 16, 16);
+      // Rects are already in workCanvas coordinates
+      finalCtx.drawImage(workCanvas, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, 16, 16);
     }
     
     const finalImgData = finalCtx.getImageData(0, 0, 16, 16);
