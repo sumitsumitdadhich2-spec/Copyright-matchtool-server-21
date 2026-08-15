@@ -1,0 +1,80 @@
+Main ek Copyright Match Tool ki tarah kaam kar raha hoon. Aapki request ke
+anusar, maine analyze kiya hai ki aapne jo video provide kiya hai usme pehle
+short video (edited) hai aur uske turant baad original movie ki raw footage di
+gayi hai.
+
+Maine 24 fps (frames per second) ke hisab se micro-seconds (milliseconds) level
+par dono videos ke scenes ko match kar diya hai. Har match ki duration bilkul
+same hai.
+
+Yahan aapki required mapping list hai:
+
+Scene 1: Boy running to the bottle on the beach
+
+  - Short video time map: 00:00.000 - 00:01.333
+  - Movie scene map time: 00:01.500 - 00:02.833
+  - (Duration: 1.333 seconds)
+
+Scene 2: Boy closely looking at the bottle
+
+  - Short video time map: 00:01.375 - 00:02.000
+  - Movie scene map time: 00:03.417 - 00:04.042
+  - (Duration: 0.625 seconds)
+
+Scene 3: Boy trying hard to open the bottle cap
+
+  - Short video time map: 00:02.042 - 00:03.958
+  - Movie scene map time: 00:04.875 - 00:06.792
+  - (Duration: 1.916 seconds)
+
+Scene 4: Extreme close-up of bloody hands pulling the cap
+
+  - Short video time map: 00:04.000 - 00:05.958
+  - Movie scene map time: 00:08.750 - 00:10.708
+  - (Duration: 1.958 seconds)
+
+Scene 5: Close-up of the boy's scared face / wide eyes
+
+  - Short video time map: 00:06.000 - 00:07.042
+  - Movie scene map time: 00:11.458 - 00:12.500
+  - (Duration: 1.042 seconds)
+
+Scene 6: Boy throws the bottle away on the sand
+
+  - Short video time map: 00:07.083 - 00:08.250
+  - Movie scene map time: 00:12.667 - 00:13.833
+  - (Duration: 1.167 seconds)
+
+Scene 7: Distant shot of black smoke pouring out
+
+  - Short video time map: 00:08.292 - 00:12.583
+  - Movie scene map time: 00:14.042 - 00:18.333
+  - (Duration: 4.291 seconds)
+
+Scene 8: Boy falling backwards onto the sand in panic
+
+  - Short video time map: 00:12.625 - 00:13.750
+  - Movie scene map time: 00:16.917 - 00:18.042
+  - (Duration: 1.125 seconds)
+
+Scene 9: Quick second shot of the smoke pillar
+
+  - Short video time map: 00:13.792 - 00:14.208
+  - Movie scene map time: 00:19.333 - 00:19.750
+  - (Duration: 0.416 seconds)
+
+Scene 10: Boy sitting on sand, looking up terrified
+
+  - Short video time map: 00:14.250 - 00:15.125
+  - Movie scene map time: 00:22.667 - 00:23.542
+  - (Duration: 0.875 seconds)
+
+Scene 11: The giant monster emerging from the smoke
+
+  - Short video time map: 00:15.167 - 00:17.375
+  - Movie scene map time: 00:36.833 - 00:39.042
+  - (Duration: 2.208 seconds)
+
+(Note: Short video me last clip (00:17.417 se end tak) jisme ek green chehre
+wala monster dikhaya gaya hai, wo original movie footage me majood nahi hai,
+isliye usey map nahi kiya gaya hai.)

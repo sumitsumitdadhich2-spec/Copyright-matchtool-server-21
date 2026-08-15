@@ -1,0 +1,6 @@
+{
+  "name": "Video Copyright Match Tool",
+  "description": "A high-performance video copyright matching tool that computes video fingerprints and performs frame-by-frame verification using IndexedDB and Web Workers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

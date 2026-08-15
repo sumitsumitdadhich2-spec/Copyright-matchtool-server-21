@@ -1,0 +1,324 @@
+/**
+ * Manual, user-triggered "Retry" flow for a single segment in the preview UI.
+ * Purely additive on top of the automatic pipeline — never touches
+ * groundMatchedSegments()/matchVideosFromFiles() decision logic or the main
+ * VLM pass (vlm-segment-resolver.ts). Those stay completely untouched; this
+ * module only consumes their outputs (candidate-recovery.ts's disk-backed
+ * StoredCandidateSet) and reuses the same verification primitives
+ * (vlm-verify.ts) — no second/different similarity-scoring algorithm.
+ *
+ * ONE mode only: verify the segment's already-discovered candidate pool.
+ * Candidates are discovered exactly ONCE — during the main matching pass —
+ * and a Retry click simply verifies the next unchecked candidates from that
+ * pool (embedding-ranked order) until an accept or the pool runs out. Retry
+ * NEVER triggers a new scan of the movie.
+ */
+import { rankCandidatesCropRobust } from './candidate-embedding-rank';
+import { sortIndexesByGreenScore, greenScoreLogTag } from './candidate-green-score';
+import { verifySegmentByVideo, VLM_CONFIDENCE_THRESHOLD, VLM_MAX_ATTEMPTS } from './vlm-verify';
+import { orderCandidatesByMode } from './clip-description';
+import { degenerateCandidateReason } from './degenerate-guard';
+import { denseScanCandidatesForRange, DENSE_SCAN_ENABLED } from './dense-embedding-scan';
+import {
+  StoredCandidateSet,
+  CandidateCheck,
+  readCandidatesFile,
+  writeCandidatesFileSync,
+} from './candidate-recovery';
+
+/**
+ * Hard cap on Gemini verifications a SINGLE Retry click may spend. Once spent
+ * without a genuine accept, the best-so-far candidate is accepted as a
+ * fallback; clicking Retry again starts a fresh budget on the remaining
+ * unchecked pool.
+ */
+const RETRY_MAX_ATTEMPTS = Number(process.env.RETRY_MAX_ATTEMPTS) || VLM_MAX_ATTEMPTS;
+
+export interface RetrySegmentResult {
+  /**
+   *  accepted    — Gemini genuinely confirmed a candidate.
+   *  best_effort — attempts/pool ran out, so the highest-match-likelihood
+   *                candidate checked so far was accepted as a fallback.
+   *  exhausted   — nothing to accept at all (no candidate ever produced a
+   *                usable Gemini score).
+   */
+  outcome: 'accepted' | 'best_effort' | 'exhausted';
+  acceptedCandidateIndex?: number;
+  /** Gemini verifications this click actually spent (<= RETRY_MAX_ATTEMPTS). */
+  attemptsUsed: number;
+}
+
+/** Verify one candidate via the exact same VIDEO-segment Gemini call and
+ *  threshold everything else uses (main pass + deferred recovery): both
+ *  matched segments are CUT out of their source videos and sent to Gemini
+ *  as two real clips in one request — no still frames. Mutates the
+ *  candidate in place. */
+async function checkCandidate(
+  candidate: CandidateCheck,
+  shortVideoPath: string,
+  movieVideoPath: string,
+  logLabel: string,
+): Promise<void> {
+  // Degenerate-candidate guard: a structurally impossible mapping (frozen
+  // matchSequence / near-zero speedRatio) is auto-rejected WITHOUT spending
+  // a Gemini call — the VLM cannot be trusted on these (a visually similar
+  // duplicate scene makes it answer "same" at high confidence).
+  const degenerateReason = degenerateCandidateReason(candidate.segment);
+  if (degenerateReason) {
+    console.log(`[${logLabel}] auto-rejected degenerate candidate: ${degenerateReason}`);
+    candidate.checked = true;
+    candidate.verdict = 'rejected';
+    candidate.matchLikelihood = 0;
+    candidate.evidence = [`Auto-rejected without VLM: ${degenerateReason}`];
+    return;
+  }
+  try {
+    const result = await verifySegmentByVideo(
+      shortVideoPath,
+      movieVideoPath,
+      candidate.segment,
+      logLabel,
+    );
+    candidate.checked = true;
+    if (result === null) {
+      candidate.verdict = 'unverifiable';
+      return;
+    }
+    candidate.confidencePct = result.confidencePct;
+    candidate.matchLikelihood = result.matchLikelihood;
+    candidate.evidence = result.evidence;
+    candidate.verdict =
+      result.same && result.confidencePct >= VLM_CONFIDENCE_THRESHOLD
+        ? 'accepted'
+        : 'rejected';
+  } catch {
+    candidate.checked = true;
+    candidate.verdict = 'unverifiable';
+  }
+}
+
+/**
+ * POOL TOP-UP (last resort, additive only).
+ *
+ * The candidate pool comes from the hash-based matching engine, whose crop
+ * variants only cover 9:16-from-16:9 and 16:9-from-9:16 geometry. A 1:1
+ * square, heavily-zoomed edit of a 16:9 source produces NO usable hash
+ * candidate at all, so the pool for such a segment is either empty or
+ * entirely wrong — and no amount of re-verifying it can ever succeed.
+ *
+ * When (and only when) the pool has no unchecked candidates left, densely
+ * scan the whole movie with aspect-aware crop windows and append whatever it
+ * finds as fresh, unchecked candidates. Every appended candidate still has to
+ * pass the SAME Gemini video verification as everything else — this widens
+ * the search space, it never accepts anything on its own.
+ *
+ * Returns the indexes of the newly appended candidates ([] on any failure).
+ */
+async function topUpPoolWithDenseScan(
+  entry: StoredCandidateSet,
+  segmentIndex: number,
+  shortVideoPath: string,
+  movieVideoPath: string,
+): Promise<number[]> {
+  if (!DENSE_SCAN_ENABLED) return [];
+
+  // Suppress regions the pool already covers so the scan spends its budget on
+  // genuinely new movie timestamps.
+  const excludeMovieTimestamps = entry.candidates.map(c => c.segment.movieStart);
+
+  let fresh;
+  try {
+    fresh = await denseScanCandidatesForRange({
+      shortVideoPath,
+      movieVideoPath,
+      shortStart: entry.shortStart,
+      shortEnd: entry.shortEnd,
+      excludeMovieTimestamps,
+      label: `CandidateRetry seg${segmentIndex}`,
+    });
+  } catch (err: any) {
+    console.log(`[CandidateRetry] seg${segmentIndex}: dense-scan top-up failed (${err?.message || err})`);
+    return [];
+  }
+
+  if (!fresh || fresh.length === 0) {
+    console.log(`[CandidateRetry] seg${segmentIndex}: dense-scan top-up found nothing new`);
+    return [];
+  }
+
+  const appended: number[] = [];
+  for (const segment of fresh) {
+    // Never append a duplicate of a timestamp already in the pool.
+    const duplicate = entry.candidates.some(
+      c => Math.abs(c.segment.movieStart - segment.movieStart) < 1.0,
+    );
+    if (duplicate) continue;
+    entry.candidates.push({ segment, checked: false });
+    appended.push(entry.candidates.length - 1);
+  }
+
+  console.log(
+    `[CandidateRetry] seg${segmentIndex}: dense-scan top-up appended ${appended.length} candidate(s): ` +
+    appended.map(i => `#${i}@${entry.candidates[i].segment.movieStart.toFixed(2)}s`).join(' '),
+  );
+  return appended;
+}
+
+/**
+ * Run one Retry click for a segment: verify the next unchecked candidates
+ * from the already-discovered pool (embedding-ranked first) until a genuine
+ * accept, the pool runs out, or the click's attempt budget is spent. Persists
+ * every state change to disk incrementally (never held in memory beyond this
+ * single call), so history survives a server restart mid-retry.
+ */
+export async function retrySegmentCandidates(
+  uploadDir: string,
+  matchJobId: string,
+  segmentIndex: number,
+  shortVideoPath: string,
+  movieVideoPath: string,
+  _shortResultPath: string,
+  _movieResultPath: string,
+): Promise<RetrySegmentResult> {
+  const loadedEntry = readCandidatesFile(uploadDir, matchJobId, segmentIndex);
+  if (!loadedEntry) throw new Error('No candidate history for this segment');
+  const entry: StoredCandidateSet = loadedEntry;
+
+  let attemptsUsed = 0;
+  let acceptedIdx: number | undefined;
+
+  const persist = () => writeCandidatesFileSync(uploadDir, matchJobId, segmentIndex, entry);
+
+  /** Already-checked candidates are NEVER re-verified — only fresh ones. */
+  let uncheckedIdxs = entry.candidates
+    .map((c, i) => (c.checked ? -1 : i))
+    .filter(i => i !== -1);
+
+  // Pool exhausted: widen the search space with a dense aspect-aware scan
+  // rather than dead-ending. Additive only — appended candidates are still
+  // verified by the same Gemini gate below.
+  if (uncheckedIdxs.length === 0) {
+    console.log(
+      `[CandidateRetry] seg${segmentIndex}: pool exhausted — running dense-scan top-up`,
+    );
+    const appended = await topUpPoolWithDenseScan(
+      entry, segmentIndex, shortVideoPath, movieVideoPath,
+    );
+    if (appended.length > 0) {
+      persist();
+      uncheckedIdxs = appended;
+    }
+  }
+
+  if (uncheckedIdxs.length > 0) {
+    // Mode-aware ranking: when a previously-persisted AI clip profile
+    // auto-selected a ranking signal for this clip (hash / embedding /
+    // combined), candidates are ordered by THAT signal. Without a profile,
+    // the original crop-robust embedding ranking applies unchanged.
+    // Reorders only; on failure (model unavailable etc.) the order is kept.
+    let order = uncheckedIdxs;
+    try {
+      if (entry.recommendedMode) {
+        order = await orderCandidatesByMode(
+          entry.recommendedMode,
+          entry.candidates,
+          uncheckedIdxs,
+          shortVideoPath,
+          movieVideoPath,
+          'CandidateRetry',
+        );
+      } else {
+        const ranked = await rankCandidatesCropRobust(
+          entry.candidates,
+          uncheckedIdxs,
+          shortVideoPath,
+          movieVideoPath,
+          'CandidateRetry',
+        );
+        if (ranked) order = ranked;
+      }
+    } catch { /* ranking is best-effort only */ }
+
+    // GREEN-QUALITY PRIMARY ordering: candidates with more green timeline
+    // frames (similarity >= 80, the UI's own threshold) are verified FIRST.
+    // Stable sort over the ranking above, so the embedding/mode order
+    // survives as the SECONDARY tie-breaker. Ordering only — never a verdict.
+    order = sortIndexesByGreenScore(i => entry.candidates[i]?.segment, order);
+    console.log(
+      `[CandidateRetry] seg${segmentIndex}: green-score verification order: ` +
+      order.map(i => `#${i}(${greenScoreLogTag(entry.candidates[i]?.segment)})`).join(' > ')
+    );
+
+    for (const idx of order) {
+      if (attemptsUsed >= RETRY_MAX_ATTEMPTS) break;
+      attemptsUsed++;
+      await checkCandidate(
+        entry.candidates[idx],
+        shortVideoPath,
+        movieVideoPath,
+        `CandidateRetry seg${segmentIndex}#${attemptsUsed}`,
+      );
+      persist();
+      if (entry.candidates[idx].verdict === 'accepted') {
+        acceptedIdx = idx;
+        break;
+      }
+    }
+  } else {
+    console.log(
+      `[CandidateRetry] seg${segmentIndex}: no unchecked candidates left in the pool and ` +
+      `the dense-scan top-up added none — no more candidates to try`
+    );
+  }
+
+  if (acceptedIdx !== undefined) {
+    // Genuine Gemini accept. Supersede — never delete. The previous
+    // recoveredCandidateIndex simply stops being marked "★ Used"; its entry
+    // stays in `candidates` exactly where it already was.
+    entry.recoveredCandidateIndex = acceptedIdx;
+    entry.bestEffort = false;
+    entry.dropped = false;
+    persist();
+    return { outcome: 'accepted', acceptedCandidateIndex: acceptedIdx, attemptsUsed };
+  }
+
+  // ------------------------------------------------------------------
+  // BEST-EFFORT FALLBACK — pool/attempts ran out without a genuine accept:
+  // accept the candidate with the HIGHEST Gemini-derived match likelihood
+  // across the segment's entire checked history (this click and earlier
+  // ones). Marked bestEffort so the UI can distinguish it; a later genuine
+  // accept clears the flag.
+  // ------------------------------------------------------------------
+  let bestIdx = -1;
+  let bestScore = -1;
+  entry.candidates.forEach((c, i) => {
+    // Never fall back to a structurally impossible candidate, even if an
+    // earlier (pre-guard) run recorded a high VLM likelihood for it.
+    if (degenerateCandidateReason(c.segment)) return;
+    const score =
+      typeof c.matchLikelihood === 'number'
+        ? c.matchLikelihood
+        : typeof c.confidencePct === 'number' && c.verdict
+          ? (c.verdict === 'accepted' ? c.confidencePct : 100 - c.confidencePct)
+          : undefined;
+    if (score !== undefined && score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  });
+
+  if (bestIdx !== -1) {
+    entry.recoveredCandidateIndex = bestIdx;
+    entry.bestEffort = true;
+    entry.dropped = false;
+    persist();
+    console.log(
+      `[CandidateRetry] seg${segmentIndex}: no genuine accept after ${attemptsUsed} attempt(s) — ` +
+      `accepting best-so-far candidate ${bestIdx} (likelihood ${bestScore}) as fallback`
+    );
+    return { outcome: 'best_effort', acceptedCandidateIndex: bestIdx, attemptsUsed };
+  }
+
+  // Nothing ever produced a usable Gemini score (all unverifiable).
+  return { outcome: 'exhausted', attemptsUsed };
+}

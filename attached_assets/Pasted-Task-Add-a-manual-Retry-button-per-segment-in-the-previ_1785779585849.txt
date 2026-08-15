@@ -1,0 +1,172 @@
+Task: Add a manual "Retry" button per segment in the preview UI, with full candidate history
+Context — what already exists (do not rebuild these, reuse them)
+The app already has, from earlier work:
+Batching + cache reset: VLM verification runs in batches of 48 segments
+with a cache-reset call after each batch and at the start of each new video
+pair (server/vlm-verify.ts).
+Background candidate discovery: the moment a segment is rejected during
+the main VLM pass, the app discovers up to 10 alternate movie-location
+candidates for it in the background, without blocking the main pass, and
+persists them to disk (server/candidate-recovery.ts).
+Deferred recovery pass: after the main pass finishes, previously-rejected
+segments are re-examined in original-rejection order, trying their
+discovered candidates one at a time via VLM, until one is accepted or all
+are exhausted. Any recovered segment gets reinserted into the final results
+in correct chronological order.
+Candidate API + preview navigation: GET /api/match/:matchJobId/candidates
+(or per-segment variant) already exposes checked candidates to the frontend,
+and the preview UI already has a segment Next/Previous stepper plus a
+separate candidate Next/Previous stepper (shown only when a segment has
+candidates) with a "Candidate X of Y" indicator and a "★ Used" badge marking
+which one was picked.
+This task builds on top of all of that — it does not replace or duplicate any
+of it.
+What's missing / what to add
+1. Ensure candidates are visible from the start for auto-rejected segments
+Confirm (this may already be working via the existing candidates API/stepper —
+verify, and only fix if broken) that for every segment that was automatically
+rejected during the main pass or deferred pass, its full set of discovered
+candidates — both the ones VLM already checked and rejected, and any that were
+discovered but never got checked (e.g. because an earlier one in the list was
+accepted first) — are visible in the preview UI's candidate stepper without
+requiring the user to click Retry first. This is existing/expected behavior;
+this task's job is to confirm it and make sure the new Retry-generated
+candidates append onto the same visible history rather than replacing it or
+requiring a separate view.
+2. Add a "Retry" button in the segment comparison view
+Directly in the preview UI where the user visually compares a segment's short
+clip against its currently-matched (or best-candidate) movie frame, add a
+"Retry" button. This is a manual, user-triggered action — independent of
+whatever automatic verdict (accepted, rejected, inconclusive) the segment
+currently has. The user clicks this when they visually judge the current match
+to be wrong, regardless of what VLM said.
+3. Retry behavior — first click: search among NOT-yet-checked candidates
+On first click of Retry for a given segment:
+Look at that segment's already-discovered candidate pool (from background
+discovery). Find candidates in that pool that have not yet been checked by
+VLM (i.e., verification was never attempted on them — this is distinct
+from ones that were checked and rejected).
+If unchecked candidates exist, verify them via VLM one at a time (same
+verification call/logic as the existing deferred pass — do not write a new
+verification path) until one is accepted or the unchecked ones are
+exhausted.
+If one is accepted, it becomes the segment's new active match, replacing
+the previous one in the results — but the previous (now-superseded)
+candidate must NOT be deleted from the candidate history; it stays visible
+in the stepper, just no longer marked "★ Used" (the new one gets that badge
+instead).
+If none of the unchecked candidates are accepted (all get checked and
+rejected), the segment remains in its prior state (whatever it was before
+this Retry), and all newly-checked-and-rejected candidates are added to the
+visible candidate history (per point 1) — nothing is hidden or discarded.
+4. Retry behavior — second+ click on the same segment: broader re-search
+If the user clicks Retry again on a segment whose first Retry (per point 3)
+did not find an accepted candidate (i.e., all previously-discovered candidates,
+both original and from the first retry, are now exhausted with no accept):
+Trigger a fresh, broader search of the movie's fingerprint data for that
+short-clip's timestamp range — not limited to the original candidate pool.
+Reuse the existing hash-matching/similarity-scoring logic from
+server/matching-engine.ts (the same approach used for background candidate
+discovery) rather than writing a new algorithm — just run it again with
+either a wider search scope or relaxed similarity threshold to surface
+candidates that weren't found the first time.
+Newly-found candidates from this broader search get verified via VLM the
+same way, and get appended to the same visible candidate history (not a
+separate list) — the user should see the full chronological history of
+every candidate ever considered for this segment, across the original
+discovery, the first Retry, and this broader Retry, all in one place.
+Every subsequent Retry click on this segment repeats this broader-search
+behavior (not just the second click) — once the original pool is
+exhausted, all further retries do a fresh broader search.
+5. UI behavior while a Retry is running
+While a Retry is in progress for a segment:
+Show a loading spinner in place of that segment's result in the preview
+(a single spinning indicator is sufficient — no need for granular
+per-candidate progress).
+The rest of the UI (other segments, the segment Next/Previous stepper, all
+other controls) must remain fully usable and unaffected — a Retry on one
+segment must not block or freeze navigation to or interaction with other
+segments.
+Once the Retry completes (accepted or exhausted), replace the spinner with
+the updated result and refresh the candidate stepper for that segment to
+include the newly-checked candidates.
+6. Persist all candidate data to disk, not memory
+All candidates — original background-discovered ones, first-Retry ones, and
+broader-Retry ones, whether accepted, rejected, or never-checked — must be
+persisted to disk under the job's existing uploads/ storage convention
+(reuse whatever file/naming pattern the existing candidate-recovery feature
+already uses — do not invent a new storage format). This must not accumulate
+in server memory for the life of the job; read from disk when the preview UI
+requests candidate history for a segment, exactly as the existing candidates
+API already does.
+7. New/updated endpoints needed
+POST /api/match/:matchJobId/segment/:segmentId/retry — triggers the Retry
+flow described in points 3-4 for that segment (determines internally
+whether this is a "first retry" — search unchecked pool — or a "further
+retry" — broader search — based on whether unchecked candidates remain).
+Returns immediately with an acknowledgment (the retry runs asynchronously);
+the frontend polls or re-fetches the segment's status/candidates to detect
+completion (reuse whatever polling pattern the existing match-job status
+system already uses, e.g. from the job-based /api/match work — don't
+invent a new transport mechanism).
+Extend the existing candidates-fetching endpoint (or the segment status
+endpoint) to include, for each candidate, whether it has been checked yet
+and its verdict if so (accepted / rejected / not yet checked) — the frontend
+needs this to render the candidate history accurately and to let point 1's
+"not yet checked" candidates be identified.
+Non-negotiable constraints — READ CAREFULLY
+Do not touch automatic matching or automatic VLM verification accuracy in
+any way. Retry is a manual, user-initiated action layered on top of the
+existing automatic pipeline — it must never change:
+The automatic first-pass matching engine's behavior (groundMatchedSegments(),
+scene-chunk detection, pass 1/2/3 logic) — completely untouched.
+The automatic main VLM verification pass's behavior, thresholds, or
+VLM_MAX_ATTEMPTS logic.
+The automatic deferred recovery pass's behavior — Retry is additive to it,
+not a replacement.
+Batching/cache-reset cadence (48-segment batches, reset triggers) — if
+Retry-triggered VLM calls go through the same VLM request layer as
+everything else (including any concurrency limiting/retry-with-backoff work
+from prior tasks), that's fine and expected; just don't change the batching
+logic itself to accommodate Retry specially.
+Also forbidden:
+Do NOT ever delete or hide a previously-checked candidate from the history
+when a new one is accepted — supersede the "★ Used" badge, keep everything
+else visible, exactly as instructed in point 3.
+Do NOT change the visual layout/behavior of the rest of the preview UI
+(existing segment stepper, candidate stepper, other buttons) beyond adding
+the Retry button and its loading-spinner state — "baaki UI vaisa hi rahe."
+Do NOT accumulate candidate data in server memory — disk-backed only, per
+point 6, consistent with the existing candidate-recovery feature's approach.
+Do NOT write a second/different similarity-scoring algorithm for the
+broader re-search in point 4 — reuse the existing matching-engine functions.
+Acceptance criteria
+Open preview for a segment that was auto-rejected with candidates already
+discovered. Confirm its full candidate history (checked and unchecked) is
+visible immediately, without clicking Retry.
+Click Retry on a segment. Confirm: unchecked candidates get verified first;
+if one is accepted, it becomes the new active match and the previous match
+is retained in history (not deleted) with the "★ Used" badge moved to the
+new one.
+Click Retry again on a segment whose first Retry found no accept. Confirm a
+broader fresh search runs (not just re-checking the same exhausted pool),
+and any newly-found candidates append to the same visible history.
+While a Retry runs, confirm the rest of the UI (other segments, navigation)
+remains fully responsive, and the retrying segment shows a spinner until
+done.
+Confirm all candidate data (original, first-retry, and broader-retry) is
+persisted to disk under the job's existing storage convention, and confirm
+via a memory check during a run with several Retries that server RAM does
+not grow proportionally to retry count.
+Confirm zero change to automatic matching engine behavior, automatic VLM
+verification thresholds/logic, automatic deferred-pass behavior, or
+batching/cache-reset cadence — run the existing small-clip baseline test
+(1007/450 frames) and confirm identical output/timing to before this
+change.
+Summary of the one rule that matters most
+Retry is a manual, additive, user-triggered action that never changes
+automatic matching/verification accuracy or logic. It only gives the user a
+way to (1) see every candidate ever considered for a segment, checked or not,
+(2) manually push through the unchecked ones first, then (3) trigger a
+genuinely broader re-search on subsequent clicks — all while preserving full
+history on disk and keeping the rest of the UI untouched and responsive.

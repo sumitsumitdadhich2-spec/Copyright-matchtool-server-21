@@ -1,0 +1,56 @@
+
+Frame at ~0% (Target 0.00s)
+  full: 87.1% match
+  crop_9_16_0: 98.8% match
+  crop_9_16_1: 91.0% match
+  crop_9_16_2: 85.2% match
+  crop_9_16_3: 98.8% match
+  crop_9_16_4: 98.8% match
+
+Frame at ~10% (Target 12.00s)
+  full: 87.5% match
+  crop_9_16_0: 98.8% match
+  crop_9_16_1: 91.4% match
+  crop_9_16_2: 79.3% match
+  crop_9_16_3: 97.3% match
+  crop_9_16_4: 96.9% match
+
+Frame at ~25% (Target 30.00s)
+  full: 85.5% match
+  crop_9_16_0: 98.4% match
+  crop_9_16_1: 91.4% match
+  crop_9_16_2: 92.2% match
+  crop_9_16_3: 98.8% match
+  crop_9_16_4: 96.9% match
+
+Frame at ~50% (Target 60.00s)
+  full: 86.7% match
+    Server:  0001110000000111000111000000011100011110000101110001111100010111...
+    Browser: 0001111100011111000111000001111100011111000111110001111100011111...
+  crop_9_16_0: 98.8% match
+  crop_9_16_1: 91.4% match
+    Server:  1000000000000000011111101111111100111111111111110000000111000000...
+    Browser: 0000000000000000001110000111111100000011011111110000000000000111...
+  crop_9_16_2: 84.0% match
+  crop_9_16_3: 97.7% match
+  crop_9_16_4: 97.7% match
+
+Frame at ~75% (Target 90.00s)
+  full: 85.9% match
+  crop_9_16_0: 98.4% match
+  crop_9_16_1: 91.8% match
+  crop_9_16_2: 94.9% match
+  crop_9_16_3: 98.4% match
+  crop_9_16_4: 96.5% match
+
+Frame at ~90% (Target 108.00s)
+  full: 87.1% match
+  crop_9_16_0: 98.4% match
+  crop_9_16_1: 92.6% match
+  crop_9_16_2: 83.2% match
+  crop_9_16_3: 97.7% match
+  crop_9_16_4: 98.0% match
+
+=== FINAL RESULTS ===
+Average Similarity: 93.15%
+Worst-case Field Similarity: 79.30%

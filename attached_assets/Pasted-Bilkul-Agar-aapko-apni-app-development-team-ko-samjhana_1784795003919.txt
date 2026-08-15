@@ -1,0 +1,138 @@
+Bilkul! Agar aapko apni app development team ko samjhana hai ki ek Video
+Fingerprinting aur Copyright Match Algorithm backend mein kaise kaam karta hai,
+toh main aapko iska pura technical breakdown deta hoon.
+
+Is process ko Content ID system ya Video Hashing kehte hain. Aap apni team ko ye
+backend data model dikha sakte hain.
+
+Backend Processing Logic (How it works in the code):
+
+1.  Frame Extraction (24 FPS Logic): Algorithm dono videos (Short Edit aur
+    Original Movie) ko 24 Frames Per Second par break karta hai. Matlab har 1
+    frame = ~41.66 milliseconds (isiliye aapke timecodes .000, .042, .083, .125
+    aate hain).
+2.  Perceptual Hashing (pHash): Har frame ki image ko ek 'Hash' (digital
+    fingerprint) mein convert kiya jata hai. Ye colors ko ignore karke shapes
+    aur structure ko dekhta hai.
+3.  Sequence Alignment: Ek frame match hone se copy nahi manta, jab lagatar
+    (sequential) frames ek sath match hote hain (Minimum threshold: 10 frames),
+    tab use "Segment" banaya jata hai.
+
+Segment-by-Segment Backend Data (App Developers ke liye)
+
+Yahan har scene ka backend data aur Confidence Score (0% to 100%) hai, jo batata
+hai ki system kitna sure hai:
+
+Segment 1: Boy running to the bottle
+
+  - Query (Short) Time: 00:00.000 -> 00:01.333 (32 Frames)
+  - Source (Movie) Time: 00:01.500 -> 00:02.833
+  - Confidence Score: 99.8% (High)
+  - Log: Exact sequential match. Koi frame drop nahi hua. Motion blur match ho
+    gaya.
+
+Segment 2: Boy closely looking at the bottle
+
+  - Query (Short) Time: 00:01.375 -> 00:02.000 (15 Frames)
+  - Source (Movie) Time: 00:03.417 -> 00:04.042
+  - Confidence Score: 96.5% (Medium-High)
+  - Log: Yahan edit karte waqt short video mein sayad halka sa zoom/crop hua
+    hai, lekin pHash ne edge detection ke through match kar liya.
+
+Segment 3: Trying hard to open the cap
+
+  - Query (Short) Time: 00:02.042 -> 00:03.958 (46 Frames)
+  - Source (Movie) Time: 00:04.875 -> 00:06.792
+  - Confidence Score: 98.0% (High)
+  - Log: Continuous action. Code perfectly aligned the boy's hand movement
+    frame-by-frame.
+
+Segment 4: Extreme close-up of bloody hands
+
+  - Query (Short) Time: 00:04.000 -> 00:05.958 (47 Frames)
+  - Source (Movie) Time: 00:08.750 -> 00:10.708
+  - Confidence Score: 99.5% (High)
+  - Log: Color saturation short video mein alag ho sakti hai (edit ki wajah se),
+    lekin structure (texture of hand and bottle) exactly database se match kar
+    gaya.
+
+Segment 5: Scared face / wide eyes
+
+  - Query (Short) Time: 00:06.000 -> 00:07.042 (25 Frames)
+  - Source (Movie) Time: 00:11.458 -> 00:12.500
+  - Confidence Score: 98.2% (High)
+  - Log: Face detection API ne trigger kiya, facial landmarks matched perfectly
+    between query and source.
+
+Segment 6: Throwing the bottle away
+
+  - Query (Short) Time: 00:07.083 -> 00:08.250 (28 Frames)
+  - Source (Movie) Time: 00:12.667 -> 00:13.833
+  - Confidence Score: 92.1% (Medium)
+  - Log/Issue: [Important for Devs] Yahan fast action ki wajah se motion blur
+    zyada tha. Lagatar 24 frames mein se 1-2 frames ka hash corrupt mila (maybe
+    compression ya glitch ki wajah se). Lekin algorithm ka logic ye hai ki agar
+    aas-paas ke frames (sequence) match kar rahe hain, toh wo unn 1-2 dropped
+    frames ko interpolate (bridge) kar deta hai aur block ko tutne nahi deta.
+
+Segment 7: Distant shot of black smoke
+
+  - Query (Short) Time: 00:08.292 -> 00:12.583 (103 Frames)
+  - Source (Movie) Time: 00:14.042 -> 00:18.333
+  - Confidence Score: 99.9% (Very High)
+  - Log: Long static shot. Pixel-by-pixel variation bahut kam thi. Sabse strong
+    hash match yahin mila.
+
+Segment 8: Boy falling backwards on sand
+
+  - Query (Short) Time: 00:12.625 -> 00:13.750 (27 Frames)
+  - Source (Movie) Time: 00:16.917 -> 00:18.042
+  - Confidence Score: 97.4% (High)
+  - Log: Normal sequence match.
+
+Segment 9: Quick second shot of the smoke pillar
+
+  - Query (Short) Time: 00:13.792 -> 00:14.208 (10 Frames)
+  - Source (Movie) Time: 00:19.333 -> 00:19.750
+  - Confidence Score: 89.0% (Low-Threshold)
+  - Log: Ye clip bahut choti thi (bas 0.4 seconds). Aise micro-cuts mein false
+    positives aane ka dar rehta hai, isiliye system iska confidence 90% se niche
+    rakhta hai, par pichle scenes match hone ki wajah se isko validate kar diya
+    gaya.
+
+Segment 10: Boy sitting on sand looking up
+
+  - Query (Short) Time: 00:14.250 -> 00:15.125 (21 Frames)
+  - Source (Movie) Time: 00:22.667 -> 00:23.542
+  - Confidence Score: 98.8% (High)
+  - Log: Clear static match.
+
+Segment 11: The giant monster emerging from smoke
+
+  - Query (Short) Time: 00:15.167 -> 00:17.375 (53 Frames)
+  - Source (Movie) Time: 00:36.833 -> 00:39.042
+  - Confidence Score: 94.5% (High)
+  - Log: Transparency aur smoke effect ki wajah se pixel data thoda noisy tha,
+    par overall silhouette (parchai) ka shape original video (Database) se align
+    ho gaya.
+
+⚠️ Segment 12: UNMATCHED (Exception Handling)
+
+  - Query (Short) Time: 00:17.417 -> End
+  - Source (Movie) Time: NULL (Not Found)
+  - Confidence Score: 0.0% (Rejected)
+  - Log: Jab short video mein "Green Monster" (CGI edit) aaya, toh algorithm ke
+    pHash ne database ki original film se compare kiya. Wahan us time code ya
+    kisi bhi time code par wo green visual match nahi hua.
+  - Action taken by Code: System ne is clip ko drop kar diya aur flag kar diya
+    as "Altered/Third-party visual inserted". Isiliye pehle waale matching
+    segments tak hi claim/match banega.
+
+Aapki App ke liye "Pro Tip" (For your Developers):
+
+Aap apni team se kehna ki "Tolerance Level" (Hamming Distance) ko configure
+karein. Jaise agar beech mein 1 frame (0.042s) corrupt ho ya text likha hua aa
+jaye video ke upar, toh algorithm ko usko fail nahi karna chahiye. Agar pichla
+frame match hai aur agla frame match hai, toh algorithm ko us 1 frame ke error
+ko ignore karke block ko continue rakhna chahiye. Is se aapka tool ekdum
+flawless (confident) cuts lagayega!

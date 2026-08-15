@@ -1,0 +1,35 @@
+# Dependencies (reinstalled during build)
+node_modules/
+server/node_modules/
+
+# Build output
+dist/
+
+# Version control
+.git/
+.gitignore
+
+# Test / dev videos and large data files
+*.mp4
+browser_fps_*.json
+server_fps_*.json
+upload_resp.json
+compare_output.txt
+
+# Runtime upload storage (mounted at runtime, not baked in)
+uploads/
+
+# Test scripts
+test_*.mjs
+test_e2e_*.mjs
+find_best_match.mjs
+compare.mjs
+check_errors.mjs
+
+# Replit-specific
+.replit
+.local/
+attached_assets/
+
+# Misc
+.cache/

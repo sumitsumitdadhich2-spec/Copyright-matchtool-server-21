@@ -1,0 +1,32 @@
+ while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write     npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp ERR! error while extracting tarball TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+npm error gyp WARN install got an error, rolling back install
+npm error gyp ERR! configure error
+npm error gyp ERR! stack Error: There was a fatal problem while downloading/extracting the tarball
+npm error gyp ERR! stack at go (/usr/local/lib/node_modules/npm/node_modules/node-gyp/lib/install.js:254:17)
+npm error gyp ERR! stack at process.processTicksAndRejections (node:internal/process/task_queues:95:5)       npm error gyp ERR! stack at async install (/usr/local/lib/node_modules/npm/node_modules/node-gyp/lib/install.js:63:18)                                                                                                    npm error gyp ERR! stack at async getNodeDir (/usr/local/lib/node_modules/npm/node_modules/node-gyp/lib/configure.js:79:7)
+npm error gyp ERR! stack at async run (/usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js:81:18)
+npm error gyp ERR! System Linux 6.17.0-1017-aws
+npm error gyp ERR! command "/usr/local/bin/node" "/usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" "rebuild"
+npm error gyp ERR! cwd /app/server/node_modules/canvas
+npm error gyp ERR! node -v v20.20.2
+npm error gyp ERR! node-gyp -v v10.1.0
+npm error gyp ERR! not ok
+npm error A complete log of this run can be found in: /root/.npm/_logs/2026-07-22T08_47_57_499Z-debug-0.log
+The command '/bin/sh -c cd server && npm install && cd .. && npm rebuild canvas' returned a non-zero code: 1
+ERROR: Service 'app' failed to build : Build failed
+ubuntu@ip-172-31-15-11:~/Copyrightn-matchool-server-4$

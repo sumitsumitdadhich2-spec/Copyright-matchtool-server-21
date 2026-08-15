@@ -1,0 +1,45 @@
+modules = ["nodejs-20", "web"]
+
+[nix]
+channel = "stable-25_05"
+
+[agent]
+expertMode = true
+
+[workflows]
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PORT=5000 npm run dev"
+waitForPort = 5000
+
+[[ports]]
+localPort = 3000
+externalPort = 5000
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[[ports]]
+localPort = 5001
+externalPort = 4200
+
+[[ports]]
+localPort = 5050
+externalPort = 3002
+
+[[ports]]
+localPort = 8098
+externalPort = 3001
+
+[[ports]]
+localPort = 24678
+externalPort = 3000
