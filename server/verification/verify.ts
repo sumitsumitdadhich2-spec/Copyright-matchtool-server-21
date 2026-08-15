@@ -67,6 +67,23 @@ const RANKING_ENABLED = process.env.VERIFY_RANKING_ENABLED !== '0';
 const RANK_SPAN_WEIGHT = clampNum(process.env.VERIFY_RANK_SPAN_WEIGHT, 10, 0, 100);
 const RANK_FRAMES_WEIGHT = clampNum(process.env.VERIFY_RANK_FRAMES_WEIGHT, 10, 0, 100);
 const RANK_TIMELINE_WEIGHT = clampNum(process.env.VERIFY_RANK_TIMELINE_WEIGHT, 15, 0, 100);
+/** Hard hash-confidence floor for CANDIDATES (alternates only — the engine's
+ *  own pick from the main matching system is never filtered here). Alternates
+ *  below this % are not offered as candidates at all. The candidate pool this
+ *  filter sweeps is the engine's full-movie, all-variant pre-dedup scan, so
+ *  filtering the whole pool IS the exhaustive "recheck the entire reference
+ *  movie in every variant" for >= this confidence. */
+const MIN_CANDIDATE_HASH = clampNum(process.env.VERIFY_MIN_CANDIDATE_HASH, 80, 0, 100);
+/** Fallback floor: when NO alternate reaches MIN_CANDIDATE_HASH anywhere in
+ *  the pool, alternates strictly above this % are still offered so Gemini VLM
+ *  can verify them — one of those may be the real match. Below this they are
+ *  dropped unconditionally. */
+const FALLBACK_CANDIDATE_HASH = clampNum(process.env.VERIFY_FALLBACK_CANDIDATE_HASH, 78, 0, 100);
+/** Tiny-fluke guard: an alternate whose speed-corrected movie span covers less
+ *  than this fraction of the short range's span is a fluke (e.g. a 0.24s
+ *  movie sliver "matching" a 2.12s clip) and is dropped from the candidate
+ *  list. Applies to alternates only, never the engine pick. */
+const MIN_SPAN_RATIO = clampNum(process.env.VERIFY_MIN_SPAN_RATIO, 0.3, 0, 1);
 /** Ranges verified in parallel. Gemini's own RPM pacing lives in gemini-vlm.ts. */
 const CONCURRENCY = clampInt(process.env.VERIFY_CONCURRENCY, 2, 1, 8);
 /** A verdict below this confidence is not trusted either way. */
@@ -268,8 +285,8 @@ async function verifyOneRange(
   neighbors: MatchedSegment[],
   videoMeta: VerificationRecord['videoMetadata'],
   /** When true (manual Retry), EVERY candidate is verified — no first-accept
-   *  early stop — and the accepted candidate with the highest Gemini
-   *  confidence wins. The bulk pass keeps first-accept-wins to save quota. */
+   *  early stop. Among all Gemini-accepted candidates the one with the highest
+   *  HASH confidence wins (same rule as the bulk pass). */
   checkAll = false,
 ): Promise<RangeOutcome> {
   const candidates = collectCandidates(primary, req.candidatePool, neighbors);
@@ -415,7 +432,8 @@ async function verifyOneRange(
           continue;
         }
         // checkAll (manual Retry): keep verifying the remaining candidates so
-        // the best-confidence match wins, not just the first acceptable one.
+        // the highest-hash-confidence accepted match wins, not just the first
+        // acceptable one.
         continue;
       }
 
@@ -434,24 +452,19 @@ async function verifyOneRange(
     deleteClip(shortClip);
   }
 
-  // Winner selection among accepted candidates:
-  //   - bulk pass: the highest HASH confidence wins (that is the whole point of
-  //     still checking higher-hash candidates after a first accept), Gemini
-  //     confidence breaks ties, then the earlier/higher-ranked candidate.
-  //   - checkAll (manual Retry): the highest Gemini confidence wins, hash
-  //     confidence breaks ties, then the earlier/higher-ranked candidate.
+  // Winner selection among accepted candidates — both the bulk pass AND the
+  // manual Retry (checkAll): when Gemini accepts more than one candidate, the
+  // highest HASH confidence wins. Gemini confidence breaks ties, then the
+  // earlier/higher-ranked candidate. This is the whole point of still checking
+  // higher-hash candidates after a first accept.
   const acceptedEntries = record.candidates
     .map((c, i) => ({ c, i }))
     .filter(x => x.c.verdict === 'accepted');
   if (acceptedEntries.length > 0) {
     acceptedEntries.sort((a, b) =>
-      checkAll
-        ? (b.c.confidencePct ?? 0) - (a.c.confidencePct ?? 0) ||
-          (b.c.hashConfidence ?? 0) - (a.c.hashConfidence ?? 0) ||
-          a.i - b.i
-        : (b.c.hashConfidence ?? 0) - (a.c.hashConfidence ?? 0) ||
-          (b.c.confidencePct ?? 0) - (a.c.confidencePct ?? 0) ||
-          a.i - b.i,
+      (b.c.hashConfidence ?? 0) - (a.c.hashConfidence ?? 0) ||
+      (b.c.confidencePct ?? 0) - (a.c.confidencePct ?? 0) ||
+      a.i - b.i,
     );
     const winnerIdx = acceptedEntries[0].i;
     record.usedCandidateIndex = winnerIdx;
@@ -522,13 +535,45 @@ function collectCandidates(
   const out: RankedCandidate[] = [{ segment: primary }];
   if (MAX_ALTERNATES === 0) return out;
 
-  const alternates = getAlternateCandidatesForRange(
+  // The pool is the engine's full-movie, all-variant pre-dedup scan, so the
+  // filtering below sweeps every candidate the exhaustive scan ever produced
+  // for this range — the "recheck the whole reference movie in every variant"
+  // happens by filtering the complete pool, not by re-running the scan.
+  const rawAlternates = getAlternateCandidatesForRange(
     pool,
     primary.shortStart,
     primary.shortEnd,
     [],
     0.5,
   );
+
+  // 1. Tiny-fluke guard: a candidate whose speed-corrected movie span covers
+  //    only a sliver of the short range (e.g. 0.24s vs a 2.12s clip) is a
+  //    hash fluke, not a real match — drop it outright.
+  const shortSpan = Math.max(0, primary.shortEnd - primary.shortStart);
+  const solid = rawAlternates.filter(
+    a => speedCorrectedSpanRatio(a, shortSpan) >= MIN_SPAN_RATIO,
+  );
+
+  // 2. Hash-confidence floor: only alternates >= MIN_CANDIDATE_HASH% become
+  //    candidates. If the entire pool has none, fall back to alternates
+  //    strictly above FALLBACK_CANDIDATE_HASH% so Gemini VLM can still verify
+  //    them — one of those may be the real match. Anything lower is dropped.
+  const strong = solid.filter(a => a.confidence >= MIN_CANDIDATE_HASH);
+  const alternates = strong.length > 0
+    ? strong
+    : solid.filter(a => a.confidence > FALLBACK_CANDIDATE_HASH);
+
+  if (rawAlternates.length !== alternates.length) {
+    console.log(
+      `[Verify] Candidate filter for clip ${fmt(primary.shortStart)}s–${fmt(primary.shortEnd)}s: ` +
+      `${rawAlternates.length} raw alternate(s) → ${solid.length} after tiny-span guard ` +
+      `(min ratio ${MIN_SPAN_RATIO}) → ${alternates.length} after hash floor ` +
+      `(${strong.length > 0
+        ? `>= ${MIN_CANDIDATE_HASH}%`
+        : `no alternate >= ${MIN_CANDIDATE_HASH}% in the whole pool — fallback > ${FALLBACK_CANDIDATE_HASH}% for Gemini verification`}).`,
+    );
+  }
 
   const ordered = RANKING_ENABLED
     ? rankAlternates(alternates, primary, neighbors)
@@ -540,6 +585,19 @@ function collectCandidates(
     out.push(alt);
   }
   return out;
+}
+
+/** How well a candidate's movie span covers the short range's span after
+ *  correcting for the candidate's own playback speed. 1 = perfect coverage,
+ *  0.11 = the 0.24s-sliver-vs-2.12s-clip fluke case. */
+function speedCorrectedSpanRatio(segment: MatchedSegment, shortSpan: number): number {
+  const speed = Number.isFinite(segment.speedRatio) && segment.speedRatio > 0
+    ? segment.speedRatio
+    : 1;
+  const expectedSpan = shortSpan * speed;
+  const actualSpan = Math.max(0, segment.movieEnd - segment.movieStart);
+  if (expectedSpan <= 0 || actualSpan <= 0) return 0;
+  return Math.min(expectedSpan, actualSpan) / Math.max(expectedSpan, actualSpan);
 }
 
 /**
@@ -606,13 +664,15 @@ function rankAlternates(
     };
   });
 
-  // Primary order: rank score. Secondary order: raw hash confidence — when
-  // rank scores tie (or are effectively equal), the candidate the hash search
-  // itself believed in more gets asked first.
+  // Primary order: raw HASH confidence — the highest-hash candidates are
+  // always shown/asked first. Secondary order: the Task 5 rank score (span,
+  // frame support, timeline consistency), which still breaks ties between
+  // candidates the hash search believed in equally. Nothing was removed from
+  // the rank signals; hash-first ordering was added on top.
   ranked.sort(
     (a, b) =>
-      (b.rankScore ?? 0) - (a.rankScore ?? 0) ||
-      b.segment.confidence - a.segment.confidence,
+      b.segment.confidence - a.segment.confidence ||
+      (b.rankScore ?? 0) - (a.rankScore ?? 0),
   );
   return ranked;
 }
@@ -663,8 +723,8 @@ export interface RecheckResult {
  * Re-run verification for exactly one range and overwrite its record.
  * Same code path as the bulk pass, with one deliberate difference: Retry
  * verifies EVERY candidate (no first-accept early stop) and picks the
- * highest-confidence accepted candidate. It also never checks the daily
- * quota gate — a manual Retry always attempts the full check.
+ * accepted candidate with the highest HASH confidence. It also never checks
+ * the daily quota gate — a manual Retry always attempts the full check.
  */
 export async function recheckSegment(req: RecheckRequest): Promise<RecheckResult> {
   if (!req.shortVideoPath || !req.movieVideoPath || !geminiConfigured()) {
@@ -688,8 +748,8 @@ export async function recheckSegment(req: RecheckRequest): Promise<RecheckResult
 
   console.log(`[Verify] Manual re-check requested for range ${req.segmentIndex}.`);
   req.onLog?.(
-    `Retry started — full check mode: every candidate gets its own Gemini verification, ` +
-    `the highest-confidence accepted candidate wins.`,
+    `Retry started — full check mode: every candidate gets its own Gemini verification; ` +
+    `among accepted candidates the highest HASH confidence wins.`,
   );
 
   const outcome = await verifyOneRange(
@@ -709,8 +769,8 @@ export async function recheckSegment(req: RecheckRequest): Promise<RecheckResult
     [],
     loadVideoMetaForRecords(req.uploadDir, req.matchJobId),
     // Manual Retry always runs the FULL check: every candidate is verified
-    // (up to one Gemini call each) and the highest-confidence accepted
-    // candidate wins. This is a deliberate quota trade-off the user chose.
+    // (up to one Gemini call each) and the accepted candidate with the
+    // highest HASH confidence wins. A deliberate quota trade-off.
     true,
   );
 
