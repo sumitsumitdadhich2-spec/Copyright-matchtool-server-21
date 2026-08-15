@@ -15,6 +15,9 @@ import * as http from 'http';
 import { createServer as createViteServer } from 'vite';
 import { extractFingerprints, NUM_WORKERS } from './server/pipeline';
 import { matchVideosFromFiles } from './server/matching-engine';
+// Task 1 (FPS-aware alt pipeline): ffprobe metadata per match job, saved
+// durably like verify records. Never read by the protected matching engine.
+import { probeVideoMetadata, saveMatchVideoMetadata } from './server/video-metadata';
 import { getGeminiStatus, geminiConfigured } from './server/gemini-vlm';
 import {
   verifyMatchedSegments,
@@ -1226,6 +1229,29 @@ async function startServer() {
 
     (async () => {
       try {
+        // Task 1 (FPS-aware alt pipeline): probe fps/VFR/duration for both
+        // videos with ffprobe and persist it durably alongside the job, like
+        // verify records. Best-effort and fully non-fatal — probeVideoMetadata
+        // never throws, and a missing video file simply records null.
+        try {
+          const shortVideoForMeta = getVideoPathForJob(shortJobId);
+          const movieVideoForMeta = getVideoPathForJob(movieJobId);
+          const [shortProbe, movieProbe] = await Promise.all([
+            shortVideoForMeta ? probeVideoMetadata(shortVideoForMeta) : Promise.resolve(null),
+            movieVideoForMeta ? probeVideoMetadata(movieVideoForMeta) : Promise.resolve(null),
+          ]);
+          await saveMatchVideoMetadata(uploadDir, matchJobId, { short: shortProbe, movie: movieProbe });
+          if (shortProbe || movieProbe) {
+            console.log(
+              `[Match ${matchJobId}] Video metadata: short fps=${shortProbe?.averageFps?.toFixed(2) ?? 'n/a'}` +
+              `${shortProbe?.isVFR ? ' (VFR)' : ''}, movie fps=${movieProbe?.averageFps?.toFixed(2) ?? 'n/a'}` +
+              `${movieProbe?.isVFR ? ' (VFR)' : ''}.`,
+            );
+          }
+        } catch (metaErr: any) {
+          console.warn(`[Match ${matchJobId}] Video metadata probe failed (non-fatal): ${metaErr?.message || metaErr}`);
+        }
+
         // matchVideosFromFiles streams both files line-by-line and converts hash
         // strings directly into flat TypedArrays — never loads the full JSON into
         // memory.  Peak RAM drops from ~7 GB to ~400 MB for a 2-hour movie.
@@ -1379,6 +1405,9 @@ async function startServer() {
     if (fs.existsSync(mp)) { try { fs.unlinkSync(mp); deleted = true; } catch { /* ignore */ } }
     if (fs.existsSync(rp)) { try { fs.unlinkSync(rp); } catch { /* ignore */ } }
     deleteRecordsForJob(uploadDir, matchJobId);
+    // Task 1 video-metadata file — cleaned up with the rest of the job.
+    const vmPath = path.join(uploadDir, `${matchJobId}_videometa.json`);
+    if (fs.existsSync(vmPath)) { try { fs.unlinkSync(vmPath); } catch { /* ignore */ } }
 
     matchJobs.delete(matchJobId);
     matchJobCancelFns.delete(matchJobId);

@@ -1219,6 +1219,25 @@ function acceptSegment(
  * speedRatio/movieStart/movieEnd now come from acceptSegment's regression
  * over the full walked sequence, same as any Pass 1/2/3 segment.
  */
+/**
+ * Median seconds-per-frame of a sampled timestamp grid — ALT-POOL USE ONLY.
+ * Feeds altDedupSeparationFrames (ALT_DEDUP_SECONDS, Task 1) so alt-candidate
+ * dedup separation is expressed in seconds and converted to frames per
+ * source, instead of a hard-coded 50-frame constant. Never read by Pass 1/2/3.
+ */
+function altFrameDuration(fps: Array<{ timestamp: number }>): number {
+  if (fps.length < 2) return 0;
+  const n = Math.min(fps.length - 1, 200);
+  const deltas: number[] = [];
+  for (let i = 1; i <= n; i++) {
+    const d = fps[i].timestamp - fps[i - 1].timestamp;
+    if (d > 0) deltas.push(d);
+  }
+  if (deltas.length === 0) return 0;
+  deltas.sort((a, b) => a - b);
+  return deltas[Math.floor(deltas.length / 2)];
+}
+
 function buildAltCandidate(
   sSet: PreSet,
   mSet: PreSet,
@@ -1256,9 +1275,13 @@ function buildAltCandidatesForChunk(
 ): MatchedSegment[] {
   if (raw.length === 0) return [];
   const sorted = [...raw].sort((a, b) => b.sim - a.sim);
+  // Seconds-based dedup separation (Task 1): ALT_DEDUP_SECONDS converted to
+  // frames for this source's grid. Default reproduces SEED_SEPARATION (50
+  // frames @ 25fps) exactly, so behavior is unchanged until the env is set.
+  const sepFrames = altDedupSeparationFrames(altFrameDuration(shortFps), SEED_SEPARATION);
   const deduped: AlignedCand[] = [];
   for (const c of sorted) {
-    if (deduped.some(d => Math.abs(d.offset - c.offset) < SEED_SEPARATION)) continue;
+    if (deduped.some(d => Math.abs(d.offset - c.offset) < sepFrames)) continue;
     deduped.push(c);
     if (deduped.length >= ALT_CANDIDATES_PER_CHUNK) break;
   }
@@ -1324,9 +1347,12 @@ async function buildAltCandidatesForChunkWindowed(
 ): Promise<MatchedSegment[]> {
   if (raw.length === 0) return [];
   const sorted = [...raw].sort((a, b) => b.sim - a.sim);
+  // Seconds-based dedup separation (Task 1) — same conversion as the
+  // in-memory path; default is behavior-identical to SEED_SEPARATION.
+  const sepFrames = altDedupSeparationFrames(altFrameDuration(shortSet.fps), SEED_SEPARATION);
   const deduped: AlignedCand[] = [];
   for (const c of sorted) {
-    if (deduped.some(d => Math.abs(d.offset - c.offset) < SEED_SEPARATION)) continue;
+    if (deduped.some(d => Math.abs(d.offset - c.offset) < sepFrames)) continue;
     deduped.push(c);
     if (deduped.length >= ALT_CANDIDATES_PER_CHUNK) break;
   }
@@ -1827,7 +1853,40 @@ export async function groundMatchedSegments(
 
   console.log(`[Matcher] Final: ${validated.length} segment(s), ${unmatchedRanges.length} unmatched range(s).`);
   console.log(`[Matcher] VLM fallback pool: ${altCandidatePool.length} alternate candidate(s) across ${chunks.length} chunk(s).`);
-  return { segments: validated, unmatchedRanges, candidatePool: [...preDedup, ...altCandidatePool] };
+
+  // ------------------------------------------------------------------
+  // Alt-candidate expansion post-pass (Tasks 2-4) — STRICTLY ADDITIVE.
+  // Runs after everything above is final; reads the accepted segments as
+  // anchors and only APPENDS extra candidates to candidatePool. It can
+  // never change `segments` or `unmatchedRanges`.
+  // ------------------------------------------------------------------
+  const expansionCandidates = await expandAltCandidates({
+    shortFps,
+    movieFps,
+    chunks,
+    acceptedSegments: validated,
+    scanWindow: async (sis, loMi, hiMi, minSim) => {
+      const pts: ScanPoint[] = [];
+      for (const si of sis) {
+        const yp = yieldIfNeeded(si);
+        if (yp) await yp;
+        for (let mi = loMi; mi <= hiMi; mi++) {
+          const s = hashSimFastCross(sSet, si, mSet, mi);
+          if (s >= minSim) pts.push({ si, mi, sim: s });
+        }
+      }
+      return pts;
+    },
+    buildCandidate: async (cs, ce, offsetFrames) =>
+      buildAltCandidate(sSet, mSet, shortFps, movieFps, cs, ce, offsetFrames, frameDrift),
+    logTag: '[Matcher]',
+  });
+
+  return {
+    segments: validated,
+    unmatchedRanges,
+    candidatePool: [...preDedup, ...altCandidatePool, ...expansionCandidates],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -2520,10 +2579,47 @@ async function groundMatchedSegmentsChunked(
   }
 
   console.log(`[MatchChunked] Final: ${validated.length} segment(s).`);
+
+  // ------------------------------------------------------------------
+  // Alt-candidate expansion post-pass (Tasks 2-4) — STRICTLY ADDITIVE.
+  // Same contract as the in-memory path: reads accepted segments as
+  // anchors, only APPENDS to candidatePool. The relaxed window scan loads
+  // just the [loMi, hiMi] movie slice via loadMovieWindowPreset, keeping
+  // this path's low-RAM guarantee.
+  // ------------------------------------------------------------------
+  const expansionCandidates = await expandAltCandidates({
+    shortFps,
+    movieFps: movieMetaFps,
+    chunks,
+    acceptedSegments: validated,
+    scanWindow: async (sis, loMi, hiMi, minSim) => {
+      const pts: ScanPoint[] = [];
+      try {
+        const winSet = await loadMovieWindowPreset(movieFilePath, byteOffsets, loMi, hiMi, meta);
+        for (const si of sis) {
+          for (let mi = loMi; mi <= hiMi; mi++) {
+            const s = hashSimFastCross(shortSet, si, winSet, mi - loMi);
+            if (s >= minSim) pts.push({ si, mi, sim: s });
+          }
+        }
+      } catch (e: any) {
+        console.warn(`[MatchChunked] Expansion window scan failed (non-fatal): ${e?.message || e}`);
+        return [];
+      }
+      return pts;
+    },
+    buildCandidate: (cs, ce, offsetFrames) =>
+      buildAltCandidateChunked(
+        shortSet, movieFilePath, byteOffsets, movieMetaFps, meta,
+        cs, ce, offsetFrames, frameDrift, WALK_WINDOW,
+      ),
+    logTag: '[MatchChunked]',
+  });
+
   return {
     segments: validated,
     unmatchedRanges: computeUnmatched(shortFps, usedFinal),
-    candidatePool: [...merged, ...altCandidatePool],
+    candidatePool: [...merged, ...altCandidatePool, ...expansionCandidates],
   };
 }
 
