@@ -21,7 +21,6 @@ import { probeVideoMetadata, saveMatchVideoMetadata } from './server/video-metad
 import { getGeminiStatus, geminiConfigured } from './server/gemini-vlm';
 import {
   verifyMatchedSegments,
-  recheckSegment,
   readRecord,
   readAllRecords,
   deleteRecordsForJob,
@@ -29,6 +28,10 @@ import {
   flagTimelineOutliers,
   type VerifySummary,
 } from './server/verification';
+// The manual Retry endpoints (segment Retry + gap Retry) run on their OWN
+// standalone copy of the verification system (server/retry-verification/),
+// so future Retry-only changes never affect the bulk matching pass above.
+import { recheckSegment } from './server/retry-verification';
 
 // ── Process-level safety net ────────────────────────────────────────────────
 // Long background jobs (2-hour-movie fingerprinting/matching) touch a huge
@@ -1528,10 +1531,11 @@ async function startServer() {
     res.json({ matchJobId, retries });
   });
 
-  // 6j. Manual per-segment Re-check — a user-triggered action that re-runs the
-  // exact same verification code path (server/verification/verify.ts →
-  // recheckSegment) for ONE range and overwrites its record. Never touches
-  // the matching engine. Returns immediately; the frontend polls the
+  // 6j. Manual per-segment Re-check — a user-triggered action that runs the
+  // STANDALONE retry verification system (server/retry-verification/verify.ts
+  // → recheckSegment, an exact copy of the bulk system) for ONE range and
+  // overwrites its record. Never touches the matching engine or the bulk
+  // verification system. Returns immediately; the frontend polls the
   // candidates endpoints above (which include a `retrying` flag) to detect
   // completion, reusing the same fetch-and-poll pattern the rest of the app
   // already uses.
@@ -1659,8 +1663,9 @@ async function startServer() {
   });
 
   // 6j-bis. Manual Retry for an UNMATCHED gap — searches the persisted engine
-  // candidate pool for candidates overlapping the gap and runs the exact same
-  // full-check verification (recheckSegment) on them. On acceptance the new
+  // candidate pool for candidates overlapping the gap and runs the standalone
+  // retry system's full-check verification (server/retry-verification/ →
+  // recheckSegment) on them. On acceptance the new
   // segment is added to the timeline and the gap is shrunk/removed. Never
   // touches the matching engine. Same fire-and-poll shape as the segment
   // Retry above; progress is watched via /retry-status (key `gap:<start>`).
