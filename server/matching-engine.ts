@@ -269,6 +269,150 @@ function passesStrictGate(
   return seg.confidence >= STRICT_MIN_CONF && strictSpanOk(seg.shortStart, seg.shortEnd, clipDuration);
 }
 
+/**
+ * Effective duration for the tiny-span check of a segment: the duration of
+ * the scene chunk containing the segment's midpoint (capped at the full clip
+ * duration). Using the chunk — not the whole clip — keeps the rule fair for
+ * multi-scene compilations where one genuine segment can only ever cover its
+ * own scene, while still rejecting 0.2s flukes against a 2s scene.
+ */
+function strictEffectiveDuration(
+  shortStart: number,
+  shortEnd: number,
+  chunks: Array<{ start: number; end: number }>,
+  shortFps: FPData[],
+): number {
+  const clipDuration = shortFps.length > 1
+    ? shortFps[shortFps.length - 1].timestamp - shortFps[0].timestamp
+    : 0;
+  const mid = (shortStart + shortEnd) / 2;
+  for (const c of chunks) {
+    const cs = shortFps[c.start].timestamp;
+    const ce = shortFps[c.end].timestamp;
+    if (mid >= cs - 1e-6 && mid <= ce + 1e-6) {
+      return Math.min(clipDuration, ce - cs);
+    }
+  }
+  return clipDuration;
+}
+
+/** Strict gate for a finished MatchedSegment, chunk-aware span check. */
+function segPassesStrictGate(
+  seg: MatchedSegment,
+  chunks: Array<{ start: number; end: number }>,
+  shortFps: FPData[],
+): boolean {
+  return passesStrictGate(seg, strictEffectiveDuration(seg.shortStart, seg.shortEnd, chunks, shortFps));
+}
+
+/**
+ * Exhaustive retry search for one scene chunk (in-memory path).
+ *
+ * Called only when Passes 1 & 2 produced no ≥ STRICT_MIN_CONF segment for the
+ * chunk. Each retry pass (1..MAX_EXHAUSTIVE_PASSES):
+ *  - re-scans the ENTIRE movie reference for every seed (never gives up early),
+ *  - uses a DENSER seed grid than the previous pass, shifted by `retryPass`
+ *    frames (offset sweep) so seeds land on different frames each pass,
+ *  - pass 1 scans at coarse stride 2 with fine +1 refinement around promising
+ *    hits; passes 2+ scan at fine stride 1 (coarse → fine resolutions),
+ *  - verifies each candidate with frameSim (ALL crop-variant combinations on
+ *    both sides — all 15 variants) before walking,
+ *  - walks bidirectionally (backward + forward — aage-piche) via buildSegment.
+ *
+ * A sequence is returned ONLY when its AVERAGE confidence ≥ STRICT_MIN_CONF
+ * and its span passes the tiny-span check against the chunk duration.
+ * Returns null when no genuine ≥80% segment exists in this pass.
+ */
+async function exhaustiveRetrySearch(
+  sSet: PreSet,
+  mSet: PreSet,
+  chunk: { start: number; end: number },
+  usedShort: Uint8Array,
+  isCut: Uint8Array,
+  frameDrift: number,
+  retryPass: number,
+): Promise<RawSeq[] | null> {
+  const shortFps = sSet.fps;
+  const chunkSize = chunk.end - chunk.start + 1;
+  const chunkMinFrames = Math.max(3, Math.floor(chunkSize * 0.3));
+  const chunkDuration = shortFps[chunk.end].timestamp - shortFps[chunk.start].timestamp;
+
+  // Denser + offset-shifted seed grid per retry pass
+  const numSeeds = 5 + retryPass * 4;
+  const seeds = new Set<number>();
+  for (let p = 0; p < numSeeds; p++) {
+    let si = chunk.start + Math.round(p * (chunkSize - 1) / Math.max(1, numSeeds - 1)) + retryPass;
+    si = Math.max(chunk.start, Math.min(chunk.end, si));
+    if (!usedShort[si]) seeds.add(si);
+  }
+  if (seeds.size === 0) return null;
+
+  const stride = retryPass === 1 ? 2 : 1;
+
+  let best: RawSeq[] | null = null;
+  let bestConf = 0;
+
+  for (const si of seeds) {
+    // Full forward scan of the entire movie for this seed
+    const cands: Array<{ mi: number; sim: number }> = [];
+    let lastCand: { mi: number; sim: number } | null = null;
+
+    for (let mi = 0; mi < mSet.fps.length; mi += stride) {
+      const yp = yieldIfNeeded(mi, 20_000);
+      if (yp) await yp;
+
+      let s = hashSimFastCross(sSet, si, mSet, mi);
+      let bmi = mi;
+      // Coarse pass: refine to the skipped neighbour when this spot looks promising
+      if (stride > 1 && mi + 1 < mSet.fps.length && s >= RETRY_SEED_MIN_SIM - 10) {
+        const s2 = hashSimFastCross(sSet, si, mSet, mi + 1);
+        if (s2 > s) { s = s2; bmi = mi + 1; }
+      }
+      if (s < RETRY_SEED_MIN_SIM) continue;
+
+      if (lastCand && bmi - lastCand.mi < SEED_SEPARATION) {
+        if (s > lastCand.sim) { lastCand.mi = bmi; lastCand.sim = s; }
+      } else {
+        lastCand = { mi: bmi, sim: s };
+        cands.push(lastCand);
+      }
+    }
+    if (cands.length === 0) continue;
+    cands.sort((a, b) => b.sim - a.sim);
+
+    for (const cand of cands.slice(0, MAX_SEED_CANDIDATES * 2)) {
+      // Full cross-variant verification (all 15 crop variants, both sides)
+      const seedSim = frameSim(sSet, si, mSet, cand.mi);
+      if (seedSim < RETRY_SEED_MIN_SIM) continue;
+
+      // Bidirectional walk: backward + forward from the seed
+      const seq = buildSegment(
+        sSet, mSet, si, cand.mi, seedSim,
+        usedShort, isCut, frameDrift, chunk.start, chunk.end
+      );
+      if (seq.length < chunkMinFrames) continue;
+
+      const conf = seq.reduce((a, f) => a + f.sim, 0) / seq.length;
+      // HARD GATE: segment AVERAGE must be ≥ 80% — a single peak frame is not enough
+      if (conf < STRICT_MIN_CONF) continue;
+      const s0 = shortFps[seq[0].si].timestamp;
+      const s1 = shortFps[seq[seq.length - 1].si].timestamp;
+      if (!strictSpanOk(s0, s1, chunkDuration)) continue;
+
+      if (
+        best === null ||
+        seq.length > best.length ||
+        (seq.length === best.length && conf > bestConf)
+      ) {
+        best = seq;
+        bestConf = conf;
+      }
+    }
+  }
+
+  return best;
+}
+
 /** aHash weight vs dHash weight when both are available (no pHash) */
 const A_WEIGHT = 0.55;
 const D_WEIGHT = 0.45;
@@ -1767,6 +1911,42 @@ export async function groundMatchedSegments(
     console.log(`[Matcher] Pass ${pass} (minSim=${passMinSim}%): ${passCount} chunk(s) matched.`);
   }
 
+  // ------------------------------------------------------------------
+  // EXHAUSTIVE RETRY (STRICT 80% RULE): chunks that Passes 1 & 2 left with
+  // no ≥80% segment get up to MAX_EXHAUSTIVE_PASSES full-movie re-scans with
+  // denser + offset-shifted seed grids, coarse→fine strides, all crop
+  // variants, and bidirectional walks. The search only stops early when a
+  // genuine ≥80%-average segment is found; the pass cap prevents any
+  // infinite loop.
+  // ------------------------------------------------------------------
+  let retryFound = 0;
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const chunk = chunks[ci];
+    let hasUnmatched = false;
+    for (let si = chunk.start; si <= chunk.end; si++) {
+      if (!usedShort[si]) { hasUnmatched = true; break; }
+    }
+    if (!hasUnmatched) continue;
+    // Skip micro-chunks from false cuts — nothing genuine can average ≥80% there
+    if (chunk.end - chunk.start + 1 < 3) continue;
+
+    for (let retry = 1; retry <= MAX_EXHAUSTIVE_PASSES; retry++) {
+      console.log(`[Matcher] Exhaustive retry ${retry}/${MAX_EXHAUSTIVE_PASSES}: chunk [${chunk.start}–${chunk.end}]…`);
+      const seq = await exhaustiveRetrySearch(sSet, mSet, chunk, usedShort, isCut, frameDrift, retry);
+      if (!seq) continue;
+
+      const conf = seq.reduce((a, f) => a + f.sim, 0) / seq.length;
+      for (const item of seq) usedShort[item.si] = 1;
+      segments.push(acceptSegment(seq, shortFps, movieFps, false, sSet, mSet));
+      retryFound++;
+      console.log(`[Matcher] Exhaustive retry HIT: chunk [${chunk.start}–${chunk.end}] conf ${conf.toFixed(1)}% (pass ${retry}).`);
+      break;
+    }
+  }
+  if (retryFound > 0) {
+    console.log(`[Matcher] Exhaustive retry: ${retryFound} chunk(s) recovered at ≥${STRICT_MIN_CONF}%.`);
+  }
+
   onProgress?.({ phase: 'finalizing', pct: 92 });
 
   // ------------------------------------------------------------------
@@ -1845,9 +2025,25 @@ export async function groundMatchedSegments(
         }
       }
 
-      for (const item of group) usedShort[item.si] = 1;
-      segments.push(acceptSegment(group, shortFps, movieFps, true, sSet, mSet));
-      pass3Count++;
+      // STRICT 80% RULE: forced segments obey the same hard gate — a
+      // sub-80%-average or tiny-span group is honestly left unmatched
+      // instead of surfacing a 70s-range fluke as a "match".
+      const forcedSeg = acceptSegment(group, shortFps, movieFps, true, sSet, mSet);
+      const chunkDuration = shortFps[chunk.end].timestamp - shortFps[chunk.start].timestamp;
+      if (
+        forcedSeg.confidence >= STRICT_MIN_CONF &&
+        strictSpanOk(forcedSeg.shortStart, forcedSeg.shortEnd, chunkDuration)
+      ) {
+        for (const item of group) usedShort[item.si] = 1;
+        segments.push(forcedSeg);
+        pass3Count++;
+      } else {
+        console.log(
+          `[Matcher] Pass 3 (strict-reject): group [${forcedSeg.shortStart.toFixed(2)}–` +
+          `${forcedSeg.shortEnd.toFixed(2)}s] conf ${forcedSeg.confidence.toFixed(1)}%` +
+          ` — below ${STRICT_MIN_CONF}% avg or tiny span; no confident match found.`
+        );
+      }
       k += Math.max(1, group.length);
     }
   }
@@ -1885,9 +2081,20 @@ export async function groundMatchedSegments(
 
   // Context-aware validation: drop low-confidence segments that have no
   // high-confidence neighbour confirming a consistent movie timeline.
-  const validated = contextValidateSegments(final);
-  if (validated.length !== final.length) {
-    console.log(`[Matcher] Context validation: dropped ${final.length - validated.length} segment(s).`);
+  const contextValidated = contextValidateSegments(final);
+  if (contextValidated.length !== final.length) {
+    console.log(`[Matcher] Context validation: dropped ${final.length - contextValidated.length} segment(s).`);
+  }
+
+  // STRICT 80% RULE — final safety net: nothing below 80% average hash
+  // confidence (or with a fluke tiny span) can ever reach the results,
+  // regardless of which pass produced or merged it.
+  const validated = contextValidated.filter(seg => segPassesStrictGate(seg, chunks, shortFps));
+  if (validated.length !== contextValidated.length) {
+    console.log(`[Matcher] STRICT 80% RULE: dropped ${contextValidated.length - validated.length} sub-${STRICT_MIN_CONF}%/tiny-span segment(s) from results.`);
+  }
+  if (validated.length === 0) {
+    console.log(`[Matcher] STRICT 80% RULE: no confident match found — no segment averaged ≥${STRICT_MIN_CONF}% hash confidence after exhaustive search.`);
   }
 
   const tToSi = new Map<string, number>();
@@ -1937,7 +2144,10 @@ export async function groundMatchedSegments(
   return {
     segments: validated,
     unmatchedRanges,
-    candidatePool: [...preDedup, ...altCandidatePool, ...expansionCandidates],
+    // STRICT 80% RULE: the pool obeys the same hard gate — 77/78/79%-range
+    // candidates never exist anywhere, including VLM-retry alternates.
+    candidatePool: [...preDedup, ...altCandidatePool, ...expansionCandidates]
+      .filter(seg => segPassesStrictGate(seg, chunks, shortFps)),
   };
 }
 
@@ -2476,10 +2686,12 @@ async function groundMatchedSegmentsChunked(
       if (list) raw.push(...list);
     }
     altCandidatePool.push(
-      ...await buildAltCandidatesForChunkWindowed(
+      ...(await buildAltCandidatesForChunkWindowed(
         raw, shortSet, movieFilePath, byteOffsets, movieMetaFps, meta,
         sc.start, sc.end, frameDrift, WALK_WINDOW,
-      )
+      ))
+        // STRICT 80% RULE: sub-80% alternates never enter the pool.
+        .filter(c => c.confidence >= STRICT_MIN_CONF)
     );
   }
   console.log(`[MatchChunked] VLM fallback pool: ${altCandidatePool.length} alternate candidate(s) across ${chunks.length} chunk(s).`);
@@ -2539,6 +2751,9 @@ async function groundMatchedSegmentsChunked(
           if (seq.length < chunkMinFrames) continue;
 
           const conf = seq.reduce((a, f) => a + f.sim, 0) / seq.length;
+          // STRICT 80% RULE: sub-80% average sequences never become
+          // candidates on the chunked path either — same gate as full path.
+          if (conf < STRICT_MIN_CONF) continue;
           if (bestSeq === null || seq.length > bestSeq.length ||
               (seq.length === bestSeq.length && conf > bestSeqConf)) {
             bestSeq      = seq;
@@ -2558,6 +2773,141 @@ async function groundMatchedSegmentsChunked(
     }
 
     console.log(`[MatchChunked] Pass ${pass} (minSim=${passMinSim}%): ${passCount} chunk(s) matched.`);
+  }
+
+  // ------------------------------------------------------------------
+  // EXHAUSTIVE RETRY (STRICT 80% RULE) — chunked path. Same strict rule and
+  // same exhaustive behavior as the in-memory path, but every movie access
+  // stays windowed so the low-RAM guarantee holds:
+  //  - each retry pass re-scans the ENTIRE movie (window by window),
+  //  - denser + offset-shifted seed grids per pass (offset sweep),
+  //  - coarse (stride 2 + refine) on pass 1, fine (stride 1) after,
+  //  - bidirectional walk in a ±WALK_WINDOW slice around each candidate,
+  //  - a segment is accepted ONLY at ≥ STRICT_MIN_CONF average + real span.
+  // Bounded by MAX_EXHAUSTIVE_PASSES — can never loop forever.
+  // ------------------------------------------------------------------
+  for (let retry = 1; retry <= MAX_EXHAUSTIVE_PASSES; retry++) {
+    const unmatchedChunks = chunks.filter(sc => {
+      if (sc.end - sc.start + 1 < 3) return false;
+      for (let si = sc.start; si <= sc.end; si++) {
+        if (!usedShort[si]) return true;
+      }
+      return false;
+    });
+    if (unmatchedChunks.length === 0) break;
+
+    // Build retry seeds: denser grid, shifted by `retry` frames
+    const retrySeedCands = new Map<number, Array<{ mi: number; sim: number }>>();
+    const seedChunk = new Map<number, { start: number; end: number }>();
+    for (const sc of unmatchedChunks) {
+      const sz = sc.end - sc.start + 1;
+      const numSeeds = 5 + retry * 4;
+      for (let p = 0; p < numSeeds; p++) {
+        let si = sc.start + Math.round(p * (sz - 1) / Math.max(1, numSeeds - 1)) + retry;
+        si = Math.max(sc.start, Math.min(sc.end, si));
+        if (usedShort[si] || retrySeedCands.has(si)) continue;
+        retrySeedCands.set(si, []);
+        seedChunk.set(si, sc);
+      }
+    }
+    if (retrySeedCands.size === 0) break;
+
+    console.log(`[MatchChunked] Exhaustive retry ${retry}/${MAX_EXHAUSTIVE_PASSES}: ${unmatchedChunks.length} chunk(s), ${retrySeedCands.size} seed(s) — full movie re-scan…`);
+
+    const stride = retry === 1 ? 2 : 1;
+
+    // Full movie re-scan, window by window (low RAM)
+    for (let ws = 0; ws < totalMovieFrames; ws += CHUNK_FRAMES) {
+      const we = Math.min(ws + CHUNK_FRAMES - 1, totalMovieFrames - 1);
+      const wSet = await loadMovieWindowPreset(movieFilePath, byteOffsets, ws, we, meta);
+      const wLen = we - ws + 1;
+
+      for (const [si, list] of retrySeedCands) {
+        let lastCand: { mi: number; sim: number } | null =
+          list.length > 0 ? list[list.length - 1] : null;
+
+        for (let lm = 0; lm < wLen; lm += stride) {
+          let s = hashSimFastCross(shortSet, si, wSet, lm);
+          let blm = lm;
+          // Coarse pass: refine to the skipped neighbour on promising hits
+          if (stride > 1 && lm + 1 < wLen && s >= RETRY_SEED_MIN_SIM - 10) {
+            const s2 = hashSimFastCross(shortSet, si, wSet, lm + 1);
+            if (s2 > s) { s = s2; blm = lm + 1; }
+          }
+          if (s < RETRY_SEED_MIN_SIM) continue;
+
+          const gmi = ws + blm;
+          if (lastCand && gmi - lastCand.mi < SEED_SEPARATION) {
+            if (s > lastCand.sim) { lastCand.mi = gmi; lastCand.sim = s; }
+          } else {
+            lastCand = { mi: gmi, sim: s };
+            list.push(lastCand);
+          }
+        }
+
+        if (list.length > MAX_SEED_CANDIDATES * 4) {
+          list.sort((a, b) => b.sim - a.sim);
+          list.splice(MAX_SEED_CANDIDATES * 2);
+        }
+      }
+    }
+
+    // Walk the collected candidates per chunk (bidirectional, windowed)
+    let retryHits = 0;
+    for (const sc of unmatchedChunks) {
+      const scSize = sc.end - sc.start + 1;
+      const scMinFrames = Math.max(3, Math.floor(scSize * 0.3));
+      const chunkDuration = shortFps[sc.end].timestamp - shortFps[sc.start].timestamp;
+
+      let bestSeq: RawSeq[] | null = null;
+      let bestConf = 0;
+      let bestWinStart = 0;
+
+      for (const [si, list] of retrySeedCands) {
+        if (seedChunk.get(si) !== sc) continue;
+        const sorted = [...list].sort((a, b) => b.sim - a.sim);
+
+        for (const cand of sorted.slice(0, MAX_SEED_CANDIDATES)) {
+          const winStart = Math.max(0, cand.mi - WALK_WINDOW);
+          const winEnd   = Math.min(totalMovieFrames - 1, cand.mi + WALK_WINDOW);
+          const localMi  = cand.mi - winStart;
+
+          const winSet  = await loadMovieWindowPreset(movieFilePath, byteOffsets, winStart, winEnd, meta);
+          // Full cross-variant verification (all crop variants, both sides)
+          const seedSim = frameSim(shortSet, si, winSet, localMi);
+          if (seedSim < RETRY_SEED_MIN_SIM) continue;
+
+          const seq = buildSegment(shortSet, winSet, si, localMi, seedSim,
+            usedShort, isCut, frameDrift, sc.start, sc.end);
+          if (seq.length < scMinFrames) continue;
+
+          const conf = seq.reduce((a, f) => a + f.sim, 0) / seq.length;
+          // HARD GATE: average ≥ 80%, not a single-frame peak
+          if (conf < STRICT_MIN_CONF) continue;
+          const s0 = shortFps[seq[0].si].timestamp;
+          const s1 = shortFps[seq[seq.length - 1].si].timestamp;
+          if (!strictSpanOk(s0, s1, chunkDuration)) continue;
+
+          if (bestSeq === null || seq.length > bestSeq.length ||
+              (seq.length === bestSeq.length && conf > bestConf)) {
+            bestSeq      = seq;
+            bestConf     = conf;
+            bestWinStart = winStart;
+          }
+        }
+      }
+
+      if (!bestSeq) continue;
+      const globalSeq = bestSeq.map(f => ({ ...f, mi: f.mi + bestWinStart }));
+      for (const item of globalSeq) usedShort[item.si] = 1;
+      segments.push(acceptSegment(globalSeq, shortFps, movieMetaFps, false));
+      retryHits++;
+      console.log(`[MatchChunked] Exhaustive retry HIT: chunk [${sc.start}–${sc.end}] conf ${bestConf.toFixed(1)}% (pass ${retry}).`);
+    }
+
+    if (retryHits > 0) {
+      console.log(`[MatchChunked] Exhaustive retry ${retry}: ${retryHits} chunk(s) recovered at ≥${STRICT_MIN_CONF}%.`);
+    }
   }
 
   onProgress?.({ phase: 'finalizing', pct: 92 });
@@ -2593,8 +2943,24 @@ async function groundMatchedSegmentsChunked(
           group.push(item); curMi = item.mi;
         } else break;
       }
-      for (const item of group) usedShort[item.si] = 1;
-      segments.push(acceptSegment(group, shortFps, movieMetaFps, true));
+      // STRICT 80% RULE: forced segments obey the same hard gate — sub-80%
+      // or tiny-span groups stay honestly unmatched instead of surfacing
+      // as fluke "matches".
+      const forcedSeg = acceptSegment(group, shortFps, movieMetaFps, true);
+      const scDuration = shortFps[sc.end].timestamp - shortFps[sc.start].timestamp;
+      if (
+        forcedSeg.confidence >= STRICT_MIN_CONF &&
+        strictSpanOk(forcedSeg.shortStart, forcedSeg.shortEnd, scDuration)
+      ) {
+        for (const item of group) usedShort[item.si] = 1;
+        segments.push(forcedSeg);
+      } else {
+        console.log(
+          `[MatchChunked] Pass 3 (strict-reject): group [${forcedSeg.shortStart.toFixed(2)}–` +
+          `${forcedSeg.shortEnd.toFixed(2)}s] conf ${forcedSeg.confidence.toFixed(1)}%` +
+          ` — below ${STRICT_MIN_CONF}% avg or tiny span; no confident match found.`
+        );
+      }
       k += Math.max(1, group.length);
     }
   }
@@ -2615,9 +2981,19 @@ async function groundMatchedSegmentsChunked(
   }
   deduped.sort((a, b) => a.shortStart - b.shortStart);
 
-  const validated = contextValidateSegments(deduped);
-  if (validated.length !== deduped.length) {
-    console.log(`[MatchChunked] Context validation: dropped ${deduped.length - validated.length} segment(s).`);
+  const contextValidated = contextValidateSegments(deduped);
+  if (contextValidated.length !== deduped.length) {
+    console.log(`[MatchChunked] Context validation: dropped ${deduped.length - contextValidated.length} segment(s).`);
+  }
+
+  // STRICT 80% RULE — final safety net (same as full path): nothing below
+  // 80% average confidence or with a fluke tiny span ever reaches results.
+  const validated = contextValidated.filter(seg => segPassesStrictGate(seg, chunks, shortFps));
+  if (validated.length !== contextValidated.length) {
+    console.log(`[MatchChunked] STRICT 80% RULE: dropped ${contextValidated.length - validated.length} sub-${STRICT_MIN_CONF}%/tiny-span segment(s) from results.`);
+  }
+  if (validated.length === 0) {
+    console.log(`[MatchChunked] STRICT 80% RULE: no confident match found — no segment averaged ≥${STRICT_MIN_CONF}% hash confidence after exhaustive search.`);
   }
 
   const tToSi = new Map<string, number>();
@@ -2671,7 +3047,10 @@ async function groundMatchedSegmentsChunked(
   return {
     segments: validated,
     unmatchedRanges: computeUnmatched(shortFps, usedFinal),
-    candidatePool: [...merged, ...altCandidatePool, ...expansionCandidates],
+    // STRICT 80% RULE: pool candidates obey the same hard gate —
+    // 77/78/79%-range candidates never exist anywhere.
+    candidatePool: [...merged, ...altCandidatePool, ...expansionCandidates]
+      .filter(seg => segPassesStrictGate(seg, chunks, shortFps)),
   };
 }
 
