@@ -14,7 +14,7 @@ import * as os from 'os';
 import * as http from 'http';
 import { createServer as createViteServer } from 'vite';
 import { extractFingerprints, NUM_WORKERS } from './server/pipeline';
-import { matchVideosFromFiles } from './server/matching-engine';
+import { matchVideosFromFiles, getAlternateCandidatesForRange, type MatchedSegment } from './server/matching-engine';
 // Task 1 (FPS-aware alt pipeline): ffprobe metadata per match job, saved
 // durably like verify records. Never read by the protected matching engine.
 import { probeVideoMetadata, saveMatchVideoMetadata } from './server/video-metadata';
@@ -194,6 +194,68 @@ async function startServer() {
   const retryInFlight = new Set<string>();
   function retryKey(matchJobId: string, segmentIndex: number): string {
     return `${matchJobId}:${segmentIndex}`;
+  }
+  function gapRetryKey(matchJobId: string, shortStart: number): string {
+    return `${matchJobId}:gap:${shortStart.toFixed(2)}`;
+  }
+
+  // Live step-by-step log lines for each in-flight (or just-finished) Retry,
+  // keyed the same way as retryInFlight. In-memory only — purely a UI feature
+  // so the user can watch which candidate is being verified right now. The
+  // log of a key is reset when a new Retry starts on that key and survives
+  // until then, so the UI can show the final outcome after completion.
+  interface RetryLogEntry { t: number; message: string; }
+  const retryLogs = new Map<string, RetryLogEntry[]>();
+  const RETRY_LOG_MAX_LINES = 200;
+  const RETRY_LOG_MAX_KEYS = 60;
+  function logRetry(key: string, message: string): void {
+    let log = retryLogs.get(key);
+    if (!log) {
+      // Cap total tracked keys — drop the oldest key when over budget.
+      if (retryLogs.size >= RETRY_LOG_MAX_KEYS) {
+        const oldest = retryLogs.keys().next().value;
+        if (oldest !== undefined) retryLogs.delete(oldest);
+      }
+      log = [];
+      retryLogs.set(key, log);
+    }
+    log.push({ t: Date.now(), message });
+    if (log.length > RETRY_LOG_MAX_LINES) log.splice(0, log.length - RETRY_LOG_MAX_LINES);
+    console.log(`[Re-check] ${key}: ${message}`);
+  }
+  function resetRetryLog(key: string): void {
+    retryLogs.delete(key);
+  }
+
+  // ── Persisted candidate pool ────────────────────────────────────────────────
+  // The engine's full pre-dedup candidate pool used to live only in memory for
+  // the duration of the initial verify pass, so a later manual Retry could only
+  // re-check candidates it already knew about. Persisting the pool per match
+  // job lets Retry DISCOVER NEW candidates (and lets unmatched gaps be
+  // retried at all). Best-effort on both sides: a missing/corrupt pool file
+  // simply degrades Retry back to the old already-known-candidates behavior.
+  function candidatePoolPath(matchJobId: string) {
+    return path.join(uploadDir, `${matchJobId}_candidate_pool.json`);
+  }
+  async function saveCandidatePool(matchJobId: string, pool: MatchedSegment[] | undefined): Promise<void> {
+    if (!pool || pool.length === 0) return;
+    try {
+      await fs.promises.writeFile(candidatePoolPath(matchJobId), JSON.stringify(pool));
+      console.log(`[Match ${matchJobId}] Candidate pool persisted (${pool.length} candidate(s)) for future retries.`);
+    } catch (e: any) {
+      console.warn(`[Match ${matchJobId}] Could not persist candidate pool (non-fatal): ${e?.message || e}`);
+    }
+  }
+  function loadCandidatePool(matchJobId: string): MatchedSegment[] {
+    const p = candidatePoolPath(matchJobId);
+    if (!fs.existsSync(p)) return [];
+    try {
+      const parsed = JSON.parse(fs.readFileSync(p, 'utf-8'));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e: any) {
+      console.warn(`[Match ${matchJobId}] Corrupt candidate pool file (ignored): ${e?.message || e}`);
+      return [];
+    }
   }
 
   function matchMetaPath(matchJobId: string) {
@@ -1271,6 +1333,11 @@ async function startServer() {
 
         console.log(`[Match ${matchJobId}] Done: ${result.segments.length} segments, ${result.unmatchedRanges.length} unmatched ranges.`);
 
+        // Persist the engine's full pre-dedup candidate pool so a later manual
+        // Retry (segments AND unmatched gaps) can search it for NEW candidates
+        // instead of only re-checking already-known ones.
+        await saveCandidatePool(matchJobId, result.candidatePool);
+
 
         // ── Gemini verification stage ───────────────────────────────────────
         // The new candidate/verification system (server/verification/). Takes
@@ -1433,7 +1500,32 @@ async function startServer() {
     if (!Number.isFinite(idx)) return res.status(400).json({ error: 'segmentIndex must be a number' });
     const entry = readRecord(uploadDir, matchJobId, idx);
     if (!entry) return res.status(404).json({ error: 'No candidate data for this segment' });
-    res.json({ ...entry, retrying: retryInFlight.has(retryKey(matchJobId, idx)) });
+    const key = retryKey(matchJobId, idx);
+    res.json({
+      ...entry,
+      retrying: retryInFlight.has(key),
+      retryLog: retryLogs.get(key) ?? [],
+    });
+  });
+
+  // Live Retry status + step-by-step logs — polled by the UI while any manual
+  // Retry (segment or unmatched gap) is running, so the user can watch which
+  // candidate is being verified right now. Logs persist after completion
+  // (until the same key is retried again), so the final outcome stays visible.
+  app.get('/api/match/:matchJobId/retry-status', (req, res) => {
+    const { matchJobId } = req.params;
+    const prefix = `${matchJobId}:`;
+    const retries: Array<{ key: string; running: boolean; log: RetryLogEntry[] }> = [];
+    for (const [key, log] of retryLogs) {
+      if (!key.startsWith(prefix)) continue;
+      retries.push({ key, running: retryInFlight.has(key), log });
+    }
+    // Keys that are in flight but have not logged anything yet.
+    for (const key of retryInFlight) {
+      if (!key.startsWith(prefix)) continue;
+      if (!retryLogs.has(key)) retries.push({ key, running: true, log: [] });
+    }
+    res.json({ matchJobId, retries });
   });
 
   // 6j. Manual per-segment Re-check — a user-triggered action that re-runs the
@@ -1477,6 +1569,7 @@ async function startServer() {
     }
 
     retryInFlight.add(key);
+    resetRetryLog(key);
     res.json({ ok: true, matchJobId, segmentIndex });
 
     const originalRange = { shortStart: entry.shortStart, shortEnd: entry.shortEnd };
@@ -1485,19 +1578,39 @@ async function startServer() {
     const activeIdx = entry.usedCandidateIndex ?? entry.recoveredCandidateIndex ?? 0;
     const primarySegment = entry.candidates[activeIdx]?.segment ?? entry.candidates[0]?.segment;
 
+    // Merge already-known candidates with the persisted engine pool, so this
+    // Retry can DISCOVER candidates the original pass never offered (the pool
+    // is pre-dedup and much deeper than the record). Known candidates go
+    // first; collectCandidates dedups near-identical movie timestamps.
+    const knownSegments = entry.candidates.map(c => c.segment);
+    const diskPool = loadCandidatePool(matchJobId);
+    const freshFromPool = getAlternateCandidatesForRange(
+      diskPool, entry.shortStart, entry.shortEnd, [], 0.5,
+    ).filter(cand =>
+      !knownSegments.some(k => Math.abs(k.movieStart - cand.movieStart) < 1),
+    );
+    const mergedPool = [...knownSegments, ...freshFromPool];
+
     (async () => {
       try {
         console.log(`[Re-check] Match ${matchJobId} segment ${segmentIndex}: starting…`);
+        logRetry(key,
+          `Searching candidates: ${knownSegments.length} already known, ` +
+          `${freshFromPool.length} NEW candidate(s) discovered in the engine's candidate pool` +
+          `${diskPool.length === 0 ? ' (no persisted pool for this job — older match, using known candidates only)' : ''}.`,
+        );
         const result = await recheckSegment({
           segment: primarySegment,
           segmentIndex,
-          candidatePool: entry.candidates.map(c => c.segment),
+          candidatePool: mergedPool,
           shortVideoPath,
           movieVideoPath,
           uploadDir,
           matchJobId,
+          onLog: (message) => logRetry(key, message),
         });
         console.log(`[Re-check] Match ${matchJobId} segment ${segmentIndex}: ${result.message}.`);
+        logRetry(key, `Result: ${result.message}.`);
 
         // Swap the (possibly switched, possibly re-flagged) segment back into
         // the job's live segments + persisted result JSON. Matched by range,
@@ -1525,7 +1638,7 @@ async function startServer() {
             // This range had no active segment before — add it now.
             liveJob.segments = [...liveJob.segments, newSeg].sort((a: any, b: any) => a.shortStart - b.shortStart);
           }
-          // Recompute the display-only timeline flags — swapping in a new
+          // Recompute the display-only timeline flags ��� swapping in a new
           // match can create OR resolve a backwards jump against the
           // neighbouring segments, so the badges must not stay stale.
           try { liveJob.segments = flagTimelineOutliers(liveJob.segments); } catch { /* display-only */ }

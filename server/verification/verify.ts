@@ -100,6 +100,10 @@ export interface VerifyRequest {
   uploadDir: string;
   matchJobId: string;
   onProgress?: (done: number, total: number, message: string) => void;
+  /** Live step-by-step log lines (used by the manual Retry flow so the UI can
+   *  show exactly which candidate is being checked right now). Best-effort:
+   *  the bulk pass never sets it. */
+  onLog?: (message: string) => void;
 }
 
 export interface VerifySummary {
@@ -266,6 +270,10 @@ async function verifyOneRange(
   checkAll = false,
 ): Promise<RangeOutcome> {
   const candidates = collectCandidates(primary, req.candidatePool, neighbors);
+  req.onLog?.(
+    `Collected ${candidates.length} candidate(s) for clip ${fmt(primary.shortStart)}s–${fmt(primary.shortEnd)}s ` +
+    `(engine pick + ${candidates.length - 1} alternate(s) from the candidate pool).`,
+  );
 
   const record: VerificationRecord = {
     segmentIndex,
@@ -295,6 +303,7 @@ async function verifyOneRange(
   if (!shortClip) {
     const reason = 'could not cut the short-clip side with ffmpeg — range left unverified';
     console.warn(`[Verify] Range ${segmentIndex} (${fmt(primary.shortStart)}-${fmt(primary.shortEnd)}): ${reason}.`);
+    req.onLog?.(`FAILED: ${reason}.`);
     record.skippedReason = reason;
     record.usedCandidateIndex = 0;
     return { segment: primary, record, calls: 0 };
@@ -306,6 +315,11 @@ async function verifyOneRange(
       const candidate = candidates[i].segment;
       const entry = record.candidates[i];
 
+      req.onLog?.(
+        `Checking candidate ${i + 1}/${candidates.length} @ movie ${fmt(candidate.movieStart)}s–${fmt(candidate.movieEnd)}s ` +
+        `(hash confidence ${Math.round(candidate.confidence)}%)…`,
+      );
+
       const movieClip = await cutClip(
         req.movieVideoPath!,
         candidate.movieStart,
@@ -315,6 +329,7 @@ async function verifyOneRange(
       if (!movieClip) {
         entry.verdict = 'unverifiable';
         entry.reason = 'reference clip could not be cut';
+        req.onLog?.(`Candidate ${i + 1}: UNVERIFIABLE — reference clip could not be cut.`);
         continue;
       }
 
@@ -348,6 +363,7 @@ async function verifyOneRange(
       if (!verdict) {
         entry.verdict = 'unverifiable';
         entry.reason = 'Gemini returned no usable verdict';
+        req.onLog?.(`Candidate ${i + 1}: UNVERIFIABLE — Gemini returned no usable verdict.`);
         continue;
       }
 
@@ -362,6 +378,7 @@ async function verifyOneRange(
           `ACCEPTED candidate ${i} @ movie ${fmt(candidate.movieStart)}s ` +
           `(Gemini ${entry.confidencePct}%${i > 0 ? ', switched from the engine pick' : ''}).`,
         );
+        req.onLog?.(`Candidate ${i + 1}: ACCEPTED by Gemini (${entry.confidencePct}% confident).`);
         if (!checkAll) {
           // Bulk pass: a winner ends the range — no point spending quota on the rest.
           record.usedCandidateIndex = i;
@@ -374,11 +391,13 @@ async function verifyOneRange(
 
       if (!verdict.same && trusted) {
         entry.verdict = 'rejected';
+        req.onLog?.(`Candidate ${i + 1}: REJECTED by Gemini (${entry.confidencePct}% confident it is different footage).`);
       } else {
         entry.verdict = 'unverifiable';
         entry.reason =
           `low certainty (${entry.confidencePct}% < ${MIN_CONFIDENCE}%)` +
           (entry.reason ? ` — ${entry.reason}` : '');
+        req.onLog?.(`Candidate ${i + 1}: UNVERIFIABLE — low certainty (${entry.confidencePct}% < ${MIN_CONFIDENCE}%).`);
       }
     }
   } finally {
@@ -404,6 +423,11 @@ async function verifyOneRange(
       `winner is candidate ${winnerIdx} @ movie ${fmt(winner.movieStart)}s ` +
       `(Gemini ${record.candidates[winnerIdx].confidencePct}%).`,
     );
+    req.onLog?.(
+      `Full check done: ${acceptedEntries.length}/${record.candidates.length} accepted — ` +
+      `WINNER is candidate ${winnerIdx + 1} @ movie ${fmt(winner.movieStart)}s ` +
+      `(Gemini ${record.candidates[winnerIdx].confidencePct}% confident).`,
+    );
     return { segment: winner, record, calls };
   }
 
@@ -420,6 +444,10 @@ async function verifyOneRange(
     `[Verify] Range ${segmentIndex} (${fmt(primary.shortStart)}-${fmt(primary.shortEnd)}): ` +
     `${anyRejected ? 'REJECTED' : 'UNVERIFIABLE'} after ${record.candidates.length} candidate(s) — ` +
     `keeping the engine pick, flagged for review.`,
+  );
+  req.onLog?.(
+    `Full check done: no candidate accepted after ${record.candidates.length} candidate(s) — ` +
+    `${anyRejected ? 'REJECTED (kept visible for review)' : 'UNVERIFIABLE (Gemini gave no usable verdict)'}.`,
   );
 
   return {
@@ -610,6 +638,10 @@ export async function recheckSegment(req: RecheckRequest): Promise<RecheckResult
   }
 
   console.log(`[Verify] Manual re-check requested for range ${req.segmentIndex}.`);
+  req.onLog?.(
+    `Retry started — full check mode: every candidate gets its own Gemini verification, ` +
+    `the highest-confidence accepted candidate wins.`,
+  );
 
   const outcome = await verifyOneRange(
     {
@@ -619,6 +651,7 @@ export async function recheckSegment(req: RecheckRequest): Promise<RecheckResult
       movieVideoPath: req.movieVideoPath,
       uploadDir: req.uploadDir,
       matchJobId: req.matchJobId,
+      onLog: req.onLog,
     },
     req.segment,
     req.segmentIndex,
