@@ -86,6 +86,14 @@ interface StoredCandidateSet {
   skippedReason?: string;
   /** Server-reported: a manual Re-check is currently running for this segment. */
   retrying?: boolean;
+  /** Live step-by-step log lines for the current/last Retry of this segment. */
+  retryLog?: RetryLogEntry[];
+}
+
+/** One live log line of an in-flight (or just-finished) manual Retry. */
+interface RetryLogEntry {
+  t: number;
+  message: string;
 }
 
 interface SanityResult {
@@ -532,6 +540,16 @@ export default function App() {
   // same fetch paths already used elsewhere.
   const [retryingSegments, setRetryingSegments] = useState<Set<number>>(new Set());
   const [retryError, setRetryError] = useState<string>('');
+  // Live step-by-step log of the current/last segment Retry, so the user can
+  // watch which candidate is being verified right now. Kept after completion
+  // (until the next Retry) so the final outcome stays reviewable.
+  const [segmentRetryLog, setSegmentRetryLog] = useState<{ segmentIndex: number; entries: RetryLogEntry[] } | null>(null);
+  // Manual Retry for UNMATCHED gaps — keyed by shortStart.toFixed(2), the same
+  // key shape the server uses (`<jobId>:gap:<start>`). Logs mirror the
+  // segment-retry logs but come from the /retry-status endpoint.
+  const [gapRetryingKeys, setGapRetryingKeys] = useState<Set<string>>(new Set());
+  const [gapRetryLogs, setGapRetryLogs] = useState<Record<string, RetryLogEntry[]>>({});
+  const [gapRetryError, setGapRetryError] = useState<string>('');
 
   // Inline per-segment candidate expansion (additive UI) — keyed by the
   // candidate set's segmentIndex, same keying discipline as
@@ -1928,6 +1946,7 @@ export default function App() {
     if (!matchJobId || retrySegmentIndex < 0) return;
     const segmentIndex = retrySegmentIndex;
     setRetryError('');
+    setSegmentRetryLog({ segmentIndex, entries: [] });
     setRetryingSegments(prev => new Set(prev).add(segmentIndex));
 
     try {
@@ -1950,6 +1969,11 @@ export default function App() {
           if (!res.ok) { consecutiveErrors++; if (consecutiveErrors >= 8) break; continue; }
           consecutiveErrors = 0;
           const entry: StoredCandidateSet = await res.json();
+          // Mirror the server's live step-by-step Retry log into the UI on
+          // every poll, so the user watches candidates being verified live.
+          if (entry.retryLog && entry.retryLog.length > 0) {
+            setSegmentRetryLog({ segmentIndex, entries: entry.retryLog });
+          }
           if (!entry.retrying) break;
         } catch {
           consecutiveErrors++;
@@ -1978,6 +2002,70 @@ export default function App() {
       }
     } finally {
       setRetryingSegments(prev => { const next = new Set(prev); next.delete(segmentIndex); return next; });
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Manual Retry for an UNMATCHED gap — kicks off the server-side gap retry
+  // (which searches the persisted engine candidate pool for candidates the
+  // original pass never verified), then polls /retry-status for the gap's key
+  // so its live step-by-step log streams into the UI. On completion, both the
+  // segments and the unmatched ranges are refreshed — an accepted candidate
+  // turns (part of) the gap into a new matched segment.
+  // ---------------------------------------------------------------------------
+  const gapKeyOf = (u: UnmatchedRange) => u.shortStart.toFixed(2);
+
+  const handleRetryGap = async (u: UnmatchedRange) => {
+    if (!matchJobId) return;
+    const k = gapKeyOf(u);
+    setGapRetryError('');
+    setGapRetryLogs(prev => ({ ...prev, [k]: [] }));
+    setGapRetryingKeys(prev => new Set(prev).add(k));
+
+    try {
+      const startRes = await fetch(`/api/match/${matchJobId}/gap/retry`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ shortStart: u.shortStart, shortEnd: u.shortEnd }),
+      });
+      if (!startRes.ok) {
+        const err = await startRes.json().catch(() => ({}));
+        setGapRetryError(err?.error || 'Could not start Retry for this gap.');
+        return;
+      }
+
+      // Poll the shared retry-status endpoint for THIS gap's key until the
+      // server reports it done — same fetch-and-poll shape as segment Retry.
+      const serverKey = `${matchJobId}:gap:${k}`;
+      let consecutiveErrors = 0;
+      while (true) {
+        await new Promise(r => setTimeout(r, 1500));
+        try {
+          const res = await fetch(`/api/match/${matchJobId}/retry-status`);
+          if (!res.ok) { consecutiveErrors++; if (consecutiveErrors >= 8) break; continue; }
+          consecutiveErrors = 0;
+          const data = await res.json();
+          const rec = (data?.retries || []).find((r: any) => r.key === serverKey);
+          if (rec?.log?.length) setGapRetryLogs(prev => ({ ...prev, [k]: rec.log }));
+          if (!rec || !rec.running) break;
+        } catch {
+          consecutiveErrors++;
+          if (consecutiveErrors >= 8) break;
+        }
+      }
+
+      // Refresh candidate history AND the main result — an accepted gap
+      // candidate adds a segment and shrinks/removes the unmatched range.
+      await refreshCandidateSets();
+      const statusRes = await fetch(`/api/match-status/${matchJobId}`);
+      if (statusRes.ok) {
+        const job = await statusRes.json();
+        setSegments(job.segments || []);
+        setUnmatched(job.unmatchedRanges || []);
+        if (job.verifySummary) setVerifySummary(job.verifySummary);
+      }
+    } finally {
+      setGapRetryingKeys(prev => { const next = new Set(prev); next.delete(k); return next; });
     }
   };
 
@@ -2558,6 +2646,53 @@ export default function App() {
                     <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-sm bg-yellow-500" /> Medium confidence</span>
                     <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-sm bg-orange-700/60" /> No match found</span>
                   </div>
+
+                  {/* ── Unmatched gaps — each retryable. The server searches its
+                      persisted candidate pool for candidates overlapping the
+                      gap and runs the same full-check verification a segment
+                      Retry uses; an accepted candidate becomes a NEW segment
+                      and the gap shrinks or disappears. Live logs stream in
+                      while the retry runs. ── */}
+                  {unmatchedRanges.length > 0 && (
+                    <div className="space-y-2 pt-1">
+                      {unmatchedRanges.map((u) => {
+                        const k = gapKeyOf(u);
+                        const busy = gapRetryingKeys.has(k);
+                        const log = gapRetryLogs[k];
+                        return (
+                          <div key={k} className="rounded-lg border border-orange-500/20 bg-orange-500/5 px-3 py-2 space-y-1.5">
+                            <div className="flex flex-wrap items-center gap-3">
+                              <span className="font-mono text-xs text-orange-300">
+                                Unmatched {fmt(u.shortStart)} → {fmt(u.shortEnd)}
+                              </span>
+                              <button
+                                onClick={() => handleRetryGap(u)}
+                                disabled={busy || isMatching}
+                                title="Search the engine's saved candidate pool for this gap and verify every candidate found"
+                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-50 disabled:cursor-not-allowed border border-amber-500/30 text-amber-300 transition cursor-pointer">
+                                <RefreshCw className={`w-3 h-3 ${busy ? 'animate-spin' : ''}`} />
+                                {busy ? 'Searching…' : 'Retry Gap'}
+                              </button>
+                            </div>
+                            {log && log.length > 0 && (
+                              <div className="max-h-32 overflow-y-auto rounded bg-slate-950/70 border border-slate-800 px-2.5 py-1.5 space-y-1 font-mono text-[10px] text-slate-400">
+                                {log.map((l, i) => (
+                                  <p key={`${l.t}-${i}`} className={busy && i === log.length - 1 ? 'text-amber-300' : ''}>
+                                    {l.message}
+                                  </p>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                      {gapRetryError && (
+                        <p className="flex items-center gap-1.5 text-xs text-red-300">
+                          <AlertCircle className="w-3.5 h-3.5 shrink-0" /> {gapRetryError}
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })()}
@@ -2906,9 +3041,23 @@ export default function App() {
             {/* Dual video panes */}
             <div className="relative grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-slate-800">
               {isCurrentSegmentRetrying && (
-                <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-slate-950/85 backdrop-blur-sm">
+                <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-slate-950/85 backdrop-blur-sm p-4">
                   <RefreshCw className="w-6 h-6 text-indigo-400 animate-spin" />
-                  <p className="text-xs font-medium text-slate-300">Retrying this segment…</p>
+                  <p className="text-xs font-medium text-slate-300">
+                    Retrying this segment — full check: every candidate gets its own verification…
+                  </p>
+                  {/* Live step-by-step log — which candidate is being verified
+                      right now, streamed from the server on every poll. */}
+                  {segmentRetryLog && segmentRetryLog.segmentIndex === retrySegmentIndex &&
+                    segmentRetryLog.entries.length > 0 && (
+                    <div className="w-full max-w-lg max-h-36 overflow-y-auto rounded-lg bg-slate-950/80 border border-slate-800 px-3 py-2 space-y-1 font-mono text-[10px] text-slate-400 text-left">
+                      {segmentRetryLog.entries.slice(-10).map((l, i) => (
+                        <p key={`${l.t}-${i}`} className={i === segmentRetryLog.entries.slice(-10).length - 1 ? 'text-indigo-300' : ''}>
+                          {l.message}
+                        </p>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -3079,6 +3228,23 @@ export default function App() {
               <div className="px-4 py-2 border-t border-red-900/40 bg-red-500/5 flex items-center gap-2 text-xs text-red-300">
                 <AlertCircle className="w-3.5 h-3.5 shrink-0" />
                 {retryError}
+              </div>
+            )}
+
+            {/* Full log of the last Retry for this segment — kept visible
+                after completion so the final outcome stays reviewable. */}
+            {!isCurrentSegmentRetrying && segmentRetryLog &&
+              segmentRetryLog.segmentIndex === retrySegmentIndex &&
+              segmentRetryLog.entries.length > 0 && (
+              <div className="px-4 py-2.5 border-t border-slate-800 bg-slate-950/40 space-y-1.5">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                  Last Retry log — {segmentRetryLog.entries.length} step{segmentRetryLog.entries.length !== 1 ? 's' : ''}
+                </p>
+                <div className="max-h-40 overflow-y-auto rounded-lg bg-slate-950/70 border border-slate-800 px-3 py-2 space-y-1 font-mono text-[10px] text-slate-400">
+                  {segmentRetryLog.entries.map((l, i) => (
+                    <p key={`${l.t}-${i}`}>{l.message}</p>
+                  ))}
+                </div>
               </div>
             )}
 

@@ -1658,6 +1658,130 @@ async function startServer() {
     })();
   });
 
+  // 6j-bis. Manual Retry for an UNMATCHED gap — searches the persisted engine
+  // candidate pool for candidates overlapping the gap and runs the exact same
+  // full-check verification (recheckSegment) on them. On acceptance the new
+  // segment is added to the timeline and the gap is shrunk/removed. Never
+  // touches the matching engine. Same fire-and-poll shape as the segment
+  // Retry above; progress is watched via /retry-status (key `gap:<start>`).
+  app.post('/api/match/:matchJobId/gap/retry', async (req, res) => {
+    const { matchJobId } = req.params;
+    const shortStart = Number(req.body?.shortStart);
+    const shortEnd = Number(req.body?.shortEnd);
+    if (!Number.isFinite(shortStart) || !Number.isFinite(shortEnd) || shortEnd <= shortStart) {
+      return res.status(400).json({ error: 'shortStart and shortEnd must be numbers with shortEnd > shortStart' });
+    }
+
+    const job = matchJobs.get(matchJobId) ?? loadMatchJobFromDisk(matchJobId);
+    if (!job) return res.status(404).json({ error: 'Match job not found' });
+    if (job.status !== 'completed') return res.status(400).json({ error: 'Match job is not completed yet' });
+
+    const key = gapRetryKey(matchJobId, shortStart);
+    if (retryInFlight.has(key)) {
+      return res.status(409).json({ error: 'A Retry is already in progress for this gap' });
+    }
+
+    if (!geminiConfigured()) {
+      return res.status(503).json({ error: 'No verification provider available — set GEMINI_API_KEY.' });
+    }
+    const gStatus = getGeminiStatus();
+    if (gStatus.dailyLimitReached) {
+      return res.status(503).json({ error: 'Gemini daily quota exhausted — add a new API key, then hit Retry again.' });
+    }
+
+    const movieVideoPath = getVideoPathForJob(job.movieJobId);
+    const shortVideoPath = getVideoPathForJob(job.shortJobId);
+    if (!movieVideoPath || !shortVideoPath) {
+      return res.status(400).json({ error: 'Original videos are no longer available for clip extraction.' });
+    }
+
+    // The ONLY candidate source for a gap is the persisted engine pool — the
+    // gap has no verification record. No pool → nothing to try, fail fast.
+    const diskPool = loadCandidatePool(matchJobId);
+    if (diskPool.length === 0) {
+      return res.status(404).json({ error: 'No persisted candidate pool for this match job (older match) — re-run matching to enable gap Retry.' });
+    }
+    const gapCandidates = getAlternateCandidatesForRange(diskPool, shortStart, shortEnd, [], 0.5);
+    if (gapCandidates.length === 0) {
+      return res.status(404).json({ error: 'The engine\'s candidate pool has no candidate overlapping this gap — nothing to verify.' });
+    }
+
+    retryInFlight.add(key);
+    resetRetryLog(key);
+    res.json({ ok: true, matchJobId, shortStart, shortEnd });
+
+    // Reuse the record index of a previous gap Retry on the same range so
+    // repeated attempts overwrite one record instead of piling up new ones;
+    // otherwise allocate the next free index.
+    const allRecords = readAllRecords(uploadDir, matchJobId);
+    const prior = allRecords.find(r => {
+      const overlap = Math.min(r.shortEnd, shortEnd) - Math.max(r.shortStart, shortStart);
+      return overlap > 0.5 * (shortEnd - shortStart);
+    });
+    const segmentIndex = prior
+      ? prior.segmentIndex
+      : allRecords.length > 0 ? Math.max(...allRecords.map(r => r.segmentIndex)) + 1 : 0;
+
+    (async () => {
+      try {
+        console.log(`[Re-check] Match ${matchJobId} gap ${shortStart.toFixed(2)}–${shortEnd.toFixed(2)}: starting…`);
+        logRetry(key,
+          `Gap Retry started for unmatched range ${shortStart.toFixed(2)}s–${shortEnd.toFixed(2)}s: ` +
+          `${gapCandidates.length} candidate(s) discovered in the engine's saved candidate pool.`,
+        );
+        const result = await recheckSegment({
+          segment: gapCandidates[0],
+          segmentIndex,
+          candidatePool: gapCandidates,
+          shortVideoPath,
+          movieVideoPath,
+          uploadDir,
+          matchJobId,
+          onLog: (message) => logRetry(key, message),
+        });
+        console.log(`[Re-check] Match ${matchJobId} gap ${shortStart.toFixed(2)}: ${result.message}.`);
+        logRetry(key, `Result: ${result.message}.`);
+
+        if (result.accepted && result.segment) {
+          const liveJob = matchJobs.get(matchJobId) ?? job;
+          const newSeg: any = result.segment;
+          // Insert the newly-verified segment in short-clip order and subtract
+          // its range from the unmatched gaps (shrinking or removing them).
+          liveJob.segments = [...(liveJob.segments ?? []), newSeg]
+            .sort((a: any, b: any) => a.shortStart - b.shortStart);
+          const prevGaps: any[] = liveJob.unmatchedRanges ?? [];
+          const nextGaps: any[] = [];
+          for (const g of prevGaps) {
+            if (newSeg.shortEnd <= g.shortStart + 0.05 || newSeg.shortStart >= g.shortEnd - 0.05) {
+              nextGaps.push(g);
+              continue;
+            }
+            // Keep any leftover sliver of at least 0.25 s on either side.
+            if (newSeg.shortStart > g.shortStart + 0.25) nextGaps.push({ ...g, shortStart: g.shortStart, shortEnd: newSeg.shortStart });
+            if (newSeg.shortEnd < g.shortEnd - 0.25) nextGaps.push({ ...g, shortStart: newSeg.shortEnd, shortEnd: g.shortEnd });
+          }
+          liveJob.unmatchedRanges = nextGaps;
+          try { liveJob.segments = flagTimelineOutliers(liveJob.segments!); } catch { /* display-only */ }
+          await fs.promises.writeFile(matchResultPath(matchJobId), JSON.stringify({
+            segments: liveJob.segments,
+            unmatchedRanges: liveJob.unmatchedRanges,
+            movieFrames: liveJob.movieFrames,
+            shortFrames: liveJob.shortFrames,
+            verifySummary: liveJob.verifySummary,
+          }));
+          logRetry(key, `New segment added to the timeline (movie ${newSeg.movieStart.toFixed(2)}s–${newSeg.movieEnd.toFixed(2)}s); unmatched gap updated.`);
+        } else {
+          logRetry(key, 'No candidate was accepted — the gap stays unmatched. Its candidate data was saved so you can review it.');
+        }
+      } catch (err: any) {
+        console.error(`[Re-check] Match ${matchJobId} gap ${shortStart.toFixed(2)} failed:`, err?.message || err);
+        logRetry(key, `Gap Retry FAILED: ${err?.message || err}.`);
+      } finally {
+        retryInFlight.delete(key);
+      }
+    })();
+  });
+
   // 6k. Manual candidate selection ("Make main segment") — purely additive,
   // user-triggered action. NEVER touches the matching engine, VLM resolver, or
   // recovery passes: it only swaps which already-discovered candidate is the
