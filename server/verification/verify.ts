@@ -100,6 +100,9 @@ export interface VerifyRequest {
   uploadDir: string;
   matchJobId: string;
   onProgress?: (done: number, total: number, message: string) => void;
+  /** Live per-candidate progress ("Checking candidate 2/6 @ 01:23…") —
+   *  used by the manual Retry flow to surface progress in the UI. */
+  onCandidateProgress?: (message: string) => void;
 }
 
 export interface VerifySummary {
@@ -306,6 +309,16 @@ async function verifyOneRange(
       const candidate = candidates[i].segment;
       const entry = record.candidates[i];
 
+      // Live progress — visible both in the server console and (via the
+      // onCandidateProgress hook) in the frontend's retry spinner.
+      const progressMsg =
+        `Candidate ${i + 1}/${candidates.length} @ movie ` +
+        `${fmt(candidate.movieStart)}–${fmt(candidate.movieEnd)} — checking with Gemini…`;
+      console.log(
+        `[Verify] Range ${segmentIndex} (${fmt(primary.shortStart)}-${fmt(primary.shortEnd)}): ${progressMsg}`,
+      );
+      req.onCandidateProgress?.(progressMsg);
+
       const movieClip = await cutClip(
         req.movieVideoPath!,
         candidate.movieStart,
@@ -374,11 +387,19 @@ async function verifyOneRange(
 
       if (!verdict.same && trusted) {
         entry.verdict = 'rejected';
+        console.log(
+          `[Verify] Range ${segmentIndex}: candidate ${i + 1}/${candidates.length} ` +
+          `@ movie ${fmt(candidate.movieStart)}s REJECTED (Gemini ${entry.confidencePct}%).`,
+        );
       } else {
         entry.verdict = 'unverifiable';
         entry.reason =
           `low certainty (${entry.confidencePct}% < ${MIN_CONFIDENCE}%)` +
           (entry.reason ? ` — ${entry.reason}` : '');
+        console.log(
+          `[Verify] Range ${segmentIndex}: candidate ${i + 1}/${candidates.length} ` +
+          `@ movie ${fmt(candidate.movieStart)}s UNVERIFIABLE (${entry.confidencePct}% < ${MIN_CONFIDENCE}%).`,
+        );
       }
     }
   } finally {
@@ -619,6 +640,7 @@ export async function recheckSegment(req: RecheckRequest): Promise<RecheckResult
       movieVideoPath: req.movieVideoPath,
       uploadDir: req.uploadDir,
       matchJobId: req.matchJobId,
+      onCandidateProgress: req.onCandidateProgress,
     },
     req.segment,
     req.segmentIndex,

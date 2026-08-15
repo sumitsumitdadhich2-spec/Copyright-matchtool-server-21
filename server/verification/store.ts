@@ -66,6 +66,9 @@ export interface VerificationRecord {
   skippedReason?: string;
   /** Set while a manual re-check is in flight (added by the API layer). */
   retrying?: boolean;
+  /** Live progress text of the in-flight re-check (added by the API layer),
+   *  e.g. "Candidate 2/6 @ movie 01:23–01:31 — checking with Gemini…". */
+  retryProgress?: string;
   /** Task 1/5 debug metadata: detected fps + VFR flags from the ffprobe pass
    *  (server/video-metadata.ts), copied onto every record so a range can be
    *  debugged without hunting for the job-level metadata file. */

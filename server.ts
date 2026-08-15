@@ -192,6 +192,10 @@ async function startServer() {
   // this set on a server restart is fine: the re-check itself couldn't have
   // survived the restart either, so "not retrying" is the correct state.
   const retryInFlight = new Set<string>();
+  /** Live human-readable progress of an in-flight re-check, keyed like
+   *  retryInFlight ("Candidate 2/6 @ movie 01:23–01:31 — checking…").
+   *  Surfaced by the candidates endpoints so the UI spinner can show it. */
+  const retryProgress = new Map<string, string>();
   function retryKey(matchJobId: string, segmentIndex: number): string {
     return `${matchJobId}:${segmentIndex}`;
   }
@@ -1423,7 +1427,11 @@ async function startServer() {
   app.get('/api/match/:matchJobId/candidates', (req, res) => {
     const { matchJobId } = req.params;
     const entries = readAllRecords(uploadDir, matchJobId)
-      .map(e => ({ ...e, retrying: retryInFlight.has(retryKey(matchJobId, e.segmentIndex)) }));
+      .map(e => ({
+        ...e,
+        retrying: retryInFlight.has(retryKey(matchJobId, e.segmentIndex)),
+        retryProgress: retryProgress.get(retryKey(matchJobId, e.segmentIndex)),
+      }));
     res.json({ matchJobId, segments: entries });
   });
 
@@ -1433,7 +1441,11 @@ async function startServer() {
     if (!Number.isFinite(idx)) return res.status(400).json({ error: 'segmentIndex must be a number' });
     const entry = readRecord(uploadDir, matchJobId, idx);
     if (!entry) return res.status(404).json({ error: 'No candidate data for this segment' });
-    res.json({ ...entry, retrying: retryInFlight.has(retryKey(matchJobId, idx)) });
+    res.json({
+      ...entry,
+      retrying: retryInFlight.has(retryKey(matchJobId, idx)),
+      retryProgress: retryProgress.get(retryKey(matchJobId, idx)),
+    });
   });
 
   // 6j. Manual per-segment Re-check — a user-triggered action that re-runs the
@@ -1477,6 +1489,7 @@ async function startServer() {
     }
 
     retryInFlight.add(key);
+    retryProgress.set(key, 'Preparing re-check — cutting clips…');
     res.json({ ok: true, matchJobId, segmentIndex });
 
     const originalRange = { shortStart: entry.shortStart, shortEnd: entry.shortEnd };
@@ -1496,6 +1509,7 @@ async function startServer() {
           movieVideoPath,
           uploadDir,
           matchJobId,
+          onCandidateProgress: (message: string) => retryProgress.set(key, message),
         });
         console.log(`[Re-check] Match ${matchJobId} segment ${segmentIndex}: ${result.message}.`);
 
@@ -1525,7 +1539,7 @@ async function startServer() {
             // This range had no active segment before — add it now.
             liveJob.segments = [...liveJob.segments, newSeg].sort((a: any, b: any) => a.shortStart - b.shortStart);
           }
-          // Recompute the display-only timeline flags — swapping in a new
+          // Recompute the display-only timeline flags ��� swapping in a new
           // match can create OR resolve a backwards jump against the
           // neighbouring segments, so the badges must not stay stale.
           try { liveJob.segments = flagTimelineOutliers(liveJob.segments); } catch { /* display-only */ }
@@ -1541,6 +1555,7 @@ async function startServer() {
         console.error(`[Re-check] Match ${matchJobId} segment ${segmentIndex} failed:`, err?.message || err);
       } finally {
         retryInFlight.delete(key);
+        retryProgress.delete(key);
       }
     })();
   });

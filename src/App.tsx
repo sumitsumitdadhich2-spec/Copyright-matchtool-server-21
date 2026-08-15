@@ -86,6 +86,9 @@ interface StoredCandidateSet {
   skippedReason?: string;
   /** Server-reported: a manual Re-check is currently running for this segment. */
   retrying?: boolean;
+  /** Server-reported live progress of the running Re-check
+   *  ("Candidate 2/6 @ movie 01:23–01:31 — checking with Gemini…"). */
+  retryProgress?: string;
 }
 
 interface SanityResult {
@@ -1950,6 +1953,11 @@ export default function App() {
           if (!res.ok) { consecutiveErrors++; if (consecutiveErrors >= 8) break; continue; }
           consecutiveErrors = 0;
           const entry: StoredCandidateSet = await res.json();
+          // Live progress: swap the fresh entry (carrying `retrying` +
+          // `retryProgress`) into candidateSets so the spinner overlay can
+          // show which candidate is being checked right now.
+          setCandidateSets(prev =>
+            prev.map(cs => (cs.segmentIndex === entry.segmentIndex ? entry : cs)));
           if (!entry.retrying) break;
         } catch {
           consecutiveErrors++;
@@ -2906,9 +2914,16 @@ export default function App() {
             {/* Dual video panes */}
             <div className="relative grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-slate-800">
               {isCurrentSegmentRetrying && (
-                <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-slate-950/85 backdrop-blur-sm">
+                <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-slate-950/85 backdrop-blur-sm px-6">
                   <RefreshCw className="w-6 h-6 text-indigo-400 animate-spin" />
                   <p className="text-xs font-medium text-slate-300">Retrying this segment…</p>
+                  {/* Live server-side progress: which candidate is being
+                      checked right now (refreshed by the retry poll loop). */}
+                  {activeCandidateSet?.retryProgress && (
+                    <p className="text-[11px] font-mono text-indigo-300/90 text-center text-balance">
+                      {activeCandidateSet.retryProgress}
+                    </p>
+                  )}
                 </div>
               )}
 
